@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
+use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
 use mx8_observe::metrics::{Counter, Gauge};
 
 use crate::sink::Sink;
@@ -95,9 +96,17 @@ impl Pipeline {
         manifest_bytes: &[u8],
     ) -> Result<()> {
         let records = parse_canonical_manifest_tsv(manifest_bytes)?;
+        let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let s3_client = if has_s3 {
+            let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            Some(aws_sdk_s3::Client::new(&cfg))
+        } else {
+            None
+        };
 
         let (tx, sink_task) = self.spawn_sink(sink)?;
-        self.produce_manifest_batches(tx.clone(), records).await?;
+        self.produce_manifest_batches(tx.clone(), records, s3_client)
+            .await?;
         drop(tx);
         sink_task.await??;
         Ok(())
@@ -182,12 +191,13 @@ impl Pipeline {
         &self,
         tx: mpsc::Sender<InflightBatch>,
         records: Vec<mx8_core::types::ManifestRecord>,
+        s3_client: Option<aws_sdk_s3::Client>,
     ) -> Result<()> {
         let mut sender = tx;
         let mut start = 0usize;
         while start < records.len() {
             let end = (start + self.caps.batch_size_samples).min(records.len());
-            self.send_manifest_batch(&mut sender, &records[start..end])
+            self.send_manifest_batch(&mut sender, &records[start..end], s3_client.as_ref())
                 .await?;
             start = end;
         }
@@ -198,15 +208,16 @@ impl Pipeline {
         &self,
         tx: &mut mpsc::Sender<InflightBatch>,
         records: &[mx8_core::types::ManifestRecord],
+        s3_client: Option<&aws_sdk_s3::Client>,
     ) -> Result<()> {
-        let plan = tokio::task::spawn_blocking({
-            let records = records.to_vec();
-            move || plan_read_specs(&records)
-        })
-        .await
-        .map_err(anyhow::Error::from)??;
-
+        let plan = build_batch_plan(records, s3_client).await?;
         let bytes = plan.total_bytes;
+        anyhow::ensure!(
+            bytes <= self.caps.max_inflight_bytes,
+            "batch payload bytes {} exceeds max_inflight_bytes {}",
+            bytes,
+            self.caps.max_inflight_bytes
+        );
         let permit_units = if bytes == 0 {
             0u64
         } else {
@@ -227,15 +238,9 @@ impl Pipeline {
 
         self.metrics.on_inflight_add(bytes);
 
-        let read = tokio::task::spawn_blocking(move || read_specs_payload(&plan.specs))
-            .await
-            .map_err(anyhow::Error::from)?;
-
-        let payload = match read {
+        let payload = match fetch_specs_payload(&plan.specs, s3_client).await {
             Ok(p) => p,
             Err(err) => {
-                // Ensure gauge matches permit release on early exit.
-                // Permit will drop as we return.
                 self.metrics.on_inflight_sub(bytes);
                 return Err(err);
             }
@@ -263,6 +268,12 @@ impl Pipeline {
         payload: &mut Vec<u8>,
     ) -> Result<()> {
         let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        anyhow::ensure!(
+            bytes <= self.caps.max_inflight_bytes,
+            "batch payload bytes {} exceeds max_inflight_bytes {}",
+            bytes,
+            self.caps.max_inflight_bytes
+        );
         let permit_units = if bytes == 0 {
             0u64
         } else {
@@ -305,10 +316,16 @@ impl Pipeline {
 #[derive(Debug, Clone)]
 struct ReadSpec {
     sample_id: u64,
-    path: PathBuf,
+    location: SpecLocation,
     offset: u64,
     len: u64,
     expect_eof: bool,
+}
+
+#[derive(Debug, Clone)]
+enum SpecLocation {
+    Local(PathBuf),
+    S3 { bucket: String, key: String },
 }
 
 #[derive(Debug, Clone)]
@@ -318,35 +335,49 @@ struct BatchPlan {
     total_bytes: u64,
 }
 
-fn plan_read_specs(records: &[mx8_core::types::ManifestRecord]) -> Result<BatchPlan> {
+async fn build_batch_plan(
+    records: &[mx8_core::types::ManifestRecord],
+    s3_client: Option<&aws_sdk_s3::Client>,
+) -> Result<BatchPlan> {
     let mut sample_ids = Vec::with_capacity(records.len());
     let mut specs = Vec::with_capacity(records.len());
     let mut total_bytes: u64 = 0;
 
     for r in records {
-        if r.location.starts_with("s3://") {
-            anyhow::bail!(
-                "s3 locations are not supported in this runtime slice: {}",
-                r.location
-            );
-        }
-
-        let path = PathBuf::from(&r.location);
+        let location = parse_location(&r.location)?;
 
         let (offset, len, expect_eof) = match (r.byte_offset, r.byte_length) {
             (Some(off), Some(len)) => (off, len, false),
-            (None, None) => {
-                let md = std::fs::metadata(&path)?;
-                let size = md.len();
-                (0u64, size, true)
-            }
+            (None, None) => match &location {
+                SpecLocation::Local(path) => {
+                    let path = path.clone();
+                    let size = tokio::task::spawn_blocking(move || -> Result<u64> {
+                        Ok(std::fs::metadata(&path)?.len())
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)??;
+                    (0u64, size, true)
+                }
+                SpecLocation::S3 { bucket, key } => {
+                    let client = s3_client.ok_or_else(|| {
+                        anyhow::anyhow!("s3 client not configured but s3 location present")
+                    })?;
+                    let out = client.head_object().bucket(bucket).key(key).send().await?;
+                    let size = out.content_length().unwrap_or(0) as u64;
+                    anyhow::ensure!(
+                        size > 0,
+                        "s3 object has unknown/zero size: s3://{bucket}/{key}"
+                    );
+                    (0u64, size, false)
+                }
+            },
             _ => anyhow::bail!("partial byte range for sample_id {}", r.sample_id),
         };
 
         sample_ids.push(r.sample_id);
         specs.push(ReadSpec {
             sample_id: r.sample_id,
-            path,
+            location,
             offset,
             len,
             expect_eof,
@@ -364,9 +395,10 @@ fn plan_read_specs(records: &[mx8_core::types::ManifestRecord]) -> Result<BatchP
     })
 }
 
-fn read_specs_payload(specs: &[ReadSpec]) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-
+async fn fetch_specs_payload(
+    specs: &[ReadSpec],
+    s3_client: Option<&aws_sdk_s3::Client>,
+) -> Result<Vec<u8>> {
     let mut total: u64 = 0;
     for s in specs {
         total = total
@@ -379,28 +411,95 @@ fn read_specs_payload(specs: &[ReadSpec]) -> Result<Vec<u8>> {
 
     for s in specs {
         let len = usize::try_from(s.len).map_err(|_| anyhow::anyhow!("payload too large"))?;
+        match &s.location {
+            SpecLocation::Local(path) => {
+                let path = path.clone();
+                let offset = s.offset;
+                let expect_eof = s.expect_eof;
+                let sample_id = s.sample_id;
+                let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut f = std::fs::File::open(&path)?;
+                    f.seek(SeekFrom::Start(offset))?;
+                    let mut buf = vec![0u8; len];
+                    f.read_exact(&mut buf)?;
 
-        let mut f = std::fs::File::open(&s.path)?;
-        f.seek(SeekFrom::Start(s.offset))?;
+                    if expect_eof {
+                        let mut tmp = [0u8; 1];
+                        let extra = f.read(&mut tmp)?;
+                        if extra != 0 {
+                            anyhow::bail!(
+                                "file grew after sizing (expected eof): sample_id={} path={}",
+                                sample_id,
+                                path.display()
+                            );
+                        }
+                    }
 
-        let start = payload.len();
-        payload.resize(start.saturating_add(len), 0u8);
-        f.read_exact(&mut payload[start..])?;
+                    Ok(buf)
+                })
+                .await
+                .map_err(anyhow::Error::from)??;
+                payload.extend_from_slice(&bytes);
+            }
+            SpecLocation::S3 { bucket, key } => {
+                let client = s3_client.ok_or_else(|| {
+                    anyhow::anyhow!("s3 client not configured but s3 location present")
+                })?;
+                let start = s.offset;
+                let end = start
+                    .checked_add(s.len)
+                    .and_then(|v| v.checked_sub(1))
+                    .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+                let range = format!("bytes={start}-{end}");
 
-        if s.expect_eof {
-            let mut tmp = [0u8; 1];
-            let extra = f.read(&mut tmp)?;
-            if extra != 0 {
-                anyhow::bail!(
-                    "file grew after sizing (expected eof): sample_id={} path={}",
-                    s.sample_id,
-                    s.path.display()
+                let out = client
+                    .get_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .range(range)
+                    .send()
+                    .await?;
+                let b = collect_byte_stream(out.body).await?;
+                anyhow::ensure!(
+                    b.len() == len,
+                    "s3 returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
                 );
+                payload.extend_from_slice(&b);
             }
         }
     }
 
     Ok(payload)
+}
+
+async fn collect_byte_stream(stream: ByteStream) -> Result<Vec<u8>> {
+    let collected: AggregatedBytes = stream.collect().await?;
+    Ok(collected.into_bytes().to_vec())
+}
+
+fn parse_location(location: &str) -> Result<SpecLocation> {
+    if let Some(rest) = location.strip_prefix("s3://") {
+        let (bucket, key) = parse_s3_bucket_key(rest)?;
+        return Ok(SpecLocation::S3 { bucket, key });
+    }
+    Ok(SpecLocation::Local(PathBuf::from(location)))
+}
+
+fn parse_s3_bucket_key(rest: &str) -> Result<(String, String)> {
+    // rest = "<bucket>/<key...>"
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((bucket, key)) = rest.split_once('/') else {
+        anyhow::bail!("invalid s3 url (missing key): s3://{rest}");
+    };
+    let bucket = bucket.trim();
+    let key = key.trim();
+    anyhow::ensure!(!bucket.is_empty(), "invalid s3 url (empty bucket)");
+    anyhow::ensure!(!key.is_empty(), "invalid s3 url (empty key)");
+    Ok((bucket.to_string(), key.to_string()))
 }
 
 fn parse_canonical_manifest_tsv(bytes: &[u8]) -> Result<Vec<mx8_core::types::ManifestRecord>> {
@@ -496,4 +595,23 @@ fn parse_canonical_manifest_tsv(bytes: &[u8]) -> Result<Vec<mx8_core::types::Man
     }
 
     Ok(records)
+}
+
+#[cfg(test)]
+mod s3_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_s3_bucket_key_ok() -> Result<()> {
+        let (b, k) = parse_s3_bucket_key("mybucket/path/to.obj")?;
+        assert_eq!(b, "mybucket");
+        assert_eq!(k, "path/to.obj");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_s3_bucket_key_rejects_missing_key() {
+        let err = parse_s3_bucket_key("mybucket").unwrap_err();
+        assert!(err.to_string().contains("missing key"));
+    }
 }
