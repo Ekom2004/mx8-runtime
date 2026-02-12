@@ -10,8 +10,8 @@ use clap::Parser;
 use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, info_span, Instrument};
-use tracing_subscriber::EnvFilter;
 
+use mx8_observe::metrics::{Counter, Gauge};
 use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
 use mx8_proto::v0::*;
 
@@ -45,6 +45,10 @@ struct Args {
     /// Development-only: block size (samples) for lease WorkRanges.
     #[arg(long, env = "MX8_DEV_BLOCK_SIZE", default_value_t = 65_536)]
     dev_block_size: u64,
+
+    /// Optional: periodically emit a metrics snapshot to logs.
+    #[arg(long, env = "MX8_METRICS_SNAPSHOT_INTERVAL_MS", default_value_t = 0)]
+    metrics_snapshot_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,9 +65,21 @@ struct CoordinatorState {
     next_lease_id: u64,
 }
 
+#[derive(Debug, Default)]
+struct CoordinatorMetrics {
+    register_total: Counter,
+    heartbeat_total: Counter,
+    request_lease_total: Counter,
+    leases_granted_total: Counter,
+    progress_total: Counter,
+    active_leases: Gauge,
+    registered_nodes: Gauge,
+}
+
 #[derive(Debug, Clone)]
 struct CoordinatorSvc {
     state: Arc<RwLock<CoordinatorState>>,
+    metrics: Arc<CoordinatorMetrics>,
     world_size: u32,
     heartbeat_interval_ms: u32,
     lease_ttl_ms: u32,
@@ -101,6 +117,29 @@ impl CoordinatorSvc {
             .unwrap_or_default();
         now.as_millis() as u64
     }
+
+    async fn update_gauges(&self) {
+        let state = self.state.read().await;
+        self.metrics.active_leases.set(state.leases.len() as u64);
+        self.metrics.registered_nodes.set(state.nodes.len() as u64);
+    }
+
+    async fn emit_metrics_snapshot(&self) {
+        self.update_gauges().await;
+        tracing::info!(
+            target: "mx8_metrics",
+            register_total = self.metrics.register_total.get(),
+            heartbeat_total = self.metrics.heartbeat_total.get(),
+            request_lease_total = self.metrics.request_lease_total.get(),
+            leases_granted_total = self.metrics.leases_granted_total.get(),
+            progress_total = self.metrics.progress_total.get(),
+            active_leases = self.metrics.active_leases.get(),
+            registered_nodes = self.metrics.registered_nodes.get(),
+            world_size = self.world_size,
+            manifest_hash = %self.manifest_hash,
+            "metrics"
+        );
+    }
 }
 
 #[tonic::async_trait]
@@ -109,6 +148,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<RegisterNodeResponse>, Status> {
+        self.metrics.register_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
             return Err(status);
@@ -152,7 +192,7 @@ impl Coordinator for CoordinatorSvc {
             ));
         }
 
-        Ok(Response::new(RegisterNodeResponse {
+        let resp = RegisterNodeResponse {
             assigned_rank,
             world_size: self.world_size,
             manifest_hash: self.manifest_hash.clone(),
@@ -160,13 +200,28 @@ impl Coordinator for CoordinatorSvc {
             lease_ttl_ms: self.lease_ttl_ms,
             registered_nodes,
             job_ready: registered_nodes >= self.world_size,
-        }))
+        };
+
+        tracing::info!(
+            job_id = %req.job_id,
+            node_id = %req.node_id,
+            manifest_hash = %resp.manifest_hash,
+            assigned_rank = resp.assigned_rank,
+            world_size = resp.world_size,
+            registered_nodes = resp.registered_nodes,
+            job_ready = resp.job_ready,
+            "node registered"
+        );
+
+        self.update_gauges().await;
+        Ok(Response::new(resp))
     }
 
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        self.metrics.heartbeat_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
             return Err(status);
@@ -184,6 +239,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<RequestLeaseRequest>,
     ) -> Result<Response<RequestLeaseResponse>, Status> {
+        self.metrics.request_lease_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
             return Err(status);
@@ -199,6 +255,15 @@ impl Coordinator for CoordinatorSvc {
         }
 
         if !self.is_job_ready().await {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "membership_wait",
+                job_id = %req.job_id,
+                node_id = %req.node_id,
+                manifest_hash = %self.manifest_hash,
+                world_size = self.world_size,
+                "job not ready"
+            );
             return Err(Status::failed_precondition(
                 "job not ready (membership barrier)",
             ));
@@ -230,6 +295,29 @@ impl Coordinator for CoordinatorSvc {
             }
         }
 
+        self.metrics
+            .leases_granted_total
+            .inc_by(leases.len() as u64);
+        self.update_gauges().await;
+
+        for lease in &leases {
+            if let Some(range) = &lease.range {
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "lease_granted",
+                    job_id = %req.job_id,
+                    node_id = %req.node_id,
+                    lease_id = %lease.lease_id,
+                    manifest_hash = %self.manifest_hash,
+                    epoch = range.epoch,
+                    start_id = range.start_id,
+                    end_id = range.end_id,
+                    expires_unix_time_ms = lease.expires_unix_time_ms,
+                    "lease granted"
+                );
+            }
+        }
+
         Ok(Response::new(RequestLeaseResponse {
             wait_ms: if leases.is_empty() { 500 } else { 0 },
             leases,
@@ -240,6 +328,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<ReportProgressRequest>,
     ) -> Result<Response<ReportProgressResponse>, Status> {
+        self.metrics.progress_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
             return Err(status);
@@ -276,6 +365,20 @@ impl Coordinator for CoordinatorSvc {
             }
         }
         state.progress.insert(progress_key, req.cursor);
+
+        tracing::info!(
+            target: "mx8_proof",
+            event = "progress",
+            job_id = %req.job_id,
+            node_id = %req.node_id,
+            lease_id = %req.lease_id,
+            manifest_hash = %self.manifest_hash,
+            cursor = req.cursor,
+            delivered_samples = req.delivered_samples,
+            delivered_bytes = req.delivered_bytes,
+            unix_time_ms = req.unix_time_ms,
+            "progress accepted"
+        );
         Ok(Response::new(ReportProgressResponse {}))
     }
 
@@ -298,13 +401,16 @@ impl Coordinator for CoordinatorSvc {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    mx8_observe::logging::init_tracing();
 
     let args = Args::parse();
 
-    let span = info_span!("mx8-coordinator", addr = %args.addr);
+    let span = info_span!(
+        "mx8-coordinator",
+        addr = %args.addr,
+        world_size = args.world_size,
+        manifest_hash = %args.manifest_hash
+    );
     async move {
         info!("starting coordinator (v0 skeleton)");
         if args.dev_total_samples > 0 && args.dev_block_size == 0 {
@@ -334,11 +440,25 @@ async fn main() -> Result<()> {
                 progress: std::collections::BTreeMap::new(),
                 next_lease_id: 0,
             })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: args.world_size,
             heartbeat_interval_ms: args.heartbeat_interval_ms,
             lease_ttl_ms: args.lease_ttl_ms,
             manifest_hash: args.manifest_hash,
         };
+
+        if args.metrics_snapshot_interval_ms > 0 {
+            let svc_clone = svc.clone();
+            let interval_ms = args.metrics_snapshot_interval_ms;
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                loop {
+                    ticker.tick().await;
+                    svc_clone.emit_metrics_snapshot().await;
+                }
+            });
+        }
         Server::builder()
             .add_service(CoordinatorServer::new(svc))
             .serve(args.addr)
@@ -357,6 +477,7 @@ mod tests {
     async fn register_node_empty_job_id_is_invalid_argument() {
         let svc = CoordinatorSvc {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
+            metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
@@ -378,6 +499,7 @@ mod tests {
     async fn request_lease_want_zero_is_invalid_argument() {
         let svc = CoordinatorSvc {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
+            metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
