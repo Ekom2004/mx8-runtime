@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/mx8-core",
   "crates/mx8-proto",
+  "crates/mx8-wire",
   "crates/mx8-runtime",
   "crates/mx8d-agent",
   "crates/mx8-coordinator",
@@ -23,4 +24,3 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tonic = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-

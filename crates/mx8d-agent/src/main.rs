@@ -10,6 +10,7 @@ use tracing::{info, info_span, Instrument};
 use tracing_subscriber::EnvFilter;
 
 use mx8_proto::v0::coordinator_client::CoordinatorClient;
+use mx8_proto::v0::NodeCaps;
 use mx8_proto::v0::RegisterNodeRequest;
 
 #[derive(Debug, Parser)]
@@ -49,6 +50,12 @@ async fn main() -> Result<()> {
             .register_node(RegisterNodeRequest {
                 job_id: args.job_id.clone(),
                 node_id: args.node_id.clone(),
+                caps: Some(NodeCaps {
+                    max_fetch_concurrency: 32,
+                    max_decode_concurrency: 8,
+                    max_inflight_bytes: 1 << 30,
+                    max_ram_bytes: 4 << 30,
+                }),
             })
             .await;
 

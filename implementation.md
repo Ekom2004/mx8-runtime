@@ -16,6 +16,66 @@ This document is the step-by-step plan to bring `ARCHITECTURE.MD` to life. It is
 - Demo 1: single node stability (bounded RAM + stable throughput) on a large dataset.
 - Demo 2: 4-node S3 job with deterministic sharding + leases, kill-a-node recovery, and stable throughput.
 
+## Execution Plan (Integration-First)
+
+This section exists to prevent “milestone drift” where crates/features are built in isolation and only attempt to integrate late. The milestone list below (M0–M8) is correct, but execution should follow these integration checkpoints.
+
+**Principle:** no workstream runs more than ~3–5 days without an end-to-end runnable slice that exercises the boundary (types/proto/`manifest_hash`/leases/cursor).
+
+### Phase 1 — Freeze Contracts (finish M1)
+**Deliverable:** `mx8-core` is the canonical shared model (types + logical manifest schema), and `mx8-proto` matches it with stable semantics.
+
+**Gate:**
+- Types compile; round-trip serialize where applicable.
+- Proto encode/decode smoke tests pass.
+- Cursor + half-open range semantics are documented and tested.
+
+### Phase 2 — Observability Skeleton (start M2 early)
+**Deliverable:** consistent structured logs and a minimal metrics surface across runtime/agent/coordinator.
+
+**Gate:**
+- Logs include `job_id`, `node_id`, `lease_id`, `manifest_hash`, `epoch` (where applicable).
+- “Proof log” line formats exist (ownership + cursor progression), even before full functionality.
+
+### Phase 3 — Vertical Slice A (single node bounded runtime)
+**Deliverable:** single-node runtime consumes a local manifest and runs a bounded Fetch→Decode(stub)→Pack→Deliver pipeline with hard caps + backpressure.
+
+**Gate:**
+- Demo-1 skeleton runs on one machine and shows RAM bounded + stable throughput on a synthetic/known dataset.
+
+### Phase 4 — Snapshot Resolver (M3) wired into the slice
+**Deliverable:** link resolution (`plain`, `@refresh`, `@sha256:`) produces a pinned `manifest_hash` and supplies manifest bytes/URL to consumers.
+
+**Gate:**
+- “Paste link → pinned snapshot” works deterministically.
+- Concurrent startup does not cause LIST storms (single-writer indexing/locking semantics).
+
+### Phase 5 — Distributed Control Plane (M7) in two passes
+**Pass 1 (minimum):** membership barrier + lease issuance + agent heartbeat/progress wired end-to-end against a local manifest.
+
+**Pass 2 (recovery):** lease TTL expiry + requeue remainder `[cursor,end)` + reassignment; add no-overlap proof logs.
+
+**Gate:**
+- Multi-node skeleton runs; kill-a-node produces a dip then recovery for inference/ETL semantics.
+
+### Phase 6 — Real IO + tuning (expand M4)
+**Deliverable:** S3 fetch and bounded inflight bytes integrated into the same pipeline; retries/backoff are correct.
+
+**Gate:**
+- Stable throughput from S3 without bursty request patterns (visible in metrics/logs).
+
+### Phase 7 — Python veneer (M5)
+**Deliverable:** PyO3 wrapper is thin; Python never owns core logic.
+
+**Gate:**
+- Minimal Python example runs end-to-end and prints/resolves `manifest_hash`.
+
+### Phase 8 — Video + Hardening + Launch Demos (M6 + M8)
+**Deliverable:** CPU decode baseline; NVDEC on Linux/NVIDIA with fail-open; soak + fault injection + packaging.
+
+**Gate:**
+- Demo 1 + Demo 2 are repeatable on a clean environment with a short runbook.
+
 ## Milestone Plan
 
 ### M0 — Repo + Build Baseline (1–2 days)
@@ -231,4 +291,3 @@ This document is the step-by-step plan to bring `ARCHITECTURE.MD` to life. It is
 - Exact packed format to bless for v0 auto-index (if not WebDataset tar).
 - Precise Parquet canonical hashing spec and schema evolution rules.
 - Membership timeout and operator experience if `<N` nodes register.
-

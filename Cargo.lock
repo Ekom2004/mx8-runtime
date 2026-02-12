@@ -616,6 +616,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mx8-wire"
+version = "0.0.0"
+dependencies = [
+ "mx8-core",
+ "mx8-proto",
+ "thiserror",
+]
+
+[[package]]
 name = "mx8d-agent"
 version = "0.0.0"
 dependencies = [

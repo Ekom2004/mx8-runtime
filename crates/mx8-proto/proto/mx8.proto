@@ -3,6 +3,13 @@ syntax = "proto3";
 package mx8.v0;
 
 // Control-plane API between mx8d-agent (per-node) and mx8-coordinator (per-job leader).
+//
+// Error semantics:
+// - INVALID_ARGUMENT: malformed request (missing IDs, want==0, etc.)
+// - FAILED_PRECONDITION: node not registered, job not ready (membership barrier), or invalid ownership state
+// - NOT_FOUND: unknown lease_id / manifest_hash
+// - UNAVAILABLE: transient coordinator issues; client should retry with backoff
+// - INTERNAL: unexpected server error (bug)
 service Coordinator {
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
@@ -11,23 +18,45 @@ service Coordinator {
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
 }
 
+message NodeCaps {
+  uint32 max_fetch_concurrency = 1;
+  uint32 max_decode_concurrency = 2;
+  uint64 max_inflight_bytes = 3;
+  uint64 max_ram_bytes = 4;
+}
+
 message RegisterNodeRequest {
   string job_id = 1;
   string node_id = 2;
+  NodeCaps caps = 3;
 }
 
 message RegisterNodeResponse {
-  bool ok = 1;
+  uint32 assigned_rank = 1;
+  uint32 world_size = 2;
+  string manifest_hash = 3;
+  uint32 heartbeat_interval_ms = 4;
+  uint32 lease_ttl_ms = 5;
+  uint32 registered_nodes = 6;
+  bool job_ready = 7;
+}
+
+message NodeStats {
+  uint64 inflight_bytes = 1;
+  uint64 ram_high_water_bytes = 2;
+  uint32 fetch_queue_depth = 3;
+  uint32 decode_queue_depth = 4;
+  uint32 pack_queue_depth = 5;
 }
 
 message HeartbeatRequest {
   string job_id = 1;
   string node_id = 2;
   uint64 unix_time_ms = 3;
+  NodeStats stats = 4;
 }
 
 message HeartbeatResponse {
-  bool ok = 1;
 }
 
 message WorkRange {
@@ -53,6 +82,8 @@ message RequestLeaseRequest {
 
 message RequestLeaseResponse {
   repeated Lease leases = 1;
+  // When `leases` is empty and the job is ready, the coordinator may ask the agent to back off.
+  // Semantics: retry after approximately this many milliseconds. 0 means "retry immediately".
   uint32 wait_ms = 2;
 }
 
@@ -61,10 +92,12 @@ message ReportProgressRequest {
   string node_id = 2;
   string lease_id = 3;
   uint64 cursor = 4;
+  uint64 delivered_samples = 5;
+  uint64 delivered_bytes = 6;
+  uint64 unix_time_ms = 7;
 }
 
 message ReportProgressResponse {
-  bool ok = 1;
 }
 
 message GetManifestRequest {
@@ -74,5 +107,5 @@ message GetManifestRequest {
 
 message GetManifestResponse {
   bytes manifest_bytes = 1;
+  uint32 schema_version = 2;
 }
-
