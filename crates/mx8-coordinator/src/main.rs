@@ -549,6 +549,18 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn temp_store_root(test_name: &str) -> anyhow::Result<std::path::PathBuf> {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "mx8-coordinator-test-{}-{}-{}",
+            test_name,
+            std::process::id(),
+            CoordinatorSvc::unix_time_ms()
+        ));
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
     #[tokio::test]
     async fn register_node_empty_job_id_is_invalid_argument() {
         let svc = CoordinatorSvc {
@@ -601,5 +613,36 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_manifest_serves_bytes_from_store() -> anyhow::Result<()> {
+        let root = temp_store_root("get-manifest")?;
+        let store = Arc::new(mx8_manifest_store::fs::FsManifestStore::new(root));
+
+        let hash = ManifestHash("h".to_string());
+        store.put_manifest_bytes(&hash, b"manifest")?;
+
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState::default())),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            manifest_hash: "h".to_string(),
+            manifest_store: Some(store),
+        };
+
+        let resp = svc
+            .get_manifest(Request::new(GetManifestRequest {
+                job_id: "job".to_string(),
+                manifest_hash: "h".to_string(),
+            }))
+            .await?
+            .into_inner();
+
+        assert_eq!(resp.manifest_bytes, b"manifest");
+        assert_eq!(resp.schema_version, MANIFEST_SCHEMA_VERSION);
+        Ok(())
     }
 }
