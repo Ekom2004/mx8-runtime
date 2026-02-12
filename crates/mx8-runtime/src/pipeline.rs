@@ -98,6 +98,20 @@ impl Pipeline {
         self.run_manifest_bytes(sink, &bytes).await
     }
 
+    pub async fn run_manifest_cache_dir_range<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_cache_dir: impl AsRef<Path>,
+        manifest_hash: &str,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<()> {
+        let path = manifest_cache_dir.as_ref().join(manifest_hash);
+        let bytes = std::fs::read(&path)?;
+        self.run_manifest_bytes_range(sink, &bytes, start_id, end_id)
+            .await
+    }
+
     pub async fn run_manifest_bytes<S: Sink>(
         &self,
         sink: Arc<S>,
@@ -120,6 +134,50 @@ impl Pipeline {
         } else {
             None
         };
+
+        let (tx, sink_task) = self.spawn_sink(sink)?;
+        self.produce_manifest_batches(tx.clone(), records, s3_client)
+            .await?;
+        drop(tx);
+        sink_task.await??;
+        Ok(())
+    }
+
+    pub async fn run_manifest_bytes_range<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_bytes: &[u8],
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<()> {
+        let records = parse_canonical_manifest_tsv(manifest_bytes)?;
+        let records = select_record_range(records, start_id, end_id)?;
+
+        let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let s3_client: Option<S3Client> = if has_s3 {
+            #[cfg(feature = "s3")]
+            {
+                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                Some(aws_sdk_s3::Client::new(&cfg))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        tracing::info!(
+            target: "mx8_proof",
+            event = "range_selected",
+            start_id = start_id,
+            end_id = end_id,
+            samples = records.len() as u64,
+            "selected manifest range"
+        );
 
         let (tx, sink_task) = self.spawn_sink(sink)?;
         self.produce_manifest_batches(tx.clone(), records, s3_client)
@@ -631,6 +689,20 @@ fn parse_canonical_manifest_tsv(bytes: &[u8]) -> Result<Vec<mx8_core::types::Man
     }
 
     Ok(records)
+}
+
+fn select_record_range(
+    records: Vec<mx8_core::types::ManifestRecord>,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    anyhow::ensure!(start_id <= end_id, "invalid range (start_id > end_id)");
+    let len = records.len();
+    let start = usize::try_from(start_id).map_err(|_| anyhow::anyhow!("start_id too large"))?;
+    let end = usize::try_from(end_id).map_err(|_| anyhow::anyhow!("end_id too large"))?;
+    anyhow::ensure!(start <= len, "start_id out of range");
+    anyhow::ensure!(end <= len, "end_id out of range");
+    Ok(records[start..end].to_vec())
 }
 
 #[cfg(all(test, feature = "s3"))]
