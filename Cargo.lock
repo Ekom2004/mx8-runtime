@@ -620,6 +620,7 @@ name = "mx8-runtime"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "clap",
  "mx8-core",
  "mx8-observe",
  "tokio",
