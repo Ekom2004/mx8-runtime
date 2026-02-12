@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mx8-core",
+  "crates/mx8-proto",
+  "crates/mx8-runtime",
+  "crates/mx8d-agent",
+  "crates/mx8-coordinator",
+]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+prost = "0.12"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tonic = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+

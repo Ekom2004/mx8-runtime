@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package mx8.v0;
+
+// Control-plane API between mx8d-agent (per-node) and mx8-coordinator (per-job leader).
+service Coordinator {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc RequestLease(RequestLeaseRequest) returns (RequestLeaseResponse);
+  rpc ReportProgress(ReportProgressRequest) returns (ReportProgressResponse);
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+}
+
+message RegisterNodeRequest {
+  string job_id = 1;
+  string node_id = 2;
+}
+
+message RegisterNodeResponse {
+  bool ok = 1;
+}
+
+message HeartbeatRequest {
+  string job_id = 1;
+  string node_id = 2;
+  uint64 unix_time_ms = 3;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+}
+
+message WorkRange {
+  uint64 start_id = 1;
+  uint64 end_id = 2; // half-open [start_id, end_id)
+  uint32 epoch = 3;
+  uint64 seed = 4;
+}
+
+message Lease {
+  string lease_id = 1;
+  string node_id = 2;
+  WorkRange range = 3;
+  uint64 cursor = 4;
+  uint64 expires_unix_time_ms = 5;
+}
+
+message RequestLeaseRequest {
+  string job_id = 1;
+  string node_id = 2;
+  uint32 want = 3;
+}
+
+message RequestLeaseResponse {
+  repeated Lease leases = 1;
+  uint32 wait_ms = 2;
+}
+
+message ReportProgressRequest {
+  string job_id = 1;
+  string node_id = 2;
+  string lease_id = 3;
+  uint64 cursor = 4;
+}
+
+message ReportProgressResponse {
+  bool ok = 1;
+}
+
+message GetManifestRequest {
+  string job_id = 1;
+  string manifest_hash = 2;
+}
+
+message GetManifestResponse {
+  bytes manifest_bytes = 1;
+}
+
