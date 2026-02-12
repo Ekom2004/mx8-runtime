@@ -19,6 +19,8 @@ pub enum SnapshotError {
     Store(#[from] ManifestStoreError),
     #[error("dev manifest path is required to create a new snapshot")]
     DevManifestPathRequired,
+    #[error("dev manifest read error: {0}")]
+    DevManifestIo(#[from] std::io::Error),
     #[error("dev manifest parse error: {0}")]
     DevManifestParse(String),
     #[error("dev manifest invariant violated: {0}")]
@@ -213,7 +215,7 @@ impl SnapshotResolver {
 }
 
 fn load_dev_manifest_tsv(path: &PathBuf) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
-    let bytes = std::fs::read(path).map_err(ManifestStoreError::from)?;
+    let bytes = std::fs::read(path)?;
     let text = String::from_utf8_lossy(&bytes);
 
     let mut records: Vec<ManifestRecord> = Vec::new();
@@ -437,5 +439,33 @@ mod tests {
         assert_eq!(first.manifest_hash.0, second.manifest_hash.0);
         assert_eq!(first.manifest_bytes, second.manifest_bytes);
         Ok(())
+    }
+
+    #[test]
+    fn missing_dev_manifest_path_surfaces_as_dev_manifest_io() {
+        let root =
+            std::env::temp_dir().join(format!("mx8-snapshot-missing-{}", std::process::id()));
+        let store = FsManifestStore::new(root);
+        let resolver = SnapshotResolver::new(
+            store,
+            SnapshotResolverConfig {
+                dev_manifest_path: Some(PathBuf::from("/no/such/file.tsv")),
+                ..Default::default()
+            },
+        );
+
+        let err = resolver
+            .resolve(
+                "s3://bucket/prefix/@refresh",
+                LockOwner {
+                    node_id: Some("test".to_string()),
+                },
+            )
+            .unwrap_err();
+
+        match err {
+            SnapshotError::DevManifestIo(_) => {}
+            other => panic!("expected DevManifestIo, got {other:?}"),
+        }
     }
 }
