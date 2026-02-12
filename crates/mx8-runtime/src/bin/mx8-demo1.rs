@@ -26,6 +26,12 @@ struct Args {
     #[arg(long, env = "MX8_MANIFEST_HASH", default_value = "dev")]
     manifest_hash: String,
 
+    /// Optional: use a cached manifest (from mx8d-agent) instead of synthetic data.
+    ///
+    /// If set, `MX8_MANIFEST_HASH` is used as the cache key (filename).
+    #[arg(long, env = "MX8_MANIFEST_CACHE_DIR")]
+    manifest_cache_dir: Option<std::path::PathBuf>,
+
     #[arg(long, env = "MX8_TOTAL_SAMPLES", default_value_t = 1_000_000)]
     total_samples: u64,
 
@@ -164,10 +170,24 @@ async fn main() -> Result<()> {
         };
 
         let start = Instant::now();
-        info!("starting bounded pipeline (synthetic)");
+        if args.manifest_cache_dir.is_some() {
+            info!("starting bounded pipeline (manifest cache)");
+        } else {
+            info!("starting bounded pipeline (synthetic)");
+        }
 
         tokio::select! {
-            res = pipeline.run_synthetic(sink.clone(), args.total_samples, args.bytes_per_sample) => {
+            res = async {
+                if let Some(dir) = &args.manifest_cache_dir {
+                    pipeline
+                        .run_manifest_cache_dir(sink.clone(), dir, &args.manifest_hash)
+                        .await
+                } else {
+                    pipeline
+                        .run_synthetic(sink.clone(), args.total_samples, args.bytes_per_sample)
+                        .await
+                }
+            } => {
                 res?;
             }
             _ = signal::ctrl_c() => {
