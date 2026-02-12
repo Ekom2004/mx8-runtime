@@ -26,6 +26,38 @@ impl Gauge {
         self.0.store(value, Ordering::Relaxed);
     }
 
+    pub fn add(&self, delta: u64) -> u64 {
+        self.0.fetch_add(delta, Ordering::Relaxed) + delta
+    }
+
+    pub fn sub(&self, delta: u64) -> u64 {
+        let mut prev = self.0.load(Ordering::Relaxed);
+        loop {
+            let next = prev.saturating_sub(delta);
+            match self
+                .0
+                .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return next,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    pub fn max(&self, value: u64) -> u64 {
+        let mut prev = self.0.load(Ordering::Relaxed);
+        while value > prev {
+            match self
+                .0
+                .compare_exchange_weak(prev, value, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return value,
+                Err(actual) => prev = actual,
+            }
+        }
+        prev
+    }
+
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
