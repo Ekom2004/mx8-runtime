@@ -18,6 +18,8 @@ license = "UNLICENSED"
 
 [workspace.dependencies]
 anyhow = "1"
+aws-config = "1"
+aws-sdk-s3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 prost = "0.12"
