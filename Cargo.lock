@@ -581,8 +581,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "mx8-core",
+ "mx8-manifest-store",
  "mx8-observe",
  "mx8-proto",
+ "mx8-snapshot",
  "tokio",
  "tonic",
  "tracing",
@@ -633,6 +636,17 @@ dependencies = [
  "mx8-core",
  "mx8-observe",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mx8-snapshot"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "mx8-core",
+ "mx8-manifest-store",
+ "thiserror",
  "tracing",
 ]
 

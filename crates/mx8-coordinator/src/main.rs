@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,9 +12,12 @@ use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, info_span, Instrument};
 
+use mx8_core::types::{ManifestHash, MANIFEST_SCHEMA_VERSION};
+use mx8_manifest_store::ManifestStore;
 use mx8_observe::metrics::{Counter, Gauge};
 use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
 use mx8_proto::v0::*;
+use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 
 #[derive(Debug, Parser)]
 #[command(name = "mx8-coordinator")]
@@ -34,7 +38,38 @@ struct Args {
     #[arg(long, env = "MX8_LEASE_TTL_MS", default_value_t = 10_000)]
     lease_ttl_ms: u32,
 
-    /// Pinned manifest hash for this job (placeholder until M3 snapshot resolver is wired).
+    /// Dataset link (plain / @refresh / @sha256:...).
+    ///
+    /// If set, the coordinator resolves a pinned snapshot using the manifest store.
+    #[arg(long, env = "MX8_DATASET_LINK")]
+    dataset_link: Option<String>,
+
+    /// Root directory for the FS manifest_store (M3).
+    #[arg(
+        long,
+        env = "MX8_MANIFEST_STORE_ROOT",
+        default_value = "/var/lib/mx8/manifests"
+    )]
+    manifest_store_root: PathBuf,
+
+    /// Development-only: path to a TSV manifest used to create a snapshot when needed.
+    ///
+    /// Format:
+    ///   sample_id<TAB>location[<TAB>byte_offset<TAB>byte_length[<TAB>decode_hint]]
+    #[arg(long, env = "MX8_DEV_MANIFEST_PATH")]
+    dev_manifest_path: Option<PathBuf>,
+
+    /// How long a stale intent lock is tolerated before reaping (FS store).
+    #[arg(long, env = "MX8_SNAPSHOT_LOCK_STALE_MS", default_value_t = 60_000)]
+    snapshot_lock_stale_ms: u64,
+
+    /// Max time to wait for another indexer to publish the current snapshot pointer.
+    #[arg(long, env = "MX8_SNAPSHOT_WAIT_TIMEOUT_MS", default_value_t = 30_000)]
+    snapshot_wait_timeout_ms: u64,
+
+    /// Legacy: pinned manifest hash for this job.
+    ///
+    /// Prefer `--dataset-link`; this is kept for compatibility during M3 integration.
     #[arg(long, env = "MX8_MANIFEST_HASH", default_value = "dev")]
     manifest_hash: String,
 
@@ -84,6 +119,7 @@ struct CoordinatorSvc {
     heartbeat_interval_ms: u32,
     lease_ttl_ms: u32,
     manifest_hash: String,
+    manifest_store: Option<Arc<mx8_manifest_store::fs::FsManifestStore>>,
 }
 
 impl CoordinatorSvc {
@@ -393,9 +429,25 @@ impl Coordinator for CoordinatorSvc {
         if let Some(status) = Self::validate_id("manifest_hash", &req.manifest_hash) {
             return Err(status);
         }
-        Err(Status::not_found(
-            "manifest not found (M3 will implement manifest_store)",
-        ))
+        let Some(store) = &self.manifest_store else {
+            return Err(Status::failed_precondition(
+                "manifest_store is not configured for this coordinator",
+            ));
+        };
+
+        match store.get_manifest_bytes(&ManifestHash(req.manifest_hash.clone())) {
+            Ok(bytes) => Ok(Response::new(GetManifestResponse {
+                manifest_bytes: bytes,
+                schema_version: MANIFEST_SCHEMA_VERSION,
+            })),
+            Err(mx8_manifest_store::ManifestStoreError::NotFound(_)) => {
+                Err(Status::not_found("manifest not found"))
+            }
+            Err(mx8_manifest_store::ManifestStoreError::InvalidManifestHash) => {
+                Err(Status::invalid_argument("invalid manifest_hash"))
+            }
+            Err(err) => Err(Status::internal(format!("manifest_store error: {err}"))),
+        }
     }
 }
 
@@ -405,11 +457,34 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    let store = Arc::new(mx8_manifest_store::fs::FsManifestStore::new(
+        args.manifest_store_root.clone(),
+    ));
+
+    let resolved_manifest_hash = if let Some(link) = &args.dataset_link {
+        let cfg = SnapshotResolverConfig {
+            lock_stale_after: std::time::Duration::from_millis(args.snapshot_lock_stale_ms),
+            wait_timeout: std::time::Duration::from_millis(args.snapshot_wait_timeout_ms),
+            dev_manifest_path: args.dev_manifest_path.clone(),
+            ..Default::default()
+        };
+        let resolver = SnapshotResolver::new((*store).clone(), cfg);
+        let resolved = resolver.resolve(
+            link,
+            mx8_manifest_store::fs::LockOwner {
+                node_id: Some("coordinator".to_string()),
+            },
+        )?;
+        resolved.manifest_hash.0
+    } else {
+        args.manifest_hash.clone()
+    };
+
     let span = info_span!(
         "mx8-coordinator",
         addr = %args.addr,
         world_size = args.world_size,
-        manifest_hash = %args.manifest_hash
+        manifest_hash = %resolved_manifest_hash
     );
     async move {
         info!("starting coordinator (v0 skeleton)");
@@ -444,7 +519,8 @@ async fn main() -> Result<()> {
             world_size: args.world_size,
             heartbeat_interval_ms: args.heartbeat_interval_ms,
             lease_ttl_ms: args.lease_ttl_ms,
-            manifest_hash: args.manifest_hash,
+            manifest_hash: resolved_manifest_hash,
+            manifest_store: Some(store),
         };
 
         if args.metrics_snapshot_interval_ms > 0 {
@@ -482,6 +558,7 @@ mod tests {
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             manifest_hash: "dev".to_string(),
+            manifest_store: None,
         };
 
         let err = svc
@@ -504,6 +581,7 @@ mod tests {
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             manifest_hash: "dev".to_string(),
+            manifest_store: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {

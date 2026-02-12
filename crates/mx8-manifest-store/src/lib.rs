@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod fs;
+mod sha256;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,4 +103,8 @@ pub(crate) fn unix_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    sha256::to_lower_hex(&sha256::sha256(bytes))
 }
