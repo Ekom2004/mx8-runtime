@@ -32,6 +32,14 @@ struct Args {
     #[arg(long, env = "MX8_MANIFEST_CACHE_DIR")]
     manifest_cache_dir: Option<std::path::PathBuf>,
 
+    /// Optional: when using `--manifest-cache-dir`, only process this half-open sample_id range.
+    #[arg(long, env = "MX8_START_ID")]
+    start_id: Option<u64>,
+
+    /// Optional: when using `--manifest-cache-dir`, only process this half-open sample_id range.
+    #[arg(long, env = "MX8_END_ID")]
+    end_id: Option<u64>,
+
     #[arg(long, env = "MX8_TOTAL_SAMPLES", default_value_t = 1_000_000)]
     total_samples: u64,
 
@@ -179,9 +187,25 @@ async fn main() -> Result<()> {
         tokio::select! {
             res = async {
                 if let Some(dir) = &args.manifest_cache_dir {
-                    pipeline
-                        .run_manifest_cache_dir(sink.clone(), dir, &args.manifest_hash)
-                        .await
+                    match (args.start_id, args.end_id) {
+                        (None, None) => {
+                            pipeline
+                                .run_manifest_cache_dir(sink.clone(), dir, &args.manifest_hash)
+                                .await
+                        }
+                        (Some(start_id), Some(end_id)) => {
+                            pipeline
+                                .run_manifest_cache_dir_range(
+                                    sink.clone(),
+                                    dir,
+                                    &args.manifest_hash,
+                                    start_id,
+                                    end_id,
+                                )
+                                .await
+                        }
+                        _ => anyhow::bail!("--start-id and --end-id must be set together"),
+                    }
                 } else {
                     pipeline
                         .run_synthetic(sink.clone(), args.total_samples, args.bytes_per_sample)

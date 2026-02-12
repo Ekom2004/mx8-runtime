@@ -90,3 +90,41 @@ async fn manifest_pipeline_reads_files_and_is_bounded() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_pipeline_can_run_subset_range() -> Result<()> {
+    let root = temp_dir("manifest-pipeline-range")?;
+
+    let f0 = root.join("a.bin");
+    let f1 = root.join("b.bin");
+    let f2 = root.join("c.bin");
+    std::fs::write(&f0, vec![1u8; 100])?;
+    std::fs::write(&f1, vec![2u8; 200])?;
+    std::fs::write(&f2, vec![3u8; 300])?;
+
+    let manifest = format!(
+        "schema_version=0\n\
+0\t{}\t\t\t\n\
+1\t{}\t\t\t\n\
+2\t{}\t\t\t\n",
+        f0.display(),
+        f1.display(),
+        f2.display()
+    );
+
+    let caps = RuntimeCaps {
+        max_inflight_bytes: 8 * 1024,
+        max_queue_batches: 4,
+        batch_size_samples: 8,
+    };
+    let pipeline = Pipeline::new(caps);
+
+    let sink = Arc::new(SlowSink::new(Duration::from_millis(1)));
+    pipeline
+        .run_manifest_bytes_range(sink.clone(), manifest.as_bytes(), 1, 3)
+        .await?;
+
+    assert_eq!(sink.delivered_samples.load(Ordering::Relaxed), 2);
+    assert_eq!(sink.delivered_bytes.load(Ordering::Relaxed), 200 + 300);
+    Ok(())
+}
