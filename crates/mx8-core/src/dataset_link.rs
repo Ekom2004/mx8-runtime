@@ -48,7 +48,10 @@ impl fmt::Display for DatasetLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DatasetLink::Plain(s) => write!(f, "{s}"),
-            DatasetLink::Pinned { base, manifest_hash } => write!(f, "{base}@sha256:{manifest_hash}"),
+            DatasetLink::Pinned {
+                base,
+                manifest_hash,
+            } => write!(f, "{base}@sha256:{manifest_hash}"),
             DatasetLink::Refresh(base) => write!(f, "{base}@refresh"),
         }
     }
@@ -85,4 +88,3 @@ mod tests {
         );
     }
 }
-

@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+
 use anyhow::Result;
 
 pub struct Runtime;
@@ -13,3 +16,8 @@ impl Runtime {
     }
 }
 
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -22,6 +22,7 @@ Once the Rust workspace exists:
 ## Coding Style & Naming Conventions
 
 - Rust: run `cargo fmt` before commits; prefer explicit types at boundaries and clear error types.
+- Rust should be **idiomatic**: clear ownership and error handling, avoid `unwrap()`/`expect()` in production paths, keep `unsafe` banned by default, and prefer small, composable modules with explicit boundaries.
 - Naming:
   - crates/modules: kebab-case for crates, snake_case for modules/functions, CamelCase for types.
   - config/env: `MX8_*` prefix (e.g., `MX8_COORD_BIND_ADDR`, `MX8_COORD_URL`, `MX8_MANIFEST_STORE`).

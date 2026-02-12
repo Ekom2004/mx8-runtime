@@ -26,4 +26,3 @@ fn empty_work_range() {
     assert!(r.is_empty());
     assert_eq!(r.len(), 0);
 }
-
