@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use tonic::transport::Channel;
-use tracing::{info, info_span, Instrument};
+use tracing::{info, info_span, warn, Instrument};
 
 use mx8_proto::v0::coordinator_client::CoordinatorClient;
+use mx8_proto::v0::GetManifestRequest;
 use mx8_proto::v0::HeartbeatRequest;
 use mx8_proto::v0::NodeCaps;
 use mx8_proto::v0::NodeStats;
@@ -30,6 +32,14 @@ struct Args {
 
     #[arg(long, env = "MX8_NODE_ID", default_value = "local-node")]
     node_id: String,
+
+    /// Where to cache `GetManifest` bytes locally (control-plane only).
+    #[arg(
+        long,
+        env = "MX8_MANIFEST_CACHE_DIR",
+        default_value = "/tmp/mx8/manifests"
+    )]
+    manifest_cache_dir: PathBuf,
 
     /// Optional: periodically emit a metrics snapshot to logs.
     #[arg(long, env = "MX8_METRICS_SNAPSHOT_INTERVAL_MS", default_value_t = 0)]
@@ -67,6 +77,37 @@ impl AgentMetrics {
             "metrics"
         );
     }
+}
+
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or(path);
+    std::fs::create_dir_all(parent)?;
+
+    let mut tmp = path.to_path_buf();
+    let suffix = format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        mx8_observe::time::unix_time_ms()
+    );
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("manifest");
+    tmp.set_file_name(format!("{file_name}.{suffix}"));
+
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -115,6 +156,40 @@ async fn main() -> Result<()> {
             manifest_hash = %register_resp.manifest_hash,
             "registered with coordinator"
         );
+
+        // M3: manifest proxy fallback (control-plane only).
+        // Cache the pinned manifest locally so future runtime stages can load it without
+        // needing to talk to the coordinator.
+        match client
+            .get_manifest(GetManifestRequest {
+                job_id: args.job_id.clone(),
+                manifest_hash: manifest_hash.clone(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                let path = args.manifest_cache_dir.join(&manifest_hash);
+                if let Err(err) = write_atomic(&path, &resp.manifest_bytes) {
+                    warn!(error = %err, path = %path.display(), "failed to cache manifest");
+                } else {
+                    info!(
+                        target: "mx8_proof",
+                        event = "manifest_cached",
+                        job_id = %args.job_id,
+                        node_id = %args.node_id,
+                        manifest_hash = %manifest_hash,
+                        schema_version = resp.schema_version,
+                        manifest_bytes = resp.manifest_bytes.len() as u64,
+                        path = %path.display(),
+                        "cached manifest"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "GetManifest failed (continuing)");
+            }
+        }
 
         if args.metrics_snapshot_interval_ms > 0 {
             let metrics_clone = metrics.clone();
