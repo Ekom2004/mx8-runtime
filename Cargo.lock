@@ -581,6 +581,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "mx8-observe",
  "mx8-proto",
  "tokio",
  "tonic",
@@ -594,6 +595,14 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "mx8-observe"
+version = "0.0.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -630,6 +639,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "mx8-observe",
  "mx8-proto",
  "tokio",
  "tonic",

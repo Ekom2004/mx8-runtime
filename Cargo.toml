@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/mx8-core",
+  "crates/mx8-observe",
   "crates/mx8-proto",
   "crates/mx8-wire",
   "crates/mx8-runtime",

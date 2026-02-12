@@ -12,5 +12,5 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+mx8-observe = { path = "../mx8-observe" }
 mx8-proto = { path = "../mx8-proto" }
-
