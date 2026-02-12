@@ -37,6 +37,22 @@ Every code change should end with:
 - A brief note on hot-path time/memory complexity (big-O + growth drivers).
 - Any new/changed invariants reflected in `ARCHITECTURE.MD` (if applicable).
 
+## System Design Checklist (every new surface area)
+
+Before adding a new crate/module/service endpoint, lock the following (in code + docs/tests):
+- **Boundary**: smallest possible API (types, traits, RPCs); clear owner of state; no “leaky” abstractions.
+- **Contracts/Invariants**: required vs optional fields, monotonicity rules, idempotency expectations, and what “valid” means (enforced by `validate()` + tests).
+- **Resource limits**: explicit backpressure and hard caps (RAM, inflight bytes, queue sizes); no unbounded buffering.
+- **Failure model**: timeouts, retries, cancellation, and partial-progress semantics (what is safe to replay).
+- **Observability**: proof logs + metrics for the contract (so we can demo + debug by replaying logs).
+
+## Optional Local Enforcement (no CI)
+
+To enforce checks on every push without CI:
+- `git config core.hooksPath .githooks`
+- `chmod +x .githooks/pre-push scripts/check.sh`
+- Then `git push` will run `./scripts/check.sh` (skip with `--no-verify`).
+
 ## Testing Guidelines
 
 Testing harness is not yet established. When adding tests:

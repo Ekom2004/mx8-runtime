@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep main green without CI: run the local DoD checks on push.
+# Skip with: git push --no-verify
+
+exec ./scripts/check.sh
+
