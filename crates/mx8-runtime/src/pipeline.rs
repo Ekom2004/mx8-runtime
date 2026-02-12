@@ -4,11 +4,19 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
-use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
 use mx8_observe::metrics::{Counter, Gauge};
 
 use crate::sink::Sink;
 use crate::types::Batch;
+
+#[cfg(feature = "s3")]
+use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
+
+#[cfg(feature = "s3")]
+type S3Client = aws_sdk_s3::Client;
+
+#[cfg(not(feature = "s3"))]
+type S3Client = ();
 
 const PERMIT_UNIT_BYTES: u64 = 1024;
 
@@ -97,9 +105,18 @@ impl Pipeline {
     ) -> Result<()> {
         let records = parse_canonical_manifest_tsv(manifest_bytes)?;
         let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
-        let s3_client = if has_s3 {
-            let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            Some(aws_sdk_s3::Client::new(&cfg))
+        let s3_client: Option<S3Client> = if has_s3 {
+            #[cfg(feature = "s3")]
+            {
+                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                Some(aws_sdk_s3::Client::new(&cfg))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
         } else {
             None
         };
@@ -191,7 +208,7 @@ impl Pipeline {
         &self,
         tx: mpsc::Sender<InflightBatch>,
         records: Vec<mx8_core::types::ManifestRecord>,
-        s3_client: Option<aws_sdk_s3::Client>,
+        s3_client: Option<S3Client>,
     ) -> Result<()> {
         let mut sender = tx;
         let mut start = 0usize;
@@ -208,7 +225,7 @@ impl Pipeline {
         &self,
         tx: &mut mpsc::Sender<InflightBatch>,
         records: &[mx8_core::types::ManifestRecord],
-        s3_client: Option<&aws_sdk_s3::Client>,
+        s3_client: Option<&S3Client>,
     ) -> Result<()> {
         let plan = build_batch_plan(records, s3_client).await?;
         let bytes = plan.total_bytes;
@@ -325,7 +342,11 @@ struct ReadSpec {
 #[derive(Debug, Clone)]
 enum SpecLocation {
     Local(PathBuf),
-    S3 { bucket: String, key: String },
+    #[cfg(feature = "s3")]
+    S3 {
+        bucket: String,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -337,8 +358,11 @@ struct BatchPlan {
 
 async fn build_batch_plan(
     records: &[mx8_core::types::ManifestRecord],
-    s3_client: Option<&aws_sdk_s3::Client>,
+    s3_client: Option<&S3Client>,
 ) -> Result<BatchPlan> {
+    #[cfg(not(feature = "s3"))]
+    let _ = s3_client;
+
     let mut sample_ids = Vec::with_capacity(records.len());
     let mut specs = Vec::with_capacity(records.len());
     let mut total_bytes: u64 = 0;
@@ -358,6 +382,7 @@ async fn build_batch_plan(
                     .map_err(anyhow::Error::from)??;
                     (0u64, size, true)
                 }
+                #[cfg(feature = "s3")]
                 SpecLocation::S3 { bucket, key } => {
                     let client = s3_client.ok_or_else(|| {
                         anyhow::anyhow!("s3 client not configured but s3 location present")
@@ -395,10 +420,10 @@ async fn build_batch_plan(
     })
 }
 
-async fn fetch_specs_payload(
-    specs: &[ReadSpec],
-    s3_client: Option<&aws_sdk_s3::Client>,
-) -> Result<Vec<u8>> {
+async fn fetch_specs_payload(specs: &[ReadSpec], s3_client: Option<&S3Client>) -> Result<Vec<u8>> {
+    #[cfg(not(feature = "s3"))]
+    let _ = s3_client;
+
     let mut total: u64 = 0;
     for s in specs {
         total = total
@@ -442,6 +467,7 @@ async fn fetch_specs_payload(
                 .map_err(anyhow::Error::from)??;
                 payload.extend_from_slice(&bytes);
             }
+            #[cfg(feature = "s3")]
             SpecLocation::S3 { bucket, key } => {
                 let client = s3_client.ok_or_else(|| {
                     anyhow::anyhow!("s3 client not configured but s3 location present")
@@ -476,6 +502,7 @@ async fn fetch_specs_payload(
     Ok(payload)
 }
 
+#[cfg(feature = "s3")]
 async fn collect_byte_stream(stream: ByteStream) -> Result<Vec<u8>> {
     let collected: AggregatedBytes = stream.collect().await?;
     Ok(collected.into_bytes().to_vec())
@@ -483,12 +510,21 @@ async fn collect_byte_stream(stream: ByteStream) -> Result<Vec<u8>> {
 
 fn parse_location(location: &str) -> Result<SpecLocation> {
     if let Some(rest) = location.strip_prefix("s3://") {
-        let (bucket, key) = parse_s3_bucket_key(rest)?;
-        return Ok(SpecLocation::S3 { bucket, key });
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = rest;
+            anyhow::bail!("s3 support not enabled (rebuild mx8-runtime with --features s3)");
+        }
+        #[cfg(feature = "s3")]
+        {
+            let (bucket, key) = parse_s3_bucket_key(rest)?;
+            return Ok(SpecLocation::S3 { bucket, key });
+        }
     }
     Ok(SpecLocation::Local(PathBuf::from(location)))
 }
 
+#[cfg(feature = "s3")]
 fn parse_s3_bucket_key(rest: &str) -> Result<(String, String)> {
     // rest = "<bucket>/<key...>"
     let rest = rest.trim().trim_start_matches('/');
@@ -597,7 +633,7 @@ fn parse_canonical_manifest_tsv(bytes: &[u8]) -> Result<Vec<mx8_core::types::Man
     Ok(records)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "s3"))]
 mod s3_parse_tests {
     use super::*;
 
