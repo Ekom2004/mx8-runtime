@@ -242,6 +242,11 @@ Date: 2026-02-12
   - exactly one packed format (customer-driven; likely WebDataset tar)
 - All other layouts use explicit manifests (“bring your own manifest”) until additional indexers are shipped.
 
+### Video decode (CPU + GPU)
+- v0 baseline: CPU decode is supported everywhere.
+- v0 GPU decode: Linux + NVIDIA (NVDEC) first.
+- GPU decode is best-effort and must fail open to CPU (any GPU-decode error falls back to CPU) with a consistent output contract.
+
 ### Leases and progress semantics
 - Cursor advances only after **DELIVER** to Python/consumer (not after fetch/decode).
 - Inference/ETL: at-least-once at boundaries acceptable; “no gaps” preferred.
