@@ -387,4 +387,55 @@ mod tests {
         let _ = resolver;
         Ok(())
     }
+
+    #[test]
+    fn plain_link_creates_snapshot_then_reuses_current() -> anyhow::Result<()> {
+        let root = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "mx8-snapshot-e2e-{}-{}",
+                std::process::id(),
+                mx8_manifest_store::sha256_hex(b"root")
+            ));
+            std::fs::create_dir_all(&p)?;
+            p
+        };
+
+        let manifest_path = root.join("dev_manifest.tsv");
+        std::fs::write(&manifest_path, "0\ta\n1\tb\t0\t10\tx\n")?;
+
+        let store = FsManifestStore::new(root.clone());
+        let cfg = SnapshotResolverConfig {
+            dev_manifest_path: Some(manifest_path),
+            ..Default::default()
+        };
+        let resolver = SnapshotResolver::new(store.clone(), cfg);
+
+        let first = resolver.resolve(
+            "s3://bucket/prefix/",
+            LockOwner {
+                node_id: Some("test".to_string()),
+            },
+        )?;
+        assert!(!first.manifest_hash.0.is_empty());
+        assert!(!first.manifest_bytes.is_empty());
+
+        // New resolver without dev_manifest_path should reuse the current pointer.
+        let resolver2 = SnapshotResolver::new(
+            store,
+            SnapshotResolverConfig {
+                dev_manifest_path: None,
+                ..Default::default()
+            },
+        );
+        let second = resolver2.resolve(
+            "s3://bucket/prefix/",
+            LockOwner {
+                node_id: Some("test2".to_string()),
+            },
+        )?;
+        assert_eq!(first.manifest_hash.0, second.manifest_hash.0);
+        assert_eq!(first.manifest_bytes, second.manifest_bytes);
+        Ok(())
+    }
 }
