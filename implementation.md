@@ -129,6 +129,58 @@ This section exists to prevent “milestone drift” where crates/features are b
 ### M3 — Manifest Store + Snapshot Resolver (S3 + FS) (1–2 weeks)
 **Goal:** Make “paste link → pinned snapshot” real, storm-safe, and portable.
 
+#### M3 Checklist (build in this order; keep it demo-runnable)
+1) **FS store skeleton (no S3 yet)**
+   - Define `mx8-manifest-store` crate with:
+     - `ManifestStore` trait (put/get by hash; get/set “intent → current snapshot” pointer).
+     - FS backend rooted at `MX8_MANIFEST_STORE_ROOT` (default `/var/lib/mx8/manifests`).
+     - Directory layout:
+       - `by-hash/<manifest_hash>`: immutable manifest bytes (content addressed).
+       - `intent/<intent_key>/current`: points to `<manifest_hash>` (atomic swap).
+       - `locks/<intent_key>.lock`: single-writer lock file (atomic create).
+   - **Success:** unit tests prove atomic pointer update and immutability-by-hash.
+
+2) **Intent + locking semantics**
+   - Canonical `intent_key` derivation from dataset link “intent” (backend + bucket/path + prefix + options).
+   - Lock acquisition:
+     - FS: atomic create (e.g., `create_new`) + write owner metadata (pid/node_id/unix_time_ms).
+     - Stale lock expiry policy (configurable TTL) to avoid permanent wedge after crash.
+   - **Success:** concurrency test spawns N tasks; exactly one becomes indexer; others wait/back off.
+
+3) **Canonical hashing (`manifest_hash`)**
+   - Implement canonical hash over a stable logical record stream + `MANIFEST_SCHEMA_VERSION`.
+   - Hashing must be independent of Parquet file bytes (parquet comes later; hash the logical rows).
+   - **Success:** deterministic hash for the same records across runs; tests include record-order stability rule (explicitly define whether order matters and enforce it).
+
+4) **Snapshot resolution API**
+   - Add `mx8-snapshot` crate (or module) with:
+     - Parse dataset links (`plain`, `@refresh`, `@sha256:` already exist).
+     - `resolve_snapshot(link) -> { manifest_hash, manifest_bytes_or_url }` for v0.
+   - Semantics:
+     - Plain: return current snapshot for intent; if missing, create (index) then set current.
+     - `@refresh`: create new snapshot at job start, update current.
+     - `@sha256:`: bypass intent/locks; validate presence in `by-hash/` (or return “not found”).
+   - **Success:** “paste link → pinned hash” works offline with FS store and a dev manifest input.
+
+5) **Dev indexing path (minimal)**
+   - For M3, do not implement full S3 listing yet.
+   - Support one dev input form to create a snapshot:
+     - `MX8_DEV_MANIFEST_PATH=/path/to/manifest.jsonl` (or CSV) → load into `mx8-core::ManifestRecord`.
+   - **Success:** coordinator can generate a pinned snapshot without touching S3.
+
+6) **Coordinator integration**
+   - `mx8-coordinator` calls resolver at startup and stores `manifest_hash`.
+   - `RegisterNodeResponse.manifest_hash` returns the pinned hash.
+   - Implement `GetManifest(manifest_hash)` using FS store bytes (control-plane only).
+   - **Success:** agent can `GetManifest` and cache locally; coordinator never proxies dataset bytes.
+
+7) **Observability + proof logs**
+   - Emit proof logs:
+     - `snapshot_resolved(intent_key, manifest_hash, mode=plain|refresh|pinned)`
+     - `snapshot_indexer_elected(intent_key)` and `snapshot_index_wait(wait_ms)`
+   - Metrics snapshots include manifest counts, lock waits, and resolver latencies.
+   - **Success:** demo replay shows “single writer indexing” without LIST storms.
+
 **Work:**
 1) `manifest_store` backends (Rust):
    - FS store: writes content-addressed manifests and intent pointers under a configured root path.
