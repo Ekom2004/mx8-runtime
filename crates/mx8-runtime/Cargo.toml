@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mx8-core = { path = "../mx8-core" }
+mx8-observe = { path = "../mx8-observe" }
 anyhow.workspace = true
+tokio.workspace = true
 tracing.workspace = true
-

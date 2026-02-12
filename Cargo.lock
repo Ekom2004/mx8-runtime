@@ -621,6 +621,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "mx8-core",
+ "mx8-observe",
+ "tokio",
  "tracing",
 ]
 
