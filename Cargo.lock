@@ -598,6 +598,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mx8-manifest-store"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "mx8-core",
+ "thiserror",
+]
+
+[[package]]
 name = "mx8-observe"
 version = "0.0.0"
 dependencies = [
