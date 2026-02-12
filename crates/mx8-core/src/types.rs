@@ -29,4 +29,3 @@ pub struct Lease {
     pub range: WorkRange,
     pub cursor: u64,
 }
-

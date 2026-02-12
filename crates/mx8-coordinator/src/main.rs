@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+
 use std::net::SocketAddr;
 
 use anyhow::Result;
@@ -70,7 +73,7 @@ async fn main() -> Result<()> {
     async move {
         info!("starting coordinator (v0 skeleton)");
         Server::builder()
-            .add_service(CoordinatorServer::new(CoordinatorSvc::default()))
+            .add_service(CoordinatorServer::new(CoordinatorSvc))
             .serve(args.addr)
             .await?;
         Ok(())
