@@ -14,3 +14,6 @@ tracing-subscriber.workspace = true
 
 mx8-observe = { path = "../mx8-observe" }
 mx8-proto = { path = "../mx8-proto" }
+mx8-core = { path = "../mx8-core" }
+mx8-manifest-store = { path = "../mx8-manifest-store" }
+mx8-snapshot = { path = "../mx8-snapshot" }

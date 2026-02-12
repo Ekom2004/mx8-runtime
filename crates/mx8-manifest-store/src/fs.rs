@@ -40,8 +40,8 @@ impl FsManifestStore {
 
     pub fn intent_key_for_base(base: &str) -> String {
         let normalized = normalize_intent_base(base);
-        let hash = fnv1a64(normalized.as_bytes());
-        format!("fnv64_{hash:016x}")
+        let hash_hex = crate::sha256_hex(normalized.as_bytes());
+        format!("sha256_{hash_hex}")
     }
 
     fn by_hash_path(&self, hash: &ManifestHash) -> Result<PathBuf, ManifestStoreError> {
@@ -206,17 +206,6 @@ impl ManifestStore for FsManifestStore {
 fn normalize_intent_base(base: &str) -> String {
     let trimmed = base.trim();
     trimmed.trim_end_matches('/').to_string()
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut h = FNV_OFFSET;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
 }
 
 fn lock_file_content(unix_time_ms: u64, owner: &LockOwner) -> String {
