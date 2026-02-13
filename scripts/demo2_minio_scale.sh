@@ -25,6 +25,9 @@ DEV_LEASE_WANT="${MX8_DEV_LEASE_WANT:-1}"
 BENCH_WANTS="${MX8_BENCH_WANTS:-}"
 
 SINK_SLEEP_MS="${SINK_SLEEP_MS:-0}"
+# Scale gate wants deterministic recovery; kill whichever node gets the first lease to
+# avoid waiting for a specific node ID (e.g., node1 vs node11 substring pitfalls).
+KILL_NODE_INDEX="${KILL_NODE_INDEX:-0}"
 # For scale runs, kill as soon as we observe the first lease_granted so we deterministically
 # exercise the "lease expires → remainder requeued" path (avoid racing with fast completion).
 KILL_AFTER_MS="${KILL_AFTER_MS:-0}"
@@ -146,6 +149,7 @@ run_once() {
   BYTES_PER_SAMPLE="${BYTES_PER_SAMPLE}" \
   BLOCK_SIZE="${BLOCK_SIZE}" \
   SINK_SLEEP_MS="${SINK_SLEEP_MS}" \
+  KILL_NODE_INDEX="${KILL_NODE_INDEX}" \
   KILL_AFTER_MS="${KILL_AFTER_MS}" \
   WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS}" \
   WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS}" \

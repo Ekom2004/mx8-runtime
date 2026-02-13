@@ -49,7 +49,7 @@ LEASE_TTL_MS="${LEASE_TTL_MS:-2000}"
 HEARTBEAT_INTERVAL_MS="${HEARTBEAT_INTERVAL_MS:-200}"
 PROGRESS_INTERVAL_MS="${PROGRESS_INTERVAL_MS:-200}"
 
-KILL_NODE_INDEX="${KILL_NODE_INDEX:-1}"       # 1-based index
+KILL_NODE_INDEX="${KILL_NODE_INDEX:-1}"       # 1-based index; set to 0 to auto-pick first lease holder
 KILL_AFTER_MS="${KILL_AFTER_MS:-750}"         # kill during first leases
 WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-15000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-15000}"
@@ -320,26 +320,47 @@ for i in $(seq 1 "${WORLD_SIZE}"); do
   AGENT_PIDS="${AGENT_PIDS} $!"
 done
 
-desired_kill_node_id="node${KILL_NODE_INDEX}"
+desired_kill_node_id=""
+if [[ "${KILL_NODE_INDEX}" != "0" ]]; then
+  desired_kill_node_id="node${KILL_NODE_INDEX}"
+fi
 kill_node_id="${desired_kill_node_id}"
-echo "[demo2_minio] waiting for first lease_granted to ${desired_kill_node_id}"
+if [[ -n "${desired_kill_node_id}" ]]; then
+  echo "[demo2_minio] waiting for first lease_granted to ${desired_kill_node_id}"
+else
+  echo "[demo2_minio] waiting for first lease_granted (auto kill target)"
+fi
 start_ms="$(ts_ms)"
 while true; do
-  if log_has_lease_granted_for_node_exact "${COORD_LOG}" "${desired_kill_node_id}"; then
-    echo "[demo2_minio] saw first lease_granted for ${desired_kill_node_id}"
-    break
-  fi
-  now_ms="$(ts_ms)"
-  if (( now_ms - start_ms > WAIT_FIRST_LEASE_TIMEOUT_MS )); then
-    echo "[demo2_minio] timeout waiting for first lease_granted for ${desired_kill_node_id}; falling back to first lease_granted node; see ${COORD_LOG}" >&2
+  if [[ -n "${desired_kill_node_id}" ]]; then
+    if log_has_lease_granted_for_node_exact "${COORD_LOG}" "${desired_kill_node_id}"; then
+      echo "[demo2_minio] saw first lease_granted for ${desired_kill_node_id}"
+      break
+    fi
+  else
     if kill_node_id="$(log_find_first_lease_granted_node_id "${COORD_LOG}")"; then
-      echo "[demo2_minio] fallback kill_node_id=${kill_node_id}" >&2
+      echo "[demo2_minio] selected kill_node_id=${kill_node_id}"
       KILL_NODE_INDEX="$(echo "${kill_node_id}" | sed -E 's/^node//')"
       if [[ -z "${KILL_NODE_INDEX}" ]]; then
         echo "[demo2_minio] could not parse kill index from ${kill_node_id}" >&2
         exit 1
       fi
       break
+    fi
+  fi
+  now_ms="$(ts_ms)"
+  if (( now_ms - start_ms > WAIT_FIRST_LEASE_TIMEOUT_MS )); then
+    if [[ -n "${desired_kill_node_id}" ]]; then
+      echo "[demo2_minio] timeout waiting for first lease_granted for ${desired_kill_node_id}; falling back to first lease_granted node; see ${COORD_LOG}" >&2
+      if kill_node_id="$(log_find_first_lease_granted_node_id "${COORD_LOG}")"; then
+        echo "[demo2_minio] fallback kill_node_id=${kill_node_id}" >&2
+        KILL_NODE_INDEX="$(echo "${kill_node_id}" | sed -E 's/^node//')"
+        if [[ -z "${KILL_NODE_INDEX}" ]]; then
+          echo "[demo2_minio] could not parse kill index from ${kill_node_id}" >&2
+          exit 1
+        fi
+        break
+      fi
     fi
     echo "[demo2_minio] could not find any lease_granted in coordinator log; aborting" >&2
     exit 1
