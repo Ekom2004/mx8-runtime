@@ -34,6 +34,11 @@ echo "[mx8] install maturin"
 "${PYTHON_BIN}" -m pip install -U pip >/dev/null
 "${PYTHON_BIN}" -m pip install -U maturin >/dev/null
 
+if [[ "${MX8_PY_SMOKE_INSTALL_TORCH:-0}" == "1" ]]; then
+  echo "[mx8] install torch (optional)"
+  "${PYTHON_BIN}" -m pip install -U torch
+fi
+
 STORE_ROOT="${TMP_ROOT}/store"
 DATA_FILE="${TMP_ROOT}/data.bin"
 DEV_MANIFEST="${TMP_ROOT}/dev_manifest.tsv"
@@ -74,6 +79,11 @@ if "${PYTHON_BIN}" -c "import torch" >/dev/null 2>&1; then
     MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
     MX8_DATASET_LINK="${TMP_ROOT}/dev@refresh" \
     "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_minimal.py"
+
+  MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
+    MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
+    MX8_DATASET_LINK="${TMP_ROOT}/dev@refresh" \
+    "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_train_minimal.py"
 else
   echo "[mx8] torch not installed in venv; skipping"
 fi
