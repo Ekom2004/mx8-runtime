@@ -68,6 +68,7 @@ async fn manifest_pipeline_reads_files_and_is_bounded() -> Result<()> {
         max_inflight_bytes: 32 * 1024,
         max_queue_batches: 8,
         batch_size_samples: 2,
+        prefetch_batches: 1,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();
@@ -116,6 +117,7 @@ async fn manifest_pipeline_can_run_subset_range() -> Result<()> {
         max_inflight_bytes: 8 * 1024,
         max_queue_batches: 4,
         batch_size_samples: 8,
+        prefetch_batches: 1,
     };
     let pipeline = Pipeline::new(caps);
 

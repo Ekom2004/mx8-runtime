@@ -18,6 +18,8 @@ type S3Client = aws_sdk_s3::Client;
 #[cfg(not(feature = "s3"))]
 type S3Client = ();
 
+type HttpClient = reqwest::Client;
+
 const PERMIT_UNIT_BYTES: u64 = 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +27,7 @@ pub struct RuntimeCaps {
     pub max_inflight_bytes: u64,
     pub max_queue_batches: usize,
     pub batch_size_samples: usize,
+    pub prefetch_batches: usize,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +122,9 @@ impl Pipeline {
     ) -> Result<()> {
         let records = parse_canonical_manifest_tsv(manifest_bytes)?;
         let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_http = records
+            .iter()
+            .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
         let s3_client: Option<S3Client> = if has_s3 {
             #[cfg(feature = "s3")]
             {
@@ -135,8 +141,19 @@ impl Pipeline {
             None
         };
 
+        let http_client: Option<HttpClient> = if has_http {
+            Some(
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?,
+            )
+        } else {
+            None
+        };
+
         let (tx, sink_task) = self.spawn_sink(sink)?;
-        self.produce_manifest_batches(tx.clone(), records, s3_client)
+        self.produce_manifest_batches(tx.clone(), records, s3_client, http_client)
             .await?;
         drop(tx);
         sink_task.await??;
@@ -154,6 +171,9 @@ impl Pipeline {
         let records = select_record_range(records, start_id, end_id)?;
 
         let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_http = records
+            .iter()
+            .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
         let s3_client: Option<S3Client> = if has_s3 {
             #[cfg(feature = "s3")]
             {
@@ -170,6 +190,17 @@ impl Pipeline {
             None
         };
 
+        let http_client: Option<HttpClient> = if has_http {
+            Some(
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?,
+            )
+        } else {
+            None
+        };
+
         tracing::info!(
             target: "mx8_proof",
             event = "range_selected",
@@ -180,7 +211,7 @@ impl Pipeline {
         );
 
         let (tx, sink_task) = self.spawn_sink(sink)?;
-        self.produce_manifest_batches(tx.clone(), records, s3_client)
+        self.produce_manifest_batches(tx.clone(), records, s3_client, http_client)
             .await?;
         drop(tx);
         sink_task.await??;
@@ -267,71 +298,78 @@ impl Pipeline {
         tx: mpsc::Sender<InflightBatch>,
         records: Vec<mx8_core::types::ManifestRecord>,
         s3_client: Option<S3Client>,
+        http_client: Option<HttpClient>,
     ) -> Result<()> {
-        let mut sender = tx;
-        let mut start = 0usize;
-        while start < records.len() {
-            let end = (start + self.caps.batch_size_samples).min(records.len());
-            self.send_manifest_batch(&mut sender, &records[start..end], s3_client.as_ref())
+        let prefetch = std::cmp::max(1, self.caps.prefetch_batches);
+        if prefetch <= 1 {
+            let sender = tx;
+            let mut start = 0usize;
+            while start < records.len() {
+                let end = (start + self.caps.batch_size_samples).min(records.len());
+                let inflight = build_manifest_inflight_batch(
+                    self.caps,
+                    self.metrics.clone(),
+                    self.inflight_sem.clone(),
+                    &records[start..end],
+                    s3_client.as_ref(),
+                    http_client.as_ref(),
+                )
                 .await?;
-            start = end;
-        }
-        Ok(())
-    }
-
-    async fn send_manifest_batch(
-        &self,
-        tx: &mut mpsc::Sender<InflightBatch>,
-        records: &[mx8_core::types::ManifestRecord],
-        s3_client: Option<&S3Client>,
-    ) -> Result<()> {
-        let plan = build_batch_plan(records, s3_client).await?;
-        let bytes = plan.total_bytes;
-        anyhow::ensure!(
-            bytes <= self.caps.max_inflight_bytes,
-            "batch payload bytes {} exceeds max_inflight_bytes {}",
-            bytes,
-            self.caps.max_inflight_bytes
-        );
-        let permit_units = if bytes == 0 {
-            0u64
-        } else {
-            bytes.div_ceil(PERMIT_UNIT_BYTES).max(1)
-        };
-
-        anyhow::ensure!(
-            permit_units <= u32::MAX as u64,
-            "batch too large for permit accounting ({} units)",
-            permit_units
-        );
-
-        let permit = self
-            .inflight_sem
-            .clone()
-            .acquire_many_owned(permit_units as u32)
-            .await?;
-
-        self.metrics.on_inflight_add(bytes);
-
-        let payload = match fetch_specs_payload(&plan.specs, s3_client).await {
-            Ok(p) => p,
-            Err(err) => {
-                self.metrics.on_inflight_sub(bytes);
-                return Err(err);
+                sender.send(inflight).await?;
+                start = end;
             }
-        };
+            return Ok(());
+        }
 
-        let batch = Batch {
-            sample_ids: Arc::from(plan.sample_ids.as_slice()),
-            payload: Arc::from(payload.as_slice()),
-        };
+        let records = Arc::new(records);
+        let mut joinset = tokio::task::JoinSet::new();
+        let mut buffer: std::collections::BTreeMap<usize, InflightBatch> =
+            std::collections::BTreeMap::new();
+        let mut next_to_send: usize = 0;
+        let mut next_batch_id: usize = 0;
+        let mut start = 0usize;
 
-        tx.send(InflightBatch {
-            batch,
-            bytes,
-            _permit: permit,
-        })
-        .await?;
+        while start < records.len() || !joinset.is_empty() {
+            while start < records.len() && joinset.len() < prefetch {
+                let end = (start + self.caps.batch_size_samples).min(records.len());
+                let batch_id = next_batch_id;
+                next_batch_id = next_batch_id.saturating_add(1);
+
+                let caps = self.caps;
+                let metrics = self.metrics.clone();
+                let sem = self.inflight_sem.clone();
+                let records = records.clone();
+                let s3_client = s3_client.clone();
+                let http_client = http_client.clone();
+
+                joinset.spawn(async move {
+                    let inflight = build_manifest_inflight_batch(
+                        caps,
+                        metrics,
+                        sem,
+                        &records[start..end],
+                        s3_client.as_ref(),
+                        http_client.as_ref(),
+                    )
+                    .await;
+                    (batch_id, inflight)
+                });
+
+                start = end;
+            }
+
+            let Some(res) = joinset.join_next().await else {
+                break;
+            };
+            let (batch_id, inflight) = res.map_err(anyhow::Error::from)?;
+            let inflight = inflight?;
+            buffer.insert(batch_id, inflight);
+
+            while let Some(inflight) = buffer.remove(&next_to_send) {
+                tx.send(inflight).await?;
+                next_to_send = next_to_send.saturating_add(1);
+            }
+        }
 
         Ok(())
     }
@@ -405,6 +443,9 @@ enum SpecLocation {
         bucket: String,
         key: String,
     },
+    Http {
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +458,7 @@ struct BatchPlan {
 async fn build_batch_plan(
     records: &[mx8_core::types::ManifestRecord],
     s3_client: Option<&S3Client>,
+    http_client: Option<&HttpClient>,
 ) -> Result<BatchPlan> {
     #[cfg(not(feature = "s3"))]
     let _ = s3_client;
@@ -453,6 +495,13 @@ async fn build_batch_plan(
                     );
                     (0u64, size, false)
                 }
+                SpecLocation::Http { url } => {
+                    let client = http_client.ok_or_else(|| {
+                        anyhow::anyhow!("http client not configured but http location present")
+                    })?;
+                    let size = http_head_len(client, url, r.sample_id).await?;
+                    (0u64, size, false)
+                }
             },
             _ => anyhow::bail!("partial byte range for sample_id {}", r.sample_id),
         };
@@ -478,7 +527,11 @@ async fn build_batch_plan(
     })
 }
 
-async fn fetch_specs_payload(specs: &[ReadSpec], s3_client: Option<&S3Client>) -> Result<Vec<u8>> {
+async fn fetch_specs_payload(
+    specs: &[ReadSpec],
+    s3_client: Option<&S3Client>,
+    http_client: Option<&HttpClient>,
+) -> Result<Vec<u8>> {
     #[cfg(not(feature = "s3"))]
     let _ = s3_client;
 
@@ -554,6 +607,20 @@ async fn fetch_specs_payload(specs: &[ReadSpec], s3_client: Option<&S3Client>) -
                 );
                 payload.extend_from_slice(&b);
             }
+            SpecLocation::Http { url } => {
+                let client = http_client.ok_or_else(|| {
+                    anyhow::anyhow!("http client not configured but http location present")
+                })?;
+                let b = http_range_get(client, url, s.offset, s.len, s.sample_id).await?;
+                anyhow::ensure!(
+                    b.len() == len,
+                    "http returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
+                );
+                payload.extend_from_slice(&b);
+            }
         }
     }
 
@@ -579,7 +646,176 @@ fn parse_location(location: &str) -> Result<SpecLocation> {
             return Ok(SpecLocation::S3 { bucket, key });
         }
     }
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(SpecLocation::Http {
+            url: location.to_string(),
+        });
+    }
     Ok(SpecLocation::Local(PathBuf::from(location)))
+}
+
+async fn http_head_len(client: &HttpClient, url: &str, sample_id: u64) -> Result<u64> {
+    let resp = http_with_retry(sample_id, || async move {
+        client
+            .head(url)
+            .header(reqwest::header::CONNECTION, "close")
+            .send()
+            .await
+    })
+    .await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("http HEAD failed: status={} url={}", resp.status(), url);
+    }
+
+    let len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("http HEAD missing/invalid content-length: url={url}"))?;
+    anyhow::ensure!(len > 0, "http HEAD returned zero length: url={url}");
+    Ok(len)
+}
+
+async fn http_range_get(
+    client: &HttpClient,
+    url: &str,
+    offset: u64,
+    len: u64,
+    sample_id: u64,
+) -> Result<Vec<u8>> {
+    let end = offset
+        .checked_add(len)
+        .and_then(|v| v.checked_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+    let range = format!("bytes={offset}-{end}");
+
+    let resp = http_with_retry(sample_id, || {
+        let range = range.clone();
+        async move {
+            client
+                .get(url)
+                .header(reqwest::header::CONNECTION, "close")
+                .header(reqwest::header::RANGE, range)
+                .send()
+                .await
+        }
+    })
+    .await?;
+
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        anyhow::bail!(
+            "http range GET failed: status={} url={} (expected 206)",
+            resp.status(),
+            url
+        );
+    }
+
+    let bytes = resp.bytes().await?;
+    Ok(bytes.to_vec())
+}
+
+async fn http_with_retry<F, Fut>(sample_id: u64, mut f: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    const MAX_ATTEMPTS: usize = 5;
+    const BASE_DELAY_MS: u64 = 50;
+    const MAX_DELAY_MS: u64 = 1000;
+
+    let mut attempt: usize = 0;
+    let mut delay_ms: u64 = BASE_DELAY_MS;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match f().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let transient = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status.is_server_error();
+                if transient && attempt < MAX_ATTEMPTS {
+                    let jitter = mx8_observe::time::unix_time_ms().wrapping_add(sample_id) % 37;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        delay_ms.saturating_add(jitter),
+                    ))
+                    .await;
+                    delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Err(err) => {
+                let transient = err.is_timeout() || err.is_connect();
+                if transient && attempt < MAX_ATTEMPTS {
+                    let jitter = mx8_observe::time::unix_time_ms().wrapping_add(sample_id) % 37;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        delay_ms.saturating_add(jitter),
+                    ))
+                    .await;
+                    delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                    continue;
+                }
+                return Err(anyhow::Error::new(err));
+            }
+        }
+    }
+}
+
+async fn build_manifest_inflight_batch(
+    caps: RuntimeCaps,
+    metrics: Arc<RuntimeMetrics>,
+    inflight_sem: Arc<Semaphore>,
+    records: &[mx8_core::types::ManifestRecord],
+    s3_client: Option<&S3Client>,
+    http_client: Option<&HttpClient>,
+) -> Result<InflightBatch> {
+    let plan = build_batch_plan(records, s3_client, http_client).await?;
+    let bytes = plan.total_bytes;
+    anyhow::ensure!(
+        bytes <= caps.max_inflight_bytes,
+        "batch payload bytes {} exceeds max_inflight_bytes {}",
+        bytes,
+        caps.max_inflight_bytes
+    );
+    let permit_units = if bytes == 0 {
+        0u64
+    } else {
+        bytes.div_ceil(PERMIT_UNIT_BYTES).max(1)
+    };
+
+    anyhow::ensure!(
+        permit_units <= u32::MAX as u64,
+        "batch too large for permit accounting ({} units)",
+        permit_units
+    );
+
+    let permit = inflight_sem
+        .clone()
+        .acquire_many_owned(permit_units as u32)
+        .await?;
+
+    metrics.on_inflight_add(bytes);
+
+    let payload = match fetch_specs_payload(&plan.specs, s3_client, http_client).await {
+        Ok(p) => p,
+        Err(err) => {
+            metrics.on_inflight_sub(bytes);
+            return Err(err);
+        }
+    };
+
+    let batch = Batch {
+        sample_ids: Arc::from(plan.sample_ids.as_slice()),
+        payload: Arc::from(payload.as_slice()),
+    };
+
+    Ok(InflightBatch {
+        batch,
+        bytes,
+        _permit: permit,
+    })
 }
 
 #[cfg(feature = "s3")]
