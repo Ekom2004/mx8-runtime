@@ -27,6 +27,8 @@ use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
 use mx8_runtime::sink::Sink;
 use mx8_runtime::types::Batch;
 
+const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Parser, Clone)]
 #[command(name = "mx8d-agent")]
 struct Args {
@@ -73,6 +75,14 @@ struct Args {
     /// How often to report progress while executing a lease.
     #[arg(long, env = "MX8_PROGRESS_INTERVAL_MS", default_value_t = 500)]
     progress_interval_ms: u64,
+
+    /// gRPC max message size (both decode/encode) for manifest proxying and future APIs.
+    #[arg(
+        long,
+        env = "MX8_GRPC_MAX_MESSAGE_BYTES",
+        default_value_t = DEFAULT_GRPC_MAX_MESSAGE_BYTES
+    )]
+    grpc_max_message_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -224,7 +234,9 @@ async fn report_progress_loop(
     progress: Arc<LeaseProgress>,
     mut done: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let mut client = CoordinatorClient::new(channel);
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(ctx.grpc_max_message_bytes)
+        .max_encoding_message_size(ctx.grpc_max_message_bytes);
     let mut ticker = tokio::time::interval(std::cmp::max(Duration::from_millis(1), ctx.interval));
     loop {
         tokio::select! {
@@ -273,6 +285,7 @@ struct ProgressLoopCtx {
     manifest_hash: String,
     lease_id: String,
     interval: Duration,
+    grpc_max_message_bytes: usize,
 }
 
 async fn run_lease(
@@ -317,6 +330,7 @@ async fn run_lease(
             manifest_hash: manifest_hash.to_string(),
             lease_id: lease.lease_id.clone(),
             interval: Duration::from_millis(args.progress_interval_ms),
+            grpc_max_message_bytes: args.grpc_max_message_bytes,
         },
         progress.clone(),
         done_rx,
@@ -337,7 +351,9 @@ async fn run_lease(
     metrics.delivered_samples_total.inc_by(delivered_samples);
     metrics.delivered_bytes_total.inc_by(delivered_bytes);
 
-    let mut client = CoordinatorClient::new(channel);
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(args.grpc_max_message_bytes)
+        .max_encoding_message_size(args.grpc_max_message_bytes);
     let _ = client
         .report_progress(ReportProgressRequest {
             job_id: args.job_id.clone(),
@@ -383,7 +399,9 @@ async fn main() -> Result<()> {
         let channel = Channel::from_shared(args.coord_url.clone())?
             .connect()
             .await?;
-        let mut client = CoordinatorClient::new(channel.clone());
+        let mut client = CoordinatorClient::new(channel.clone())
+            .max_decoding_message_size(args.grpc_max_message_bytes)
+            .max_encoding_message_size(args.grpc_max_message_bytes);
 
         let metrics = Arc::new(AgentMetrics::default());
         metrics.register_total.inc();
@@ -429,8 +447,9 @@ async fn main() -> Result<()> {
             Ok(resp) => {
                 let resp = resp.into_inner();
                 let path = args.manifest_cache_dir.join(&manifest_hash);
-                manifest_bytes = Some(Arc::new(resp.manifest_bytes.clone()));
-                if let Err(err) = write_atomic(&path, &resp.manifest_bytes) {
+                let bytes = Arc::new(resp.manifest_bytes);
+                manifest_bytes = Some(bytes.clone());
+                if let Err(err) = write_atomic(&path, bytes.as_slice()) {
                     warn!(error = %err, path = %path.display(), "failed to cache manifest");
                 } else {
                     info!(
@@ -440,7 +459,7 @@ async fn main() -> Result<()> {
                         node_id = %args.node_id,
                         manifest_hash = %manifest_hash,
                         schema_version = resp.schema_version,
-                        manifest_bytes = resp.manifest_bytes.len() as u64,
+                        manifest_bytes = bytes.len() as u64,
                         path = %path.display(),
                         "cached manifest"
                     );
@@ -478,8 +497,11 @@ async fn main() -> Result<()> {
         let heartbeat_job_id = args.job_id.clone();
         let heartbeat_node_id = args.node_id.clone();
         let metrics_clone = metrics.clone();
+        let grpc_max = args.grpc_max_message_bytes;
         tokio::spawn(async move {
-            let mut client = CoordinatorClient::new(heartbeat_channel);
+            let mut client = CoordinatorClient::new(heartbeat_channel)
+                .max_decoding_message_size(grpc_max)
+                .max_encoding_message_size(grpc_max);
             loop {
                 tokio::time::sleep(Duration::from_millis(heartbeat_interval_ms)).await;
                 metrics_clone.heartbeat_total.inc();
@@ -523,6 +545,7 @@ async fn main() -> Result<()> {
             let manifest_bytes = manifest_bytes.clone();
             tokio::spawn(async move {
                 let want = std::cmp::max(1, args_clone.dev_lease_want);
+                let grpc_max = args_clone.grpc_max_message_bytes;
                 let caps = RuntimeCaps {
                     max_inflight_bytes: args_clone.max_inflight_bytes,
                     max_queue_batches: args_clone.max_queue_batches,
@@ -530,7 +553,9 @@ async fn main() -> Result<()> {
                 };
                 let pipeline = Arc::new(Pipeline::new(caps));
                 loop {
-                    let mut client = CoordinatorClient::new(lease_channel.clone());
+                    let mut client = CoordinatorClient::new(lease_channel.clone())
+                        .max_decoding_message_size(grpc_max)
+                        .max_encoding_message_size(grpc_max);
                     let resp = client
                         .request_lease(RequestLeaseRequest {
                             job_id: args_clone.job_id.clone(),
