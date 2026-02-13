@@ -49,8 +49,10 @@ LEASE_TTL_MS="${LEASE_TTL_MS:-2000}"
 HEARTBEAT_INTERVAL_MS="${HEARTBEAT_INTERVAL_MS:-200}"
 PROGRESS_INTERVAL_MS="${PROGRESS_INTERVAL_MS:-200}"
 
-KILL_NODE_INDEX="${KILL_NODE_INDEX:-1}"       # 1-based index; set to 0 to auto-pick first lease holder
-KILL_AFTER_MS="${KILL_AFTER_MS:-750}"         # kill during first leases
+KILL_COUNT="${KILL_COUNT:-1}"                # number of distinct nodes to kill during the run
+KILL_NODE_INDEX="${KILL_NODE_INDEX:-1}"      # 1-based index; set to 0 to auto-pick a live lease holder
+KILL_AFTER_MS="${KILL_AFTER_MS:-750}"        # delay before first kill (ms)
+KILL_INTERVAL_MS="${KILL_INTERVAL_MS:-30000}" # delay between subsequent kills (ms)
 WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-15000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-15000}"
 WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-60000}"
@@ -138,13 +140,163 @@ import re
 path = sys.argv[1]
 node_id = sys.argv[2]
 ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-needle = re.compile(rf'event="lease_granted".*\\bnode_id={re.escape(node_id)}\\b')
+needle = re.compile(rf'event="lease_granted".*\bnode_id={re.escape(node_id)}\b')
 
 try:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for raw in f:
             line = ansi.sub("", raw)
             if needle.search(line):
+                raise SystemExit(0)
+except FileNotFoundError:
+    pass
+
+raise SystemExit(1)
+PY
+}
+
+log_has_live_lease_for_node_exact() {
+  # Usage: log_has_live_lease_for_node_exact <path> <node_id>
+  # Returns success if the most recent `event="live_leases"` line contains `@<node_id>`.
+  python3 - "$@" <<'PY'
+import sys
+import re
+
+path = sys.argv[1]
+node_id = sys.argv[2]
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+last = None
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = ansi.sub("", raw)
+            if 'event="live_leases"' in line:
+                last = line
+except FileNotFoundError:
+    pass
+
+if not last:
+    raise SystemExit(1)
+
+m = re.search(r"\bintervals=([^\n]+)$", last)
+if not m:
+    raise SystemExit(1)
+
+intervals = m.group(1)
+needle = re.compile(rf"@{re.escape(node_id)}(\b|$)")
+if needle.search(intervals):
+    raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+log_find_live_lease_node_id() {
+  # Usage: log_find_live_lease_node_id <path> <excluded_csv>
+  # Reads the most recent `event="live_leases"` line and returns the first node_id not excluded.
+  python3 - "$@" <<'PY'
+import sys
+import re
+
+path = sys.argv[1]
+excluded_csv = sys.argv[2] if len(sys.argv) > 2 else ""
+excluded = {s for s in excluded_csv.split(",") if s}
+
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+last = None
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = ansi.sub("", raw)
+            if 'event="live_leases"' in line:
+                last = line
+except FileNotFoundError:
+    pass
+
+if not last:
+    raise SystemExit(1)
+
+# Example: intervals=10000-20000:lease-1@node1, 20000-30000:lease-2@node2
+m = re.search(r"\bintervals=([^\n]+)$", last)
+if not m:
+    raise SystemExit(1)
+
+intervals = m.group(1)
+nodes = []
+for part in intervals.split(","):
+    part = part.strip()
+    at = part.rfind("@")
+    if at == -1:
+        continue
+    node = part[at + 1 :].strip()
+    if node:
+        nodes.append(node)
+
+for node in nodes:
+    if node not in excluded:
+        sys.stdout.write(node)
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+log_find_last_lease_granted_node_id() {
+  # Usage: log_find_last_lease_granted_node_id <path> <excluded_csv>
+  # Prints the most recent node_id for event="lease_granted" that is not excluded.
+  python3 - "$@" <<'PY'
+import sys
+import re
+
+path = sys.argv[1]
+excluded_csv = sys.argv[2] if len(sys.argv) > 2 else ""
+excluded = {s for s in excluded_csv.split(",") if s}
+
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+last_node = None
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = ansi.sub("", raw)
+            if 'event="lease_granted"' not in line:
+                continue
+            m = re.search(r"\bnode_id=([^\s]+)\b", line)
+            if not m:
+                continue
+            node = m.group(1)
+            if node in excluded:
+                continue
+            last_node = node
+except FileNotFoundError:
+    pass
+
+if last_node:
+    sys.stdout.write(last_node)
+    raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+log_has_range_requeued_for_node_exact() {
+  # Usage: log_has_range_requeued_for_node_exact <path> <node_id>
+  python3 - "$@" <<'PY'
+import sys
+import re
+
+path = sys.argv[1]
+node_id = sys.argv[2]
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+node_needle = re.compile(rf'\bnode_id={re.escape(node_id)}\b')
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = ansi.sub("", raw)
+            if 'event="range_requeued"' in line and node_needle.search(line):
                 raise SystemExit(0)
 except FileNotFoundError:
     pass
@@ -320,74 +472,109 @@ for i in $(seq 1 "${WORLD_SIZE}"); do
   AGENT_PIDS="${AGENT_PIDS} $!"
 done
 
-desired_kill_node_id=""
-if [[ "${KILL_NODE_INDEX}" != "0" ]]; then
-  desired_kill_node_id="node${KILL_NODE_INDEX}"
-fi
-kill_node_id="${desired_kill_node_id}"
-if [[ -n "${desired_kill_node_id}" ]]; then
-  echo "[demo2_minio] waiting for first lease_granted to ${desired_kill_node_id}"
-else
-  echo "[demo2_minio] waiting for first lease_granted (auto kill target)"
-fi
-start_ms="$(ts_ms)"
-while true; do
-  if [[ -n "${desired_kill_node_id}" ]]; then
-    if log_has_lease_granted_for_node_exact "${COORD_LOG}" "${desired_kill_node_id}"; then
-      echo "[demo2_minio] saw first lease_granted for ${desired_kill_node_id}"
-      break
-    fi
-  else
-    if kill_node_id="$(log_find_first_lease_granted_node_id "${COORD_LOG}")"; then
-      echo "[demo2_minio] selected kill_node_id=${kill_node_id}"
-      KILL_NODE_INDEX="$(echo "${kill_node_id}" | sed -E 's/^node//')"
-      if [[ -z "${KILL_NODE_INDEX}" ]]; then
-        echo "[demo2_minio] could not parse kill index from ${kill_node_id}" >&2
-        exit 1
-      fi
-      break
-    fi
+python3 - "${KILL_COUNT}" "${WORLD_SIZE}" <<'PY'
+import sys
+k = int(sys.argv[1])
+w = int(sys.argv[2])
+if k < 1:
+    raise SystemExit("KILL_COUNT must be >= 1")
+if w < 1:
+    raise SystemExit("WORLD_SIZE must be >= 1")
+if k >= w:
+    raise SystemExit("KILL_COUNT must be < WORLD_SIZE (need at least one node alive to drain)")
+PY
+
+excluded_kill_nodes=""
+first_kill_node_id=""
+first_kill_time_ms="0"
+
+for kill_seq in $(seq 1 "${KILL_COUNT}"); do
+  delay_ms="${KILL_AFTER_MS}"
+  if [[ "${kill_seq}" != "1" ]]; then
+    delay_ms="${KILL_INTERVAL_MS}"
   fi
-  now_ms="$(ts_ms)"
-  if (( now_ms - start_ms > WAIT_FIRST_LEASE_TIMEOUT_MS )); then
-    if [[ -n "${desired_kill_node_id}" ]]; then
-      echo "[demo2_minio] timeout waiting for first lease_granted for ${desired_kill_node_id}; falling back to first lease_granted node; see ${COORD_LOG}" >&2
-      if kill_node_id="$(log_find_first_lease_granted_node_id "${COORD_LOG}")"; then
-        echo "[demo2_minio] fallback kill_node_id=${kill_node_id}" >&2
-        KILL_NODE_INDEX="$(echo "${kill_node_id}" | sed -E 's/^node//')"
-        if [[ -z "${KILL_NODE_INDEX}" ]]; then
-          echo "[demo2_minio] could not parse kill index from ${kill_node_id}" >&2
-          exit 1
-        fi
+  sleep_ms "${delay_ms}"
+
+  desired_kill_node_id=""
+  if [[ "${KILL_NODE_INDEX}" != "0" && "${kill_seq}" == "1" ]]; then
+    desired_kill_node_id="node${KILL_NODE_INDEX}"
+  fi
+
+  kill_node_id=""
+  if [[ -n "${desired_kill_node_id}" ]]; then
+    echo "[demo2_minio] kill_seq=${kill_seq} waiting for ${desired_kill_node_id} to hold a live lease"
+    start_ms="$(ts_ms)"
+    while true; do
+      if log_has_live_lease_for_node_exact "${COORD_LOG}" "${desired_kill_node_id}"; then
+        kill_node_id="${desired_kill_node_id}"
         break
       fi
+      now_ms="$(ts_ms)"
+      if (( now_ms - start_ms > WAIT_FIRST_LEASE_TIMEOUT_MS )); then
+        echo "[demo2_minio] kill_seq=${kill_seq} timeout waiting for ${desired_kill_node_id} live lease; falling back to live lease holder" >&2
+        break
+      fi
+      sleep_ms 100
+    done
+  fi
+
+  if [[ -z "${kill_node_id}" ]]; then
+    echo "[demo2_minio] kill_seq=${kill_seq} selecting kill target from live_leases"
+    start_ms="$(ts_ms)"
+    while true; do
+      if kill_node_id="$(log_find_live_lease_node_id "${COORD_LOG}" "${excluded_kill_nodes}")"; then
+        echo "[demo2_minio] kill_seq=${kill_seq} selected kill_node_id=${kill_node_id}"
+        break
+      fi
+      now_ms="$(ts_ms)"
+      if (( now_ms - start_ms > WAIT_FIRST_LEASE_TIMEOUT_MS )); then
+        echo "[demo2_minio] kill_seq=${kill_seq} timeout waiting for live_leases; falling back to most recent lease_granted" >&2
+        if kill_node_id="$(log_find_last_lease_granted_node_id "${COORD_LOG}" "${excluded_kill_nodes}")"; then
+          echo "[demo2_minio] kill_seq=${kill_seq} fallback kill_node_id=${kill_node_id}" >&2
+          break
+        fi
+        echo "[demo2_minio] kill_seq=${kill_seq} could not find any lease_granted; aborting" >&2
+        exit 1
+      fi
+      sleep_ms 200
+    done
+  fi
+
+  if [[ -z "${kill_node_id}" ]]; then
+    echo "[demo2_minio] kill_seq=${kill_seq} could not pick kill node" >&2
+    exit 1
+  fi
+
+  KILL_NODE_INDEX="$(echo "${kill_node_id}" | sed -E 's/^node//')"
+  if [[ -z "${KILL_NODE_INDEX}" ]]; then
+    echo "[demo2_minio] kill_seq=${kill_seq} could not parse kill index from ${kill_node_id}" >&2
+    exit 1
+  fi
+
+  kill_pid="$(echo "${AGENT_PIDS}" | awk -v idx="${KILL_NODE_INDEX}" '{print $idx}')"
+  echo "[demo2_minio] killing kill_seq=${kill_seq} node_id=${kill_node_id} index=${KILL_NODE_INDEX} pid=${kill_pid}"
+  kill_time_ms="$(ts_ms)"
+  if [[ -z "${first_kill_node_id}" ]]; then
+    first_kill_node_id="${kill_node_id}"
+    first_kill_time_ms="${kill_time_ms}"
+  fi
+  kill -KILL "${kill_pid}" >/dev/null 2>&1 || true
+  excluded_kill_nodes="${excluded_kill_nodes}${excluded_kill_nodes:+,}${kill_node_id}"
+
+  echo "[demo2_minio] kill_seq=${kill_seq} waiting for coordinator to emit range_requeued for ${kill_node_id}"
+  start_ms="$(ts_ms)"
+  while true; do
+    if log_has_range_requeued_for_node_exact "${COORD_LOG}" "${kill_node_id}"; then
+      echo "[demo2_minio] kill_seq=${kill_seq} saw range_requeued for ${kill_node_id}"
+      break
     fi
-    echo "[demo2_minio] could not find any lease_granted in coordinator log; aborting" >&2
-    exit 1
-  fi
-  sleep_ms 100
-done
-
-sleep_ms "${KILL_AFTER_MS}"
-
-kill_pid="$(echo "${AGENT_PIDS}" | awk -v idx="${KILL_NODE_INDEX}" '{print $idx}')"
-echo "[demo2_minio] killing node_id=${kill_node_id} index=${KILL_NODE_INDEX} pid=${kill_pid}"
-kill_time_ms="$(ts_ms)"
-kill -KILL "${kill_pid}" >/dev/null 2>&1 || true
-
-echo "[demo2_minio] waiting for coordinator to emit range_requeued"
-start_ms="$(ts_ms)"
-while true; do
-  if log_has_line_with_all "${COORD_LOG}" 'event="range_requeued"'; then
-    echo "[demo2_minio] saw range_requeued"
-    break
-  fi
-  now_ms="$(ts_ms)"
-  if (( now_ms - start_ms > WAIT_REQUEUE_TIMEOUT_MS )); then
-    echo "[demo2_minio] timeout waiting for range_requeued; see ${COORD_LOG}"
-    exit 1
-  fi
-  sleep_ms 200
+    now_ms="$(ts_ms)"
+    if (( now_ms - start_ms > WAIT_REQUEUE_TIMEOUT_MS )); then
+      echo "[demo2_minio] kill_seq=${kill_seq} timeout waiting for range_requeued; see ${COORD_LOG}" >&2
+      exit 1
+    fi
+    sleep_ms 200
+  done
 done
 
 echo "[demo2_minio] waiting for coordinator to emit job_drained"
@@ -501,4 +688,4 @@ PY
 echo "[demo2_minio] done"
 echo "[demo2_minio] artifacts: ${TMP_ROOT}"
 echo "[demo2_minio] coordinator log: ${COORD_LOG}"
-print_coordinator_summary "${COORD_LOG}" "${kill_node_id}" "${kill_time_ms}"
+print_coordinator_summary "${COORD_LOG}" "${first_kill_node_id:-unknown}" "${first_kill_time_ms:-0}"
