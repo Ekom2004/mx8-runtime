@@ -19,6 +19,8 @@ use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
 use mx8_proto::v0::*;
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 
+const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(name = "mx8-coordinator")]
 struct Args {
@@ -87,6 +89,14 @@ struct Args {
     /// Optional: periodically emit a metrics snapshot to logs.
     #[arg(long, env = "MX8_METRICS_SNAPSHOT_INTERVAL_MS", default_value_t = 0)]
     metrics_snapshot_interval_ms: u64,
+
+    /// gRPC max message size (both decode/encode) for manifest proxying and future APIs.
+    #[arg(
+        long,
+        env = "MX8_GRPC_MAX_MESSAGE_BYTES",
+        default_value_t = DEFAULT_GRPC_MAX_MESSAGE_BYTES
+    )]
+    grpc_max_message_bytes: usize,
 }
 
 fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> {
@@ -848,7 +858,11 @@ async fn main() -> Result<()> {
             });
         }
         Server::builder()
-            .add_service(CoordinatorServer::new(svc))
+            .add_service(
+                CoordinatorServer::new(svc)
+                    .max_decoding_message_size(args.grpc_max_message_bytes)
+                    .max_encoding_message_size(args.grpc_max_message_bytes),
+            )
             .serve(args.addr)
             .await?;
         Ok(())
