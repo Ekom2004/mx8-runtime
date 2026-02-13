@@ -126,6 +126,7 @@ struct CoordinatorState {
     leases: std::collections::BTreeMap<String, Lease>,
     progress: std::collections::BTreeMap<(String, String), u64>,
     next_lease_id: u64,
+    drained_emitted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -212,6 +213,9 @@ impl CoordinatorSvc {
     async fn tick_once_at(&self, now_unix_time_ms: u64) {
         let mut expired: Vec<(Lease, u64)> = Vec::new();
         let mut requeued: Vec<(String, String, WorkRange, u64)> = Vec::new();
+        let mut intervals_snapshot: Option<String> = None;
+        let live_lease_count: usize;
+        let mut drained_event: Option<(u64, u32)> = None;
 
         {
             let mut state = self.state.write().await;
@@ -254,6 +258,69 @@ impl CoordinatorSvc {
                     remainder,
                     cursor,
                 ));
+            }
+
+            let mut intervals: Vec<(u64, u64, String, String)> = Vec::new();
+            for lease in state.leases.values() {
+                let Some(range) = &lease.range else {
+                    continue;
+                };
+                intervals.push((
+                    range.start_id,
+                    range.end_id,
+                    lease.lease_id.clone(),
+                    lease.node_id.clone(),
+                ));
+            }
+            intervals.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            for w in intervals.windows(2) {
+                let a = &w[0];
+                let b = &w[1];
+                if a.1 > b.0 {
+                    tracing::error!(
+                        target: "mx8_proof",
+                        event = "overlap_detected",
+                        manifest_hash = %self.manifest_hash,
+                        a_lease_id = %a.2,
+                        a_node_id = %a.3,
+                        a_start_id = a.0,
+                        a_end_id = a.1,
+                        b_lease_id = %b.2,
+                        b_node_id = %b.3,
+                        b_start_id = b.0,
+                        b_end_id = b.1,
+                        "overlapping live lease ranges detected"
+                    );
+                    panic!("overlapping live lease ranges detected");
+                }
+            }
+
+            live_lease_count = state.leases.len();
+            if !intervals.is_empty() {
+                let mut s = String::new();
+                let max = intervals.len().min(16);
+                for (i, (start, end, lease_id, node_id)) in
+                    intervals.into_iter().take(max).enumerate()
+                {
+                    if i != 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&format!("{start}-{end}:{lease_id}@{node_id}"));
+                }
+                if max < state.leases.len() {
+                    s.push_str(", ...");
+                }
+                intervals_snapshot = Some(s);
+            }
+
+            let job_ready = state.nodes.len() as u32 >= self.world_size;
+            if job_ready
+                && !state.drained_emitted
+                && state.leases.is_empty()
+                && state.available_ranges.is_empty()
+            {
+                state.drained_emitted = true;
+                drained_event = Some((now_unix_time_ms, state.nodes.len() as u32));
             }
         }
 
@@ -299,6 +366,35 @@ impl CoordinatorSvc {
                 end_id = remainder.end_id,
                 cursor = cursor,
                 "requeued remainder"
+            );
+        }
+
+        tracing::info!(
+            target: "mx8_proof",
+            event = "no_overlap_ok",
+            manifest_hash = %self.manifest_hash,
+            live_leases = live_lease_count as u64,
+            "no overlapping live leases"
+        );
+
+        if let Some(snapshot) = intervals_snapshot {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "live_leases",
+                manifest_hash = %self.manifest_hash,
+                intervals = %snapshot,
+                "live lease intervals"
+            );
+        }
+
+        if let Some((now, registered_nodes)) = drained_event {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "job_drained",
+                manifest_hash = %self.manifest_hash,
+                registered_nodes = registered_nodes,
+                unix_time_ms = now,
+                "job drained"
             );
         }
 
@@ -720,6 +816,7 @@ async fn main() -> Result<()> {
                 leases: std::collections::BTreeMap::new(),
                 progress: std::collections::BTreeMap::new(),
                 next_lease_id: 0,
+                drained_emitted: false,
             })),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: args.world_size,
@@ -874,6 +971,7 @@ mod tests {
             leases: std::collections::BTreeMap::new(),
             progress: std::collections::BTreeMap::new(),
             next_lease_id: 0,
+            drained_emitted: false,
         }));
 
         let svc = CoordinatorSvc {
