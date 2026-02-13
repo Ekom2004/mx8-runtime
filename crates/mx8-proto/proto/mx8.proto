@@ -16,6 +16,9 @@ service Coordinator {
   rpc RequestLease(RequestLeaseRequest) returns (RequestLeaseResponse);
   rpc ReportProgress(ReportProgressRequest) returns (ReportProgressResponse);
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+  // Chunked manifest proxy to avoid gRPC message size limits for larger manifests.
+  // Clients must concatenate chunks in order to reconstruct `manifest_bytes`.
+  rpc GetManifestStream(GetManifestRequest) returns (stream ManifestChunk);
 }
 
 message NodeCaps {
@@ -107,5 +110,10 @@ message GetManifestRequest {
 
 message GetManifestResponse {
   bytes manifest_bytes = 1;
+  uint32 schema_version = 2;
+}
+
+message ManifestChunk {
+  bytes data = 1;
   uint32 schema_version = 2;
 }
