@@ -102,6 +102,57 @@ sys.exit(1)
 PY
 }
 
+log_find_first_lease_granted_node_id() {
+  # Usage: log_find_first_lease_granted_node_id <path>
+  # Prints the first observed node_id for event="lease_granted", or nothing if none found yet.
+  python3 - "$@" <<'PY'
+import sys
+import re
+
+path = sys.argv[1]
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = ansi.sub("", raw)
+            if 'event="lease_granted"' not in line:
+                continue
+            m = re.search(r"\bnode_id=([^\s]+)\b", line)
+            if m:
+                sys.stdout.write(m.group(1))
+                raise SystemExit(0)
+except FileNotFoundError:
+    pass
+
+raise SystemExit(1)
+PY
+}
+
+log_has_lease_granted_for_node_exact() {
+  # Usage: log_has_lease_granted_for_node_exact <path> <node_id>
+  python3 - "$@" <<'PY'
+import sys
+import re
+
+path = sys.argv[1]
+node_id = sys.argv[2]
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+needle = re.compile(rf'event="lease_granted".*\\bnode_id={re.escape(node_id)}\\b')
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = ansi.sub("", raw)
+            if needle.search(line):
+                raise SystemExit(0)
+except FileNotFoundError:
+    pass
+
+raise SystemExit(1)
+PY
+}
+
 wait_for_tcp_listen() {
   # Usage: wait_for_tcp_listen <host> <port> <timeout_ms>
   python3 - "$@" <<'PY'
@@ -269,17 +320,28 @@ for i in $(seq 1 "${WORLD_SIZE}"); do
   AGENT_PIDS="${AGENT_PIDS} $!"
 done
 
-kill_node_id="node${KILL_NODE_INDEX}"
-echo "[demo2_minio] waiting for first lease_granted to ${kill_node_id}"
+desired_kill_node_id="node${KILL_NODE_INDEX}"
+kill_node_id="${desired_kill_node_id}"
+echo "[demo2_minio] waiting for first lease_granted to ${desired_kill_node_id}"
 start_ms="$(ts_ms)"
 while true; do
-  if log_has_line_with_all "${COORD_LOG}" 'event="lease_granted"' "node_id=${kill_node_id}"; then
-    echo "[demo2_minio] saw first lease_granted for ${kill_node_id}"
+  if log_has_lease_granted_for_node_exact "${COORD_LOG}" "${desired_kill_node_id}"; then
+    echo "[demo2_minio] saw first lease_granted for ${desired_kill_node_id}"
     break
   fi
   now_ms="$(ts_ms)"
   if (( now_ms - start_ms > WAIT_FIRST_LEASE_TIMEOUT_MS )); then
-    echo "[demo2_minio] timeout waiting for first lease_granted for ${kill_node_id}; see ${COORD_LOG}"
+    echo "[demo2_minio] timeout waiting for first lease_granted for ${desired_kill_node_id}; falling back to first lease_granted node; see ${COORD_LOG}" >&2
+    if kill_node_id="$(log_find_first_lease_granted_node_id "${COORD_LOG}")"; then
+      echo "[demo2_minio] fallback kill_node_id=${kill_node_id}" >&2
+      KILL_NODE_INDEX="$(echo "${kill_node_id}" | sed -E 's/^node//')"
+      if [[ -z "${KILL_NODE_INDEX}" ]]; then
+        echo "[demo2_minio] could not parse kill index from ${kill_node_id}" >&2
+        exit 1
+      fi
+      break
+    fi
+    echo "[demo2_minio] could not find any lease_granted in coordinator log; aborting" >&2
     exit 1
   fi
   sleep_ms 100
@@ -288,7 +350,7 @@ done
 sleep_ms "${KILL_AFTER_MS}"
 
 kill_pid="$(echo "${AGENT_PIDS}" | awk -v idx="${KILL_NODE_INDEX}" '{print $idx}')"
-echo "[demo2_minio] killing node index=${KILL_NODE_INDEX} pid=${kill_pid}"
+echo "[demo2_minio] killing node_id=${kill_node_id} index=${KILL_NODE_INDEX} pid=${kill_pid}"
 kill_time_ms="$(ts_ms)"
 kill -KILL "${kill_pid}" >/dev/null 2>&1 || true
 
@@ -359,6 +421,7 @@ first_grant_ms: Optional[int] = None
 drained_ms: Optional[int] = None
 expired_ms: Optional[int] = None
 requeued_ms: Optional[int] = None
+kill_node_re = re.compile(rf"\bnode_id={re.escape(kill_node_id)}\b")
 
 with open(coord_log, "r", encoding="utf-8", errors="replace") as f:
     for raw in f:
@@ -375,12 +438,12 @@ with open(coord_log, "r", encoding="utf-8", errors="replace") as f:
 
         if 'event="lease_expired"' in line:
             events["lease_expired"] += 1
-            if expired_ms is None and (f"node_id={kill_node_id}" in line) and t is not None:
+            if expired_ms is None and kill_node_re.search(line) and t is not None:
                 expired_ms = t
 
         if 'event="range_requeued"' in line:
             events["range_requeued"] += 1
-            if requeued_ms is None and (f"node_id={kill_node_id}" in line) and t is not None:
+            if requeued_ms is None and kill_node_re.search(line) and t is not None:
                 requeued_ms = t
 
         # Coordinator proof logs use event="progress" for accepted progress reports.
