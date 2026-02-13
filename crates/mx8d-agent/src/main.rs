@@ -277,6 +277,7 @@ struct ProgressLoopCtx {
 
 async fn run_lease(
     channel: Channel,
+    pipeline: Arc<Pipeline>,
     args: &Args,
     manifest_hash: &str,
     metrics: &Arc<AgentMetrics>,
@@ -319,13 +320,6 @@ async fn run_lease(
         progress.clone(),
         done_rx,
     ));
-
-    let caps = RuntimeCaps {
-        max_inflight_bytes: args.max_inflight_bytes,
-        max_queue_batches: args.max_queue_batches,
-        batch_size_samples: args.batch_size_samples,
-    };
-    let pipeline = Pipeline::new(caps);
 
     pipeline
         .run_manifest_cache_dir_range(
@@ -524,6 +518,12 @@ async fn main() -> Result<()> {
             let manifest_hash_clone = manifest_hash.clone();
             tokio::spawn(async move {
                 let want = std::cmp::max(1, args_clone.dev_lease_want);
+                let caps = RuntimeCaps {
+                    max_inflight_bytes: args_clone.max_inflight_bytes,
+                    max_queue_batches: args_clone.max_queue_batches,
+                    batch_size_samples: args_clone.batch_size_samples,
+                };
+                let pipeline = Arc::new(Pipeline::new(caps));
                 loop {
                     let mut client = CoordinatorClient::new(lease_channel.clone());
                     let resp = client
@@ -549,18 +549,35 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    let max_concurrent = std::cmp::max(1, want as usize);
+                    let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+                    let mut joinset = tokio::task::JoinSet::new();
+
                     for lease in resp.leases {
-                        if let Err(err) = run_lease(
-                            lease_channel.clone(),
-                            &args_clone,
-                            &manifest_hash_clone,
-                            &metrics_clone,
-                            lease,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %err, "lease execution failed");
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        let permit = match sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        let pipeline = pipeline.clone();
+                        let args = args_clone.clone();
+                        let manifest_hash = manifest_hash_clone.clone();
+                        let metrics = metrics_clone.clone();
+                        let ch = lease_channel.clone();
+                        joinset.spawn(async move {
+                            let _permit = permit;
+                            run_lease(ch, pipeline, &args, &manifest_hash, &metrics, lease).await
+                        });
+                    }
+
+                    while let Some(res) = joinset.join_next().await {
+                        match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                tracing::error!(error = %err, "lease execution failed");
+                            }
+                            Err(err) => {
+                                tracing::error!(error = %err, "lease task join failed");
+                            }
                         }
                     }
                 }
