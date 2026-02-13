@@ -18,6 +18,7 @@ Once the Rust workspace exists:
 - `cargo test`: run unit/integration tests.
 - `cargo fmt --all`: format Rust code (rustfmt).
 - `cargo clippy --all-targets --all-features`: lint for common Rust issues.
+- `./scripts/smoke.sh`: run format/lint/tests plus internal demo gates (Demo 2 + Demo 3).
 
 ## Coding Style & Naming Conventions
 
