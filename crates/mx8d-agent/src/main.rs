@@ -278,6 +278,7 @@ struct ProgressLoopCtx {
 async fn run_lease(
     channel: Channel,
     pipeline: Arc<Pipeline>,
+    manifest_bytes: Arc<Vec<u8>>,
     args: &Args,
     manifest_hash: &str,
     metrics: &Arc<AgentMetrics>,
@@ -322,13 +323,7 @@ async fn run_lease(
     ));
 
     pipeline
-        .run_manifest_cache_dir_range(
-            sink,
-            &args.manifest_cache_dir,
-            manifest_hash,
-            range.start_id,
-            range.end_id,
-        )
+        .run_manifest_bytes_range(sink, &manifest_bytes, range.start_id, range.end_id)
         .await?;
 
     let _ = done_tx.send(());
@@ -423,6 +418,7 @@ async fn main() -> Result<()> {
         // M3: manifest proxy fallback (control-plane only).
         // Cache the pinned manifest locally so future runtime stages can load it without
         // needing to talk to the coordinator.
+        let mut manifest_bytes: Option<Arc<Vec<u8>>> = None;
         match client
             .get_manifest(GetManifestRequest {
                 job_id: args.job_id.clone(),
@@ -433,6 +429,7 @@ async fn main() -> Result<()> {
             Ok(resp) => {
                 let resp = resp.into_inner();
                 let path = args.manifest_cache_dir.join(&manifest_hash);
+                manifest_bytes = Some(Arc::new(resp.manifest_bytes.clone()));
                 if let Err(err) = write_atomic(&path, &resp.manifest_bytes) {
                     warn!(error = %err, path = %path.display(), "failed to cache manifest");
                 } else {
@@ -450,9 +447,16 @@ async fn main() -> Result<()> {
                 }
             }
             Err(err) => {
+                if args.dev_lease_want > 0 {
+                    return Err(anyhow::anyhow!("GetManifest failed: {err}"));
+                }
                 warn!(error = %err, "GetManifest failed (continuing)");
             }
         }
+
+        let manifest_bytes = manifest_bytes.ok_or_else(|| {
+            anyhow::anyhow!("manifest bytes unavailable; cannot run leases without GetManifest")
+        })?;
 
         if args.metrics_snapshot_interval_ms > 0 {
             let metrics_clone = metrics.clone();
@@ -516,6 +520,7 @@ async fn main() -> Result<()> {
             let args_clone = args.clone();
             let metrics_clone = metrics.clone();
             let manifest_hash_clone = manifest_hash.clone();
+            let manifest_bytes = manifest_bytes.clone();
             tokio::spawn(async move {
                 let want = std::cmp::max(1, args_clone.dev_lease_want);
                 let caps = RuntimeCaps {
@@ -561,11 +566,21 @@ async fn main() -> Result<()> {
                         let pipeline = pipeline.clone();
                         let args = args_clone.clone();
                         let manifest_hash = manifest_hash_clone.clone();
+                        let manifest_bytes = manifest_bytes.clone();
                         let metrics = metrics_clone.clone();
                         let ch = lease_channel.clone();
                         joinset.spawn(async move {
                             let _permit = permit;
-                            run_lease(ch, pipeline, &args, &manifest_hash, &metrics, lease).await
+                            run_lease(
+                                ch,
+                                pipeline,
+                                manifest_bytes,
+                                &args,
+                                &manifest_hash,
+                                &metrics,
+                                lease,
+                            )
+                            .await
                         });
                     }
 
