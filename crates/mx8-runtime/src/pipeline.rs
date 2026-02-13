@@ -15,6 +15,9 @@ use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
 #[cfg(feature = "s3")]
 type S3Client = aws_sdk_s3::Client;
 
+#[cfg(feature = "s3")]
+type S3SdkError<E> = aws_sdk_s3::error::SdkError<E>;
+
 #[cfg(not(feature = "s3"))]
 type S3Client = ();
 
@@ -487,7 +490,14 @@ async fn build_batch_plan(
                     let client = s3_client.ok_or_else(|| {
                         anyhow::anyhow!("s3 client not configured but s3 location present")
                     })?;
-                    let out = client.head_object().bucket(bucket).key(key).send().await?;
+                    let bucket = bucket.clone();
+                    let key = key.clone();
+                    let out = s3_with_retry(r.sample_id, || {
+                        let bucket = bucket.clone();
+                        let key = key.clone();
+                        async move { client.head_object().bucket(bucket).key(key).send().await }
+                    })
+                    .await?;
                     let size = out.content_length().unwrap_or(0) as u64;
                     anyhow::ensure!(
                         size > 0,
@@ -590,13 +600,23 @@ async fn fetch_specs_payload(
                     .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
                 let range = format!("bytes={start}-{end}");
 
-                let out = client
-                    .get_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .range(range)
-                    .send()
-                    .await?;
+                let bucket = bucket.clone();
+                let key = key.clone();
+                let out = s3_with_retry(s.sample_id, || {
+                    let bucket = bucket.clone();
+                    let key = key.clone();
+                    let range = range.clone();
+                    async move {
+                        client
+                            .get_object()
+                            .bucket(bucket)
+                            .key(key)
+                            .range(range)
+                            .send()
+                            .await
+                    }
+                })
+                .await?;
                 let b = collect_byte_stream(out.body).await?;
                 anyhow::ensure!(
                     b.len() == len,
@@ -631,6 +651,58 @@ async fn fetch_specs_payload(
 async fn collect_byte_stream(stream: ByteStream) -> Result<Vec<u8>> {
     let collected: AggregatedBytes = stream.collect().await?;
     Ok(collected.into_bytes().to_vec())
+}
+
+#[cfg(feature = "s3")]
+fn s3_is_transient<E>(err: &S3SdkError<E>) -> bool {
+    match err {
+        S3SdkError::TimeoutError(_) => true,
+        S3SdkError::DispatchFailure(_) => true,
+        S3SdkError::ResponseError(_) => true,
+        S3SdkError::ConstructionFailure(_) => false,
+        S3SdkError::ServiceError(_) => err
+            .raw_response()
+            .map(|raw| {
+                let status_u16: u16 = raw.status().into();
+                status_u16 == 429 || status_u16 >= 500
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "s3")]
+async fn s3_with_retry<T, E, F, Fut>(sample_id: u64, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, S3SdkError<E>>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    const MAX_ATTEMPTS: usize = 3;
+    const BASE_DELAY_MS: u64 = 50;
+    const MAX_DELAY_MS: u64 = 1000;
+
+    let mut attempt: usize = 0;
+    let mut delay_ms: u64 = BASE_DELAY_MS;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                let transient = s3_is_transient(&err);
+                if transient && attempt < MAX_ATTEMPTS {
+                    let jitter = mx8_observe::time::unix_time_ms().wrapping_add(sample_id) % 37;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        delay_ms.saturating_add(jitter),
+                    ))
+                    .await;
+                    delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                    continue;
+                }
+                return Err(anyhow::Error::new(err));
+            }
+        }
+    }
 }
 
 fn parse_location(location: &str) -> Result<SpecLocation> {
