@@ -38,5 +38,9 @@ RUST_LOG=warn \
   MX8_PREFETCH_COMPARE=8 \
   cargo run -p mx8-runtime --bin mx8-demo3
 
-echo "[mx8] smoke OK"
+if [[ "${MX8_SMOKE_MINIO:-0}" == "1" ]]; then
+  echo "[mx8] minio_gate (S3-compatible fetch via docker)"
+  ./scripts/minio_gate.sh
+fi
 
+echo "[mx8] smoke OK"
