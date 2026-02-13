@@ -129,10 +129,13 @@ PY
 
 run_once() {
   local want="$1"
-  local tmp_log_base
-  tmp_log_base="$(mktemp "${TMPDIR:-/tmp}/mx8-demo2-minio-scale.XXXXXX")"
-  local tmp_log="${tmp_log_base}.log"
-  mv "${tmp_log_base}" "${tmp_log}"
+  local tmp_parent="${TMPDIR:-/tmp}"
+  tmp_parent="${tmp_parent%/}"
+  # macOS/BSD `mktemp` ultimately relies on `mkstemp(3)`, which requires the template
+  # to end in `XXXXXX` (no suffix after the Xs). Keep the log extension out of the
+  # template for portability.
+  local tmp_log
+  tmp_log="$(mktemp "${tmp_parent}/mx8-demo2-minio-scale.XXXXXX")"
 
   echo "[demo2_minio_scale] running want=${want} WORLD_SIZE=${WORLD_SIZE} TOTAL_SAMPLES=${TOTAL_SAMPLES} BLOCK_SIZE=${BLOCK_SIZE}" >&2
 
