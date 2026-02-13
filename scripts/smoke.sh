@@ -58,4 +58,9 @@ if [[ "${MX8_SMOKE_MINIO_MANIFEST_STORE:-0}" == "1" ]]; then
   ./scripts/minio_manifest_store_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
+  echo "[mx8] soak_demo2_minio_scale (soak gate: repeated node failures)"
+  ./scripts/soak_demo2_minio_scale.sh
+fi
+
 echo "[mx8] smoke OK"
