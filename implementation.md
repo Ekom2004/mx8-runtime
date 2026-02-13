@@ -171,8 +171,8 @@ This section exists to prevent “milestone drift” where crates/features are b
 6) **Coordinator integration**
    - `mx8-coordinator` calls resolver at startup and stores `manifest_hash`.
    - `RegisterNodeResponse.manifest_hash` returns the pinned hash.
-   - Implement `GetManifest(manifest_hash)` using FS store bytes (control-plane only).
-   - **Success:** agent can `GetManifest` and cache locally; coordinator never proxies dataset bytes.
+   - Implement `GetManifest(manifest_hash)` (small manifests) and `GetManifestStream(manifest_hash)` (chunked) using FS store bytes (control-plane only).
+   - **Success:** agent can fetch/cache manifests even when bytes exceed gRPC message limits; coordinator never proxies dataset bytes.
 
 7) **Observability + proof logs**
    - Emit proof logs:

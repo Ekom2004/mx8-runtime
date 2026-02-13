@@ -3,12 +3,15 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::Parser;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, info_span, Instrument};
 
@@ -20,6 +23,7 @@ use mx8_proto::v0::*;
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 
 const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MANIFEST_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "mx8-coordinator")]
@@ -419,6 +423,9 @@ impl CoordinatorSvc {
 
 #[tonic::async_trait]
 impl Coordinator for CoordinatorSvc {
+    type GetManifestStreamStream =
+        Pin<Box<dyn Stream<Item = Result<ManifestChunk, Status>> + Send + 'static>>;
+
     async fn register_node(
         &self,
         request: Request<RegisterNodeRequest>,
@@ -436,30 +443,33 @@ impl Coordinator for CoordinatorSvc {
             return Err(Status::invalid_argument("caps is required"));
         }
 
-        let registered_nodes = {
+        let (assigned_rank, registered_nodes) = {
             let mut state = self.state.write().await;
-            if let Some(existing) = state.nodes.get(&req.node_id) {
+            let now_ms = Self::unix_time_ms();
+
+            if let Some(existing) = state.nodes.get_mut(&req.node_id) {
                 if existing.caps != req.caps {
                     tracing::warn!("RegisterNode updated caps for existing node_id");
                 }
+                existing.caps = req.caps.clone();
+                existing.last_heartbeat_unix_time_ms = Some(now_ms);
+            } else {
+                state.nodes.insert(
+                    req.node_id.clone(),
+                    NodeEntry {
+                        caps: req.caps.clone(),
+                        last_heartbeat_unix_time_ms: Some(now_ms),
+                    },
+                );
             }
-            state.nodes.insert(
-                req.node_id.clone(),
-                NodeEntry {
-                    caps: req.caps.clone(),
-                    last_heartbeat_unix_time_ms: Some(Self::unix_time_ms()),
-                },
-            );
-            state.nodes.len() as u32
-        };
-
-        let assigned_rank = {
-            let state = self.state.read().await;
-            state
+            let assigned_rank = state
                 .nodes
                 .keys()
                 .position(|id| id == &req.node_id)
-                .unwrap_or(0) as u32
+                .ok_or_else(|| Status::internal("registered node missing from state"))?
+                as u32;
+
+            (assigned_rank, state.nodes.len() as u32)
         };
 
         if assigned_rank >= self.world_size {
@@ -750,6 +760,54 @@ impl Coordinator for CoordinatorSvc {
             Err(err) => Err(Status::internal(format!("manifest_store error: {err}"))),
         }
     }
+
+    async fn get_manifest_stream(
+        &self,
+        request: Request<GetManifestRequest>,
+    ) -> Result<Response<Self::GetManifestStreamStream>, Status> {
+        let req = request.into_inner();
+        if let Some(status) = Self::validate_id("job_id", &req.job_id) {
+            return Err(status);
+        }
+        if let Some(status) = Self::validate_id("manifest_hash", &req.manifest_hash) {
+            return Err(status);
+        }
+        let Some(store) = &self.manifest_store else {
+            return Err(Status::failed_precondition(
+                "manifest_store is not configured for this coordinator",
+            ));
+        };
+
+        let bytes = match store.get_manifest_bytes(&ManifestHash(req.manifest_hash.clone())) {
+            Ok(bytes) => bytes,
+            Err(mx8_manifest_store::ManifestStoreError::NotFound(_)) => {
+                return Err(Status::not_found("manifest not found"));
+            }
+            Err(mx8_manifest_store::ManifestStoreError::InvalidManifestHash) => {
+                return Err(Status::invalid_argument("invalid manifest_hash"));
+            }
+            Err(err) => {
+                return Err(Status::internal(format!("manifest_store error: {err}")));
+            }
+        };
+
+        let (tx, rx) = mpsc::channel::<Result<ManifestChunk, Status>>(4);
+        tokio::spawn(async move {
+            for chunk in bytes.chunks(MANIFEST_CHUNK_BYTES) {
+                let msg = ManifestChunk {
+                    data: chunk.to_vec(),
+                    schema_version: MANIFEST_SCHEMA_VERSION,
+                };
+                if tx.send(Ok(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::GetManifestStreamStream
+        ))
+    }
 }
 
 #[tokio::main]
@@ -914,6 +972,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rank_assignment_is_stable_after_membership_barrier() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState::default())),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 2,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+        };
+
+        let node2_first = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node2".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(node2_first.assigned_rank, 0);
+        assert!(!node2_first.job_ready);
+
+        let node1_second = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node1".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(node1_second.assigned_rank, 0);
+        assert!(node1_second.job_ready);
+
+        let node2_again = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node2".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(node2_again.assigned_rank, 1);
+        assert!(node2_again.job_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn request_lease_want_zero_is_invalid_argument() {
         let svc = CoordinatorSvc {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
@@ -972,6 +1077,57 @@ mod tests {
 
         assert_eq!(resp.manifest_bytes, b"manifest");
         assert_eq!(resp.schema_version, MANIFEST_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_manifest_stream_reassembles_large_manifest() -> anyhow::Result<()> {
+        use tokio_stream::StreamExt;
+
+        let root = temp_store_root("get-manifest-stream")?;
+        let store = Arc::new(mx8_manifest_store::fs::FsManifestStore::new(root));
+
+        let mut manifest = Vec::new();
+        manifest.extend_from_slice(b"schema_version=0\n");
+        manifest.extend(std::iter::repeat_n(b'a', 6 * 1024 * 1024));
+
+        let hash = ManifestHash("h".to_string());
+        store.put_manifest_bytes(&hash, manifest.as_slice())?;
+
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState::default())),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            manifest_hash: "h".to_string(),
+            manifest_store: Some(store),
+        };
+
+        let resp = svc
+            .get_manifest_stream(Request::new(GetManifestRequest {
+                job_id: "job".to_string(),
+                manifest_hash: "h".to_string(),
+            }))
+            .await?
+            .into_inner();
+
+        let mut stream = resp;
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            anyhow::ensure!(
+                chunk.data.len() <= MANIFEST_CHUNK_BYTES,
+                "chunk larger than MANIFEST_CHUNK_BYTES"
+            );
+            anyhow::ensure!(
+                chunk.schema_version == MANIFEST_SCHEMA_VERSION,
+                "unexpected schema_version"
+            );
+            out.extend_from_slice(chunk.data.as_slice());
+        }
+
+        assert_eq!(out, manifest);
         Ok(())
     }
 

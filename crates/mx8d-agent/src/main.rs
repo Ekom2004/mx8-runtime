@@ -408,19 +408,33 @@ async fn main() -> Result<()> {
 
         let metrics = Arc::new(AgentMetrics::default());
         metrics.register_total.inc();
-        let register_resp = client
+        let caps = Some(NodeCaps {
+            max_fetch_concurrency: 32,
+            max_decode_concurrency: 8,
+            max_inflight_bytes: 1 << 30,
+            max_ram_bytes: 4 << 30,
+        });
+
+        let mut register_resp = client
             .register_node(RegisterNodeRequest {
                 job_id: args.job_id.clone(),
                 node_id: args.node_id.clone(),
-                caps: Some(NodeCaps {
-                    max_fetch_concurrency: 32,
-                    max_decode_concurrency: 8,
-                    max_inflight_bytes: 1 << 30,
-                    max_ram_bytes: 4 << 30,
-                }),
+                caps: caps.clone(),
             })
             .await?
             .into_inner();
+
+        while !register_resp.job_ready {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            register_resp = client
+                .register_node(RegisterNodeRequest {
+                    job_id: args.job_id.clone(),
+                    node_id: args.node_id.clone(),
+                    caps: caps.clone(),
+                })
+                .await?
+                .into_inner();
+        }
 
         let heartbeat_interval_ms = std::cmp::max(1, register_resp.heartbeat_interval_ms as u64);
         let manifest_hash = register_resp.manifest_hash.clone();
@@ -440,41 +454,18 @@ async fn main() -> Result<()> {
         // Cache the pinned manifest locally so future runtime stages can load it without
         // needing to talk to the coordinator.
         let mut manifest_bytes: Option<Arc<Vec<u8>>> = None;
-        match client
-            .get_manifest(GetManifestRequest {
-                job_id: args.job_id.clone(),
-                manifest_hash: manifest_hash.clone(),
-            })
-            .await
-        {
-            Ok(resp) => {
-                let resp = resp.into_inner();
-                let path = args.manifest_cache_dir.join(&manifest_hash);
-                let bytes = Arc::new(resp.manifest_bytes);
-                manifest_bytes = Some(bytes.clone());
-                if let Err(err) = write_atomic(&path, bytes.as_slice()) {
-                    warn!(error = %err, path = %path.display(), "failed to cache manifest");
-                } else {
-                    info!(
-                        target: "mx8_proof",
-                        event = "manifest_cached",
-                        job_id = %args.job_id,
-                        node_id = %args.node_id,
-                        manifest_hash = %manifest_hash,
-                        schema_version = resp.schema_version,
-                        manifest_bytes = bytes.len() as u64,
-                        path = %path.display(),
-                        "cached manifest"
-                    );
-                }
+        match fetch_and_cache_manifest(&mut client, &args, &manifest_hash).await {
+            Ok(Some(bytes)) => {
+                manifest_bytes = Some(bytes);
             }
+            Ok(None) => {}
             Err(err) => {
                 if args.dev_lease_want > 0 {
-                    return Err(anyhow::anyhow!("GetManifest failed: {err}"));
+                    return Err(anyhow::anyhow!("{err}"));
                 }
                 warn!(error = %err, "GetManifest failed (continuing)");
             }
-        }
+        };
 
         let manifest_bytes = manifest_bytes.ok_or_else(|| {
             anyhow::anyhow!("manifest bytes unavailable; cannot run leases without GetManifest")
@@ -633,4 +624,66 @@ async fn main() -> Result<()> {
     }
     .instrument(span)
     .await
+}
+
+async fn fetch_and_cache_manifest(
+    client: &mut CoordinatorClient<Channel>,
+    args: &Args,
+    manifest_hash: &str,
+) -> Result<Option<Arc<Vec<u8>>>> {
+    let req = GetManifestRequest {
+        job_id: args.job_id.clone(),
+        manifest_hash: manifest_hash.to_string(),
+    };
+
+    let stream_resp = client.get_manifest_stream(req.clone()).await;
+    let (manifest_bytes, schema_version) = match stream_resp {
+        Ok(resp) => {
+            let mut stream = resp.into_inner();
+            let mut out: Vec<u8> = Vec::new();
+            let mut schema_version: Option<u32> = None;
+            while let Some(chunk) = stream.message().await? {
+                if let Some(existing) = schema_version {
+                    if chunk.schema_version != existing {
+                        return Err(anyhow::anyhow!(
+                            "GetManifestStream returned inconsistent schema_version"
+                        ));
+                    }
+                } else {
+                    schema_version = Some(chunk.schema_version);
+                }
+                out.extend_from_slice(chunk.data.as_slice());
+            }
+            let schema_version = schema_version.ok_or_else(|| {
+                anyhow::anyhow!("GetManifestStream returned no chunks (empty manifest)")
+            })?;
+            (out, schema_version)
+        }
+        Err(status) => {
+            if status.code() != tonic::Code::Unimplemented {
+                return Err(anyhow::anyhow!("GetManifestStream failed: {status}"));
+            }
+            let resp = client.get_manifest(req).await?.into_inner();
+            (resp.manifest_bytes, resp.schema_version)
+        }
+    };
+
+    let path = args.manifest_cache_dir.join(manifest_hash);
+    let bytes = Arc::new(manifest_bytes);
+    if let Err(err) = write_atomic(&path, bytes.as_slice()) {
+        warn!(error = %err, path = %path.display(), "failed to cache manifest");
+    } else {
+        info!(
+            target: "mx8_proof",
+            event = "manifest_cached",
+            job_id = %args.job_id,
+            node_id = %args.node_id,
+            manifest_hash = %manifest_hash,
+            schema_version = schema_version,
+            manifest_bytes = bytes.len() as u64,
+            path = %path.display(),
+            "cached manifest"
+        );
+    }
+    Ok(Some(bytes))
 }
