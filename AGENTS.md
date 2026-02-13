@@ -21,6 +21,7 @@ Once the Rust workspace exists:
 - `./scripts/smoke.sh`: run format/lint/tests plus internal demo gates (Demo 2 + Demo 3).
 - `./scripts/py_smoke.sh`: build/install the PyO3 veneer with `maturin` and run the minimal Python example (M5 gate).
 - `./scripts/minio_gate.sh`: run a deterministic local MinIO (S3-compatible) gate via Docker (no AWS creds).
+- `./scripts/demo2_minio.sh`: run the lease recovery demo with agents fetching bytes from MinIO (distributed + S3-compat).
 
 ## Troubleshooting
 
