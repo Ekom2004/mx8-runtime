@@ -52,12 +52,20 @@ impl RuntimeMetrics {
     }
 }
 
-struct InflightBatch {
-    batch: Batch,
-    bytes: u64,
+pub struct BatchLease {
+    pub batch: Batch,
+    pub bytes: u64,
+    metrics: Arc<RuntimeMetrics>,
     _permit: OwnedSemaphorePermit,
 }
 
+impl Drop for BatchLease {
+    fn drop(&mut self) {
+        self.metrics.on_inflight_sub(self.bytes);
+    }
+}
+
+#[derive(Clone)]
 pub struct Pipeline {
     caps: RuntimeCaps,
     metrics: Arc<RuntimeMetrics>,
@@ -77,6 +85,121 @@ impl Pipeline {
 
     pub fn metrics(&self) -> Arc<RuntimeMetrics> {
         self.metrics.clone()
+    }
+
+    /// Spawn a manifest-driven producer which streams `BatchLease`s to the caller.
+    ///
+    /// The returned lease holds the inflight RAM permit until it is dropped, so a consumer
+    /// (e.g., a Python iterator) can apply backpressure by holding onto batches.
+    pub async fn spawn_manifest_bytes_stream(
+        &self,
+        manifest_bytes: Vec<u8>,
+    ) -> Result<(
+        mpsc::Receiver<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let records = parse_canonical_manifest_tsv(&manifest_bytes)?;
+        let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_http = records
+            .iter()
+            .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
+        let s3_client: Option<S3Client> = if has_s3 {
+            #[cfg(feature = "s3")]
+            {
+                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                Some(aws_sdk_s3::Client::new(&cfg))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let http_client: Option<HttpClient> = if has_http {
+            Some(
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?,
+            )
+        } else {
+            None
+        };
+
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.caps.max_queue_batches);
+        let pipeline = self.clone();
+        let task = tokio::spawn(async move {
+            pipeline
+                .produce_manifest_batches(tx, records, s3_client, http_client)
+                .await
+        });
+        Ok((rx, task))
+    }
+
+    pub async fn spawn_manifest_bytes_range_stream(
+        &self,
+        manifest_bytes: Vec<u8>,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<(
+        mpsc::Receiver<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let records = parse_canonical_manifest_tsv(&manifest_bytes)?;
+        let records = select_record_range(records, start_id, end_id)?;
+
+        let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_http = records
+            .iter()
+            .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
+        let s3_client: Option<S3Client> = if has_s3 {
+            #[cfg(feature = "s3")]
+            {
+                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                Some(aws_sdk_s3::Client::new(&cfg))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let http_client: Option<HttpClient> = if has_http {
+            Some(
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?,
+            )
+        } else {
+            None
+        };
+
+        tracing::info!(
+            target: "mx8_proof",
+            event = "range_selected",
+            start_id = start_id,
+            end_id = end_id,
+            samples = records.len() as u64,
+            "selected manifest range"
+        );
+
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.caps.max_queue_batches);
+        let pipeline = self.clone();
+        let task = tokio::spawn(async move {
+            pipeline
+                .produce_manifest_batches(tx, records, s3_client, http_client)
+                .await
+        });
+        Ok((rx, task))
     }
 
     pub async fn run_synthetic<S: Sink>(
@@ -225,10 +348,10 @@ impl Pipeline {
         &self,
         sink: Arc<S>,
     ) -> Result<(
-        mpsc::Sender<InflightBatch>,
+        mpsc::Sender<BatchLease>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
-        let (tx, mut rx) = mpsc::channel::<InflightBatch>(self.caps.max_queue_batches);
+        let (tx, mut rx) = mpsc::channel::<BatchLease>(self.caps.max_queue_batches);
         let metrics = self.metrics.clone();
 
         let sink_task = {
@@ -237,7 +360,7 @@ impl Pipeline {
             tokio::spawn(async move {
                 while let Some(inflight) = rx.recv().await {
                     let bytes = inflight.bytes;
-                    let batch = inflight.batch;
+                    let batch = inflight.batch.clone();
                     let sample_count = u64::try_from(batch.sample_count()).unwrap_or_default();
                     // Run delivery in a blocking thread so a slow sink exerts backpressure
                     // without stalling the entire tokio runtime.
@@ -248,7 +371,7 @@ impl Pipeline {
 
                     metrics.delivered_batches_total.inc();
                     metrics.delivered_samples_total.inc_by(sample_count);
-                    metrics.on_inflight_sub(bytes);
+                    drop(inflight);
                     tracing::info!(
                         target: "mx8_proof",
                         event = "delivered",
@@ -266,11 +389,14 @@ impl Pipeline {
 
     async fn produce_synthetic_batches(
         &self,
-        tx: mpsc::Sender<InflightBatch>,
+        tx: mpsc::Sender<BatchLease>,
         total_samples: u64,
         bytes_per_sample: usize,
     ) -> Result<()> {
         let mut current_ids: Vec<u64> = Vec::with_capacity(self.caps.batch_size_samples);
+        let mut current_offsets: Vec<u64> =
+            Vec::with_capacity(self.caps.batch_size_samples.saturating_add(1));
+        current_offsets.push(0);
         let mut current_payload: Vec<u8> = Vec::with_capacity(
             self.caps
                 .batch_size_samples
@@ -281,16 +407,27 @@ impl Pipeline {
         for sample_id in 0..total_samples {
             current_ids.push(sample_id);
             current_payload.extend(std::iter::repeat_n(0u8, bytes_per_sample));
+            current_offsets.push(u64::try_from(current_payload.len()).unwrap_or(u64::MAX));
 
             if current_ids.len() >= self.caps.batch_size_samples {
-                self.send_batch(&mut sender, &mut current_ids, &mut current_payload)
-                    .await?;
+                self.send_batch(
+                    &mut sender,
+                    &mut current_ids,
+                    &mut current_offsets,
+                    &mut current_payload,
+                )
+                .await?;
             }
         }
 
         if !current_ids.is_empty() {
-            self.send_batch(&mut sender, &mut current_ids, &mut current_payload)
-                .await?;
+            self.send_batch(
+                &mut sender,
+                &mut current_ids,
+                &mut current_offsets,
+                &mut current_payload,
+            )
+            .await?;
         }
 
         Ok(())
@@ -298,7 +435,7 @@ impl Pipeline {
 
     async fn produce_manifest_batches(
         &self,
-        tx: mpsc::Sender<InflightBatch>,
+        tx: mpsc::Sender<BatchLease>,
         records: Vec<mx8_core::types::ManifestRecord>,
         s3_client: Option<S3Client>,
         http_client: Option<HttpClient>,
@@ -326,7 +463,7 @@ impl Pipeline {
 
         let records = Arc::new(records);
         let mut joinset = tokio::task::JoinSet::new();
-        let mut buffer: std::collections::BTreeMap<usize, InflightBatch> =
+        let mut buffer: std::collections::BTreeMap<usize, BatchLease> =
             std::collections::BTreeMap::new();
         let mut next_to_send: usize = 0;
         let mut next_batch_id: usize = 0;
@@ -379,8 +516,9 @@ impl Pipeline {
 
     async fn send_batch(
         &self,
-        tx: &mut mpsc::Sender<InflightBatch>,
+        tx: &mut mpsc::Sender<BatchLease>,
         ids: &mut Vec<u64>,
+        offsets: &mut Vec<u64>,
         payload: &mut Vec<u8>,
     ) -> Result<()> {
         let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -408,19 +546,40 @@ impl Pipeline {
             .acquire_many_owned(permit_units as u32)
             .await?;
 
+        anyhow::ensure!(
+            offsets.len() == ids.len().saturating_add(1),
+            "offsets length {} must equal sample_ids length + 1 ({})",
+            offsets.len(),
+            ids.len().saturating_add(1),
+        );
+        anyhow::ensure!(
+            offsets.first().copied().unwrap_or_default() == 0,
+            "offsets must start at 0"
+        );
+        anyhow::ensure!(
+            offsets.last().copied().unwrap_or_default() == bytes,
+            "offsets must end at payload length ({}), got {}",
+            bytes,
+            offsets.last().copied().unwrap_or_default()
+        );
+
         let batch = Batch {
             sample_ids: Arc::from(ids.as_slice()),
+            offsets: Arc::from(offsets.as_slice()),
             payload: Arc::from(payload.as_slice()),
         };
 
         ids.clear();
+        offsets.clear();
+        offsets.push(0);
         payload.clear();
 
         self.metrics.on_inflight_add(bytes);
 
-        tx.send(InflightBatch {
+        tx.send(BatchLease {
             batch,
             bytes,
+            metrics: self.metrics.clone(),
             _permit: permit,
         })
         .await?;
@@ -842,7 +1001,7 @@ async fn build_manifest_inflight_batch(
     records: &[mx8_core::types::ManifestRecord],
     s3_client: Option<&S3Client>,
     http_client: Option<&HttpClient>,
-) -> Result<InflightBatch> {
+) -> Result<BatchLease> {
     let plan = build_batch_plan(records, s3_client, http_client).await?;
     let bytes = plan.total_bytes;
     anyhow::ensure!(
@@ -878,14 +1037,38 @@ async fn build_manifest_inflight_batch(
         }
     };
 
+    let mut offsets: Vec<u64> = Vec::with_capacity(plan.specs.len().saturating_add(1));
+    offsets.push(0);
+    let mut running: u64 = 0;
+    for spec in &plan.specs {
+        running = running
+            .checked_add(spec.len)
+            .ok_or_else(|| anyhow::anyhow!("offset overflow"))?;
+        offsets.push(running);
+    }
+    anyhow::ensure!(
+        offsets.len() == plan.sample_ids.len().saturating_add(1),
+        "offsets length mismatch ({} vs ids {})",
+        offsets.len(),
+        plan.sample_ids.len()
+    );
+    anyhow::ensure!(
+        offsets.last().copied().unwrap_or_default() == bytes,
+        "offsets must end at payload length ({}), got {}",
+        bytes,
+        offsets.last().copied().unwrap_or_default()
+    );
+
     let batch = Batch {
         sample_ids: Arc::from(plan.sample_ids.as_slice()),
+        offsets: Arc::from(offsets.as_slice()),
         payload: Arc::from(payload.as_slice()),
     };
 
-    Ok(InflightBatch {
+    Ok(BatchLease {
         batch,
         bytes,
+        metrics,
         _permit: permit,
     })
 }

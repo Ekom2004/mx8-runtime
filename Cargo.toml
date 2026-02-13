@@ -8,6 +8,7 @@ members = [
   "crates/mx8-manifest-store",
   "crates/mx8-snapshot",
   "crates/mx8-runtime",
+  "crates/mx8-py",
   "crates/mx8d-agent",
   "crates/mx8-coordinator",
 ]
@@ -30,3 +31,4 @@ tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-t
 tonic = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pyo3 = { version = "0.21", features = ["abi3-py38"] }
