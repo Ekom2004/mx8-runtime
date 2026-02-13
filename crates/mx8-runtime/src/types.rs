@@ -4,6 +4,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct Batch {
     pub sample_ids: Arc<[u64]>,
+    /// Prefix-sum offsets into `payload` for each sample (length = sample_count + 1).
+    ///
+    /// Invariants:
+    /// - offsets[0] == 0
+    /// - offsets is non-decreasing
+    /// - offsets.last() == payload.len()
+    pub offsets: Arc<[u64]>,
     pub payload: Arc<[u8]>,
 }
 
@@ -14,5 +21,9 @@ impl Batch {
 
     pub fn sample_count(&self) -> usize {
         self.sample_ids.len()
+    }
+
+    pub fn offsets_len(&self) -> usize {
+        self.offsets.len()
     }
 }
