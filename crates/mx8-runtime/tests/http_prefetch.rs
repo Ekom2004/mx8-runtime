@@ -71,6 +71,8 @@ fn build_http_manifest(
 struct ServerConfig {
     file_path: PathBuf,
     latency: Duration,
+    fail_every_n: u64,
+    request_counter: Arc<AtomicU64>,
 }
 
 async fn serve_one_connection(mut sock: tokio::net::TcpStream, cfg: ServerConfig) -> Result<()> {
@@ -99,6 +101,17 @@ async fn serve_one_connection(mut sock: tokio::net::TcpStream, cfg: ServerConfig
     let path = parts
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+
+    let req_no = cfg.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if cfg.fail_every_n > 0 && req_no.is_multiple_of(cfg.fail_every_n) {
+        tokio::time::sleep(cfg.latency).await;
+        sock.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+        sock.shutdown().await?;
+        return Ok(());
+    }
 
     let mut range: Option<(u64, u64)> = None;
     for line in lines {
@@ -212,6 +225,8 @@ async fn http_manifest_prefetch_completes_and_respects_caps() -> Result<()> {
     let (addr, shutdown) = spawn_range_server(ServerConfig {
         file_path: data_file,
         latency: Duration::from_millis(5),
+        fail_every_n: 0,
+        request_counter: Arc::new(AtomicU64::new(0)),
     })
     .await?;
 
@@ -242,5 +257,54 @@ async fn http_manifest_prefetch_completes_and_respects_caps() -> Result<()> {
         caps.max_inflight_bytes
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_manifest_retries_transient_503() -> Result<()> {
+    let root = temp_dir("http-prefetch-retry")?;
+    let data_file = root.join("data.bin");
+
+    let total_samples: u64 = 128;
+    let bytes_per_sample: u64 = 256;
+    let total_bytes = total_samples
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| anyhow::anyhow!("overflow"))?;
+    create_sparse_data_file(&data_file, total_bytes)?;
+
+    let (addr, shutdown) = spawn_range_server(ServerConfig {
+        file_path: data_file,
+        latency: Duration::from_millis(1),
+        fail_every_n: 7,
+        request_counter: Arc::new(AtomicU64::new(0)),
+    })
+    .await?;
+
+    let manifest = build_http_manifest(addr, total_samples, bytes_per_sample)?;
+
+    let caps = RuntimeCaps {
+        max_inflight_bytes: 64 * 1024,
+        max_queue_batches: 16,
+        batch_size_samples: 8,
+        prefetch_batches: 4,
+    };
+    let pipeline = Pipeline::new(caps);
+    let metrics = pipeline.metrics();
+
+    let sink = Arc::new(CountingSink::new());
+    pipeline.run_manifest_bytes(sink.clone(), &manifest).await?;
+    let _ = shutdown.send(());
+
+    assert_eq!(
+        sink.delivered_samples.load(Ordering::Relaxed),
+        total_samples
+    );
+    let high_water = metrics.inflight_bytes_high_water.get();
+    assert!(
+        high_water <= caps.max_inflight_bytes,
+        "inflight high-water {} > cap {}",
+        high_water,
+        caps.max_inflight_bytes
+    );
     Ok(())
 }
