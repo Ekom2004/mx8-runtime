@@ -289,6 +289,7 @@ sleep_ms "${KILL_AFTER_MS}"
 
 kill_pid="$(echo "${AGENT_PIDS}" | awk -v idx="${KILL_NODE_INDEX}" '{print $idx}')"
 echo "[demo2_minio] killing node index=${KILL_NODE_INDEX} pid=${kill_pid}"
+kill_time_ms="$(ts_ms)"
 kill -KILL "${kill_pid}" >/dev/null 2>&1 || true
 
 echo "[demo2_minio] waiting for coordinator to emit range_requeued"
@@ -321,6 +322,99 @@ while true; do
   sleep_ms 500
 done
 
+print_coordinator_summary() {
+  # Usage: print_coordinator_summary <coord_log_path> <kill_node_id> <kill_time_ms>
+  python3 - "$@" <<'PY'
+import sys
+import re
+from datetime import datetime, timezone
+from typing import Optional
+
+coord_log = sys.argv[1]
+kill_node_id = sys.argv[2]
+kill_time_ms = int(sys.argv[3])
+
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+def parse_line_time_ms(line: str) -> Optional[int]:
+    # Example:
+    # 2026-02-13T12:05:09.564516Z  INFO ... event="lease_granted" ...
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s+", line)
+    if not m:
+        return None
+    ts = m.group(1)
+    # Python's fromisoformat doesn't accept trailing 'Z'.
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return int(dt.timestamp() * 1000)
+
+events = {
+    "lease_granted": 0,
+    "lease_completed": 0,
+    "lease_expired": 0,
+    "range_requeued": 0,
+    "progress": 0,
+}
+
+first_grant_ms: Optional[int] = None
+drained_ms: Optional[int] = None
+expired_ms: Optional[int] = None
+requeued_ms: Optional[int] = None
+
+with open(coord_log, "r", encoding="utf-8", errors="replace") as f:
+    for raw in f:
+        line = ansi.sub("", raw)
+        t = parse_line_time_ms(line)
+
+        if 'event="lease_granted"' in line:
+            events["lease_granted"] += 1
+            if first_grant_ms is None and t is not None:
+                first_grant_ms = t
+
+        if 'event="lease_completed"' in line:
+            events["lease_completed"] += 1
+
+        if 'event="lease_expired"' in line:
+            events["lease_expired"] += 1
+            if expired_ms is None and (f"node_id={kill_node_id}" in line) and t is not None:
+                expired_ms = t
+
+        if 'event="range_requeued"' in line:
+            events["range_requeued"] += 1
+            if requeued_ms is None and (f"node_id={kill_node_id}" in line) and t is not None:
+                requeued_ms = t
+
+        # Coordinator proof logs use event="progress" for accepted progress reports.
+        if 'event="progress"' in line:
+            events["progress"] += 1
+
+        if 'event="job_drained"' in line and t is not None:
+            drained_ms = t
+
+def fmt(ms: Optional[int]) -> str:
+    return "na" if ms is None else str(ms)
+
+grant_to_drained = None if (first_grant_ms is None or drained_ms is None) else (drained_ms - first_grant_ms)
+kill_to_expired = None if expired_ms is None else (expired_ms - kill_time_ms)
+expired_to_requeue = None if (expired_ms is None or requeued_ms is None) else (requeued_ms - expired_ms)
+requeue_to_drained = None if (requeued_ms is None or drained_ms is None) else (drained_ms - requeued_ms)
+
+print(
+    "[demo2_minio] coordinator_summary "
+    f"kill_node_id={kill_node_id} "
+    f"counts=lease_granted:{events['lease_granted']},"
+    f"lease_completed:{events['lease_completed']},"
+    f"lease_expired:{events['lease_expired']},"
+    f"range_requeued:{events['range_requeued']},"
+    f"progress:{events['progress']} "
+    f"durations_ms=first_grant_to_drained:{fmt(grant_to_drained)},"
+    f"kill_to_expired:{fmt(kill_to_expired)},"
+    f"expired_to_requeue:{fmt(expired_to_requeue)},"
+    f"requeue_to_drained:{fmt(requeue_to_drained)}"
+)
+PY
+}
+
 echo "[demo2_minio] done"
 echo "[demo2_minio] artifacts: ${TMP_ROOT}"
 echo "[demo2_minio] coordinator log: ${COORD_LOG}"
+print_coordinator_summary "${COORD_LOG}" "${kill_node_id}" "${kill_time_ms}"
