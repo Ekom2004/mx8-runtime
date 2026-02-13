@@ -25,7 +25,9 @@ DEV_LEASE_WANT="${MX8_DEV_LEASE_WANT:-1}"
 BENCH_WANTS="${MX8_BENCH_WANTS:-}"
 
 SINK_SLEEP_MS="${SINK_SLEEP_MS:-0}"
-KILL_AFTER_MS="${KILL_AFTER_MS:-750}"
+# For scale runs, kill as soon as we observe the first lease_granted so we deterministically
+# exercise the "lease expires → remainder requeued" path (avoid racing with fast completion).
+KILL_AFTER_MS="${KILL_AFTER_MS:-0}"
 WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-30000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-30000}"
 WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-240000}"
