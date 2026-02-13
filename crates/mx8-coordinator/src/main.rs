@@ -74,6 +74,9 @@ struct Args {
     manifest_hash: String,
 
     /// Development-only: total number of samples to serve as contiguous WorkRanges.
+    ///
+    /// If this is 0, the coordinator will try to derive N from the pinned manifest bytes
+    /// (canonical TSV v0) and issue ranges over `[0..N)`.
     #[arg(long, env = "MX8_DEV_TOTAL_SAMPLES", default_value_t = 0)]
     dev_total_samples: u64,
 
@@ -86,9 +89,34 @@ struct Args {
     metrics_snapshot_interval_ms: u64,
 }
 
+fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> {
+    let s = std::str::from_utf8(bytes).map_err(|e| anyhow::anyhow!("manifest not utf-8: {e}"))?;
+    let mut lines = s.lines();
+    let first = lines
+        .by_ref()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("empty manifest"))?;
+    anyhow::ensure!(
+        first.trim_start().starts_with("schema_version="),
+        "manifest header missing schema_version"
+    );
+
+    let mut n: u64 = 0;
+    for raw in lines {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        n = n
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("manifest row count overflow"))?;
+    }
+    Ok(n)
+}
+
 #[derive(Debug, Clone, Default)]
 struct NodeEntry {
     caps: Option<NodeCaps>,
+    last_heartbeat_unix_time_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +134,8 @@ struct CoordinatorMetrics {
     heartbeat_total: Counter,
     request_lease_total: Counter,
     leases_granted_total: Counter,
+    leases_expired_total: Counter,
+    ranges_requeued_total: Counter,
     progress_total: Counter,
     active_leases: Gauge,
     registered_nodes: Gauge,
@@ -168,6 +198,8 @@ impl CoordinatorSvc {
             heartbeat_total = self.metrics.heartbeat_total.get(),
             request_lease_total = self.metrics.request_lease_total.get(),
             leases_granted_total = self.metrics.leases_granted_total.get(),
+            leases_expired_total = self.metrics.leases_expired_total.get(),
+            ranges_requeued_total = self.metrics.ranges_requeued_total.get(),
             progress_total = self.metrics.progress_total.get(),
             active_leases = self.metrics.active_leases.get(),
             registered_nodes = self.metrics.registered_nodes.get(),
@@ -175,6 +207,107 @@ impl CoordinatorSvc {
             manifest_hash = %self.manifest_hash,
             "metrics"
         );
+    }
+
+    async fn tick_once_at(&self, now_unix_time_ms: u64) {
+        let mut expired: Vec<(Lease, u64)> = Vec::new();
+        let mut requeued: Vec<(String, String, WorkRange, u64)> = Vec::new();
+
+        {
+            let mut state = self.state.write().await;
+            let mut expired_ids: Vec<String> = Vec::new();
+            for (lease_id, lease) in &state.leases {
+                if lease.expires_unix_time_ms <= now_unix_time_ms {
+                    expired_ids.push(lease_id.clone());
+                }
+            }
+
+            for lease_id in expired_ids {
+                if let Some(lease) = state.leases.remove(&lease_id) {
+                    let cursor = lease.cursor;
+                    expired.push((lease, cursor));
+                    state.progress.retain(|(_, id), _| id != &lease_id);
+                }
+            }
+
+            for (lease, cursor) in &expired {
+                let Some(range) = &lease.range else {
+                    continue;
+                };
+                let cursor = *cursor;
+                let remainder_start = cursor.clamp(range.start_id, range.end_id);
+                if remainder_start >= range.end_id {
+                    continue;
+                }
+
+                let remainder = WorkRange {
+                    start_id: remainder_start,
+                    end_id: range.end_id,
+                    epoch: range.epoch,
+                    seed: range.seed,
+                };
+
+                state.available_ranges.push_front(remainder.clone());
+                requeued.push((
+                    lease.lease_id.clone(),
+                    lease.node_id.clone(),
+                    remainder,
+                    cursor,
+                ));
+            }
+        }
+
+        if !expired.is_empty() {
+            self.metrics
+                .leases_expired_total
+                .inc_by(expired.len() as u64);
+        }
+        if !requeued.is_empty() {
+            self.metrics
+                .ranges_requeued_total
+                .inc_by(requeued.len() as u64);
+        }
+
+        for (lease, cursor) in expired {
+            if let Some(range) = &lease.range {
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "lease_expired",
+                    lease_id = %lease.lease_id,
+                    node_id = %lease.node_id,
+                    manifest_hash = %self.manifest_hash,
+                    epoch = range.epoch,
+                    start_id = range.start_id,
+                    end_id = range.end_id,
+                    cursor = cursor,
+                    expires_unix_time_ms = lease.expires_unix_time_ms,
+                    now_unix_time_ms = now_unix_time_ms,
+                    "lease expired"
+                );
+            }
+        }
+
+        for (lease_id, node_id, remainder, cursor) in requeued {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "range_requeued",
+                lease_id = %lease_id,
+                node_id = %node_id,
+                manifest_hash = %self.manifest_hash,
+                epoch = remainder.epoch,
+                start_id = remainder.start_id,
+                end_id = remainder.end_id,
+                cursor = cursor,
+                "requeued remainder"
+            );
+        }
+
+        self.update_gauges().await;
+    }
+
+    async fn tick_once(&self) {
+        let now_unix_time_ms = Self::unix_time_ms();
+        self.tick_once_at(now_unix_time_ms).await;
     }
 }
 
@@ -208,6 +341,7 @@ impl Coordinator for CoordinatorSvc {
                 req.node_id.clone(),
                 NodeEntry {
                     caps: req.caps.clone(),
+                    last_heartbeat_unix_time_ms: Some(Self::unix_time_ms()),
                 },
             );
             state.nodes.len() as u32
@@ -268,6 +402,12 @@ impl Coordinator for CoordinatorSvc {
         if let Some(status) = self.ensure_registered(&req.node_id).await {
             return Err(status);
         }
+        {
+            let mut state = self.state.write().await;
+            if let Some(entry) = state.nodes.get_mut(&req.node_id) {
+                entry.last_heartbeat_unix_time_ms = Some(req.unix_time_ms);
+            }
+        }
         Ok(Response::new(HeartbeatResponse {}))
     }
 
@@ -319,11 +459,12 @@ impl Coordinator for CoordinatorSvc {
                 let expires_unix_time_ms =
                     Self::unix_time_ms().saturating_add(self.lease_ttl_ms as u64);
 
+                let cursor = range.start_id;
                 let lease = Lease {
                     lease_id: lease_id.clone(),
                     node_id: req.node_id.clone(),
                     range: Some(range),
-                    cursor: 0,
+                    cursor,
                     expires_unix_time_ms,
                 };
                 state.leases.insert(lease_id, lease.clone());
@@ -380,11 +521,18 @@ impl Coordinator for CoordinatorSvc {
         }
 
         let mut state = self.state.write().await;
-        let Some(lease) = state.leases.get(&req.lease_id) else {
-            return Err(Status::not_found("unknown lease_id"));
+        let (existing_node_id, existing_cursor, existing_range) = {
+            let Some(existing) = state.leases.get(&req.lease_id) else {
+                return Err(Status::not_found("unknown lease_id"));
+            };
+            (
+                existing.node_id.clone(),
+                existing.cursor,
+                existing.range.clone(),
+            )
         };
 
-        if lease.node_id != req.node_id {
+        if existing_node_id != req.node_id {
             return Err(Status::failed_precondition("lease is not owned by node_id"));
         }
 
@@ -395,12 +543,56 @@ impl Coordinator for CoordinatorSvc {
             }
         }
 
-        if let Some(range) = &lease.range {
+        if let Some(range) = &existing_range {
             if req.cursor < range.start_id || req.cursor > range.end_id {
                 return Err(Status::invalid_argument("cursor out of range"));
             }
         }
+
+        if req.cursor < existing_cursor {
+            return Err(Status::invalid_argument(
+                "cursor moved backwards (relative to lease cursor)",
+            ));
+        }
+
+        let completed = existing_range
+            .as_ref()
+            .is_some_and(|range| req.cursor >= range.end_id);
+
         state.progress.insert(progress_key, req.cursor);
+
+        if completed {
+            let removed = state.leases.remove(&req.lease_id);
+            state.progress.retain(|(_, id), _| id != &req.lease_id);
+            if let Some(removed) = removed {
+                if let Some(range) = &removed.range {
+                    tracing::info!(
+                        target: "mx8_proof",
+                        event = "lease_completed",
+                        job_id = %req.job_id,
+                        node_id = %req.node_id,
+                        lease_id = %req.lease_id,
+                        manifest_hash = %self.manifest_hash,
+                        epoch = range.epoch,
+                        start_id = range.start_id,
+                        end_id = range.end_id,
+                        cursor = req.cursor,
+                        delivered_samples = req.delivered_samples,
+                        delivered_bytes = req.delivered_bytes,
+                        unix_time_ms = req.unix_time_ms,
+                        "lease completed"
+                    );
+                }
+            }
+            self.update_gauges().await;
+            return Ok(Response::new(ReportProgressResponse {}));
+        }
+
+        if let Some(lease) = state.leases.get_mut(&req.lease_id) {
+            lease.cursor = req.cursor;
+            lease.expires_unix_time_ms =
+                Self::unix_time_ms().saturating_add(self.lease_ttl_ms as u64);
+        }
 
         tracing::info!(
             target: "mx8_proof",
@@ -493,10 +685,24 @@ async fn main() -> Result<()> {
         }
 
         let mut available_ranges = std::collections::VecDeque::new();
-        if args.dev_total_samples > 0 {
+        let total_samples = if args.dev_total_samples > 0 {
+            args.dev_total_samples
+        } else if resolved_manifest_hash != "dev" {
+            match store.get_manifest_bytes(&ManifestHash(resolved_manifest_hash.clone())) {
+                Ok(bytes) => count_samples_in_canonical_manifest_tsv(&bytes)?,
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not derive total_samples from manifest");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        if total_samples > 0 {
             let mut start_id = 0u64;
-            while start_id < args.dev_total_samples {
-                let end_id = (start_id + args.dev_block_size).min(args.dev_total_samples);
+            while start_id < total_samples {
+                let end_id = (start_id + args.dev_block_size).min(total_samples);
                 available_ranges.push_back(WorkRange {
                     start_id,
                     end_id,
@@ -522,6 +728,15 @@ async fn main() -> Result<()> {
             manifest_hash: resolved_manifest_hash,
             manifest_store: Some(store),
         };
+
+        let maintenance_svc = svc.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(1000));
+            loop {
+                ticker.tick().await;
+                maintenance_svc.tick_once().await;
+            }
+        });
 
         if args.metrics_snapshot_interval_ms > 0 {
             let svc_clone = svc.clone();
@@ -643,6 +858,91 @@ mod tests {
 
         assert_eq!(resp.manifest_bytes, b"manifest");
         assert_eq!(resp.schema_version, MANIFEST_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_lease_requeues_remainder_range() -> anyhow::Result<()> {
+        let state = Arc::new(RwLock::new(CoordinatorState {
+            nodes: std::collections::BTreeMap::new(),
+            available_ranges: std::collections::VecDeque::from([WorkRange {
+                start_id: 0,
+                end_id: 100,
+                epoch: 0,
+                seed: 0,
+            }]),
+            leases: std::collections::BTreeMap::new(),
+            progress: std::collections::BTreeMap::new(),
+            next_lease_id: 0,
+        }));
+
+        let svc = CoordinatorSvc {
+            state: state.clone(),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+        };
+
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node".to_string(),
+            caps: Some(NodeCaps::default()),
+        }))
+        .await?;
+
+        let lease = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner()
+            .leases
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected lease"))?;
+
+        let Some(range) = &lease.range else {
+            anyhow::bail!("expected range");
+        };
+        assert_eq!(range.start_id, 0);
+        assert_eq!(range.end_id, 100);
+
+        svc.report_progress(Request::new(ReportProgressRequest {
+            job_id: "job".to_string(),
+            node_id: "node".to_string(),
+            lease_id: lease.lease_id.clone(),
+            cursor: 40,
+            delivered_samples: 40,
+            delivered_bytes: 0,
+            unix_time_ms: CoordinatorSvc::unix_time_ms(),
+        }))
+        .await?;
+
+        let now = CoordinatorSvc::unix_time_ms();
+        {
+            let mut st = state.write().await;
+            let entry = st
+                .leases
+                .get_mut(&lease.lease_id)
+                .ok_or_else(|| anyhow::anyhow!("lease missing"))?;
+            entry.expires_unix_time_ms = now.saturating_sub(1);
+        }
+
+        svc.tick_once_at(now).await;
+
+        let st = state.read().await;
+        assert!(st.leases.is_empty());
+        let front = st
+            .available_ranges
+            .front()
+            .ok_or_else(|| anyhow::anyhow!("expected requeued range"))?;
+        assert_eq!(front.start_id, 40);
+        assert_eq!(front.end_id, 100);
         Ok(())
     }
 }

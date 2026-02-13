@@ -1747,6 +1747,7 @@ dependencies = [
  "clap",
  "mx8-observe",
  "mx8-proto",
+ "mx8-runtime",
  "tokio",
  "tonic",
  "tracing",
