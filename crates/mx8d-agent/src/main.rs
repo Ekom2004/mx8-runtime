@@ -547,72 +547,98 @@ async fn main() -> Result<()> {
                     prefetch_batches: args_clone.prefetch_batches,
                 };
                 let pipeline = Arc::new(Pipeline::new(caps));
-                loop {
-                    let mut client = CoordinatorClient::new(lease_channel.clone())
-                        .max_decoding_message_size(grpc_max)
-                        .max_encoding_message_size(grpc_max);
-                    let resp = client
-                        .request_lease(RequestLeaseRequest {
-                            job_id: args_clone.job_id.clone(),
-                            node_id: args_clone.node_id.clone(),
-                            want,
-                        })
-                        .await;
 
-                    let resp = match resp {
-                        Ok(resp) => resp.into_inner(),
-                        Err(err) => {
-                            tracing::info!(error = %err, "RequestLease failed; backing off");
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                // `want` is interpreted as "max concurrent leases per node".
+                let target_concurrency = std::cmp::max(1, want as usize);
+                let mut joinset: tokio::task::JoinSet<anyhow::Result<()>> =
+                    tokio::task::JoinSet::new();
+                let mut active: usize = 0;
+                let mut next_request_at = tokio::time::Instant::now();
+
+                loop {
+                    let now = tokio::time::Instant::now();
+                    if active < target_concurrency && now >= next_request_at {
+                        let deficit = target_concurrency - active;
+                        let deficit_u32 = u32::try_from(deficit).unwrap_or(u32::MAX);
+
+                        let mut client = CoordinatorClient::new(lease_channel.clone())
+                            .max_decoding_message_size(grpc_max)
+                            .max_encoding_message_size(grpc_max);
+                        let resp = client
+                            .request_lease(RequestLeaseRequest {
+                                job_id: args_clone.job_id.clone(),
+                                node_id: args_clone.node_id.clone(),
+                                want: std::cmp::max(1, deficit_u32),
+                            })
+                            .await;
+
+                        let resp = match resp {
+                            Ok(resp) => resp.into_inner(),
+                            Err(err) => {
+                                tracing::info!(error = %err, "RequestLease failed; backing off");
+                                next_request_at =
+                                    tokio::time::Instant::now() + Duration::from_millis(500);
+                                continue;
+                            }
+                        };
+
+                        if resp.leases.is_empty() {
+                            let wait_ms = std::cmp::max(1, resp.wait_ms);
+                            next_request_at = tokio::time::Instant::now()
+                                + Duration::from_millis(wait_ms as u64);
                             continue;
                         }
-                    };
 
-                    if resp.leases.is_empty() {
-                        let wait_ms = std::cmp::max(1, resp.wait_ms);
-                        tokio::time::sleep(Duration::from_millis(wait_ms as u64)).await;
+                        for lease in resp.leases {
+                            let pipeline = pipeline.clone();
+                            let args = args_clone.clone();
+                            let manifest_hash = manifest_hash_clone.clone();
+                            let manifest_bytes = manifest_bytes.clone();
+                            let metrics = metrics_clone.clone();
+                            let ch = lease_channel.clone();
+                            joinset.spawn(async move {
+                                run_lease(
+                                    ch,
+                                    pipeline,
+                                    manifest_bytes,
+                                    &args,
+                                    &manifest_hash,
+                                    &metrics,
+                                    lease,
+                                )
+                                .await
+                            });
+                            active = active.saturating_add(1);
+                            if active >= target_concurrency {
+                                break;
+                            }
+                        }
+
+                        next_request_at = tokio::time::Instant::now();
                         continue;
                     }
 
-                    let max_concurrent = std::cmp::max(1, want as usize);
-                    let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-                    let mut joinset = tokio::task::JoinSet::new();
-
-                    for lease in resp.leases {
-                        let permit = match sem.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        };
-                        let pipeline = pipeline.clone();
-                        let args = args_clone.clone();
-                        let manifest_hash = manifest_hash_clone.clone();
-                        let manifest_bytes = manifest_bytes.clone();
-                        let metrics = metrics_clone.clone();
-                        let ch = lease_channel.clone();
-                        joinset.spawn(async move {
-                            let _permit = permit;
-                            run_lease(
-                                ch,
-                                pipeline,
-                                manifest_bytes,
-                                &args,
-                                &manifest_hash,
-                                &metrics,
-                                lease,
-                            )
-                            .await
-                        });
+                    if active == 0 {
+                        tokio::time::sleep_until(next_request_at).await;
+                        continue;
                     }
 
-                    while let Some(res) = joinset.join_next().await {
-                        match res {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
-                                tracing::error!(error = %err, "lease execution failed");
+                    tokio::select! {
+                        res = joinset.join_next() => {
+                            match res {
+                                Some(Ok(Ok(()))) => {}
+                                Some(Ok(Err(err))) => {
+                                    tracing::error!(error = %err, "lease execution failed");
+                                }
+                                Some(Err(err)) => {
+                                    tracing::error!(error = %err, "lease task join failed");
+                                }
+                                None => {}
                             }
-                            Err(err) => {
-                                tracing::error!(error = %err, "lease task join failed");
-                            }
+                            active = active.saturating_sub(1);
+                        }
+                        _ = tokio::time::sleep_until(next_request_at), if active < target_concurrency => {
+                            // Time to ask for more leases.
                         }
                     }
                 }
