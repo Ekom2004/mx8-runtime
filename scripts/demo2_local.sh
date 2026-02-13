@@ -61,13 +61,16 @@ log_has_line_with_all() {
   # Usage: log_has_line_with_all <path> <substr1> [<substr2> ...]
   python3 - "$@" <<'PY'
 import sys
+import re
 
 path = sys.argv[1]
 need = sys.argv[2:]
+ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 try:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
+            line = ansi.sub("", line)
             if all(s in line for s in need):
                 sys.exit(0)
 except FileNotFoundError:

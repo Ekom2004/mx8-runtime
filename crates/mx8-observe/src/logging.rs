@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 
 /// Initializes a `tracing_subscriber` using `MX8_LOG` first, then `RUST_LOG`, then a default.
@@ -9,7 +10,11 @@ use tracing_subscriber::EnvFilter;
 /// - Include `epoch` for any sharding/assignment-related event (even if 0 in early phases).
 pub fn init_tracing() {
     let filter = env_filter();
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let ansi = std::io::stdout().is_terminal();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi)
+        .init();
 }
 
 pub fn env_filter() -> EnvFilter {
