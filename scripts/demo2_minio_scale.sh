@@ -26,7 +26,9 @@ WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-30000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-30000}"
 WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-240000}"
 
-tmp_log="$(mktemp "${TMPDIR:-/tmp}/mx8-demo2-minio-scale.XXXXXX.log")"
+tmp_log_base="$(mktemp "${TMPDIR:-/tmp}/mx8-demo2-minio-scale.XXXXXX")"
+tmp_log="${tmp_log_base}.log"
+mv "${tmp_log_base}" "${tmp_log}"
 echo "[demo2_minio_scale] running WORLD_SIZE=${WORLD_SIZE} TOTAL_SAMPLES=${TOTAL_SAMPLES} BLOCK_SIZE=${BLOCK_SIZE}"
 
 WORLD_SIZE="${WORLD_SIZE}" \
@@ -109,4 +111,3 @@ print("[demo2_minio_scale] OK: large manifest cached without gRPC limit errors")
 PY
 
 echo "[demo2_minio_scale] done"
-
