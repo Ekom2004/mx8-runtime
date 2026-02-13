@@ -45,6 +45,10 @@ struct Args {
     #[arg(long, env = "MX8_HTTP_BANDWIDTH_BPS", default_value_t = 0)]
     http_bandwidth_bps: u64,
 
+    /// Inject a transient HTTP failure every N requests (0 disables).
+    #[arg(long, env = "MX8_HTTP_FAIL_EVERY_N", default_value_t = 0)]
+    http_fail_every_n: u64,
+
     #[arg(long, env = "MX8_KEEP_ARTIFACTS", default_value_t = false)]
     keep_artifacts: bool,
 }
@@ -131,6 +135,8 @@ struct ServerConfig {
     file_path: PathBuf,
     latency: Duration,
     bandwidth_bps: u64,
+    fail_every_n: u64,
+    request_counter: Arc<AtomicU64>,
 }
 
 async fn serve_one_connection(mut sock: tokio::net::TcpStream, cfg: ServerConfig) -> Result<()> {
@@ -159,6 +165,17 @@ async fn serve_one_connection(mut sock: tokio::net::TcpStream, cfg: ServerConfig
     let path = parts
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+
+    let req_no = cfg.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if cfg.fail_every_n > 0 && req_no.is_multiple_of(cfg.fail_every_n) {
+        tokio::time::sleep(cfg.latency).await;
+        sock.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+        sock.shutdown().await?;
+        return Ok(());
+    }
 
     let mut range: Option<(u64, u64)> = None;
     for line in lines {
@@ -313,6 +330,8 @@ async fn main() -> Result<()> {
         file_path: data_file.clone(),
         latency: Duration::from_millis(args.http_latency_ms),
         bandwidth_bps: args.http_bandwidth_bps,
+        fail_every_n: args.http_fail_every_n,
+        request_counter: Arc::new(AtomicU64::new(0)),
     };
     let (addr, shutdown) = spawn_range_server(server_cfg).await?;
     let manifest_bytes =
@@ -326,9 +345,14 @@ async fn main() -> Result<()> {
     };
 
     let (s1, b1, hw1, ms1) = run_once(&manifest_bytes, base_caps).await?;
+    let sps1 = if ms1 == 0 {
+        0.0
+    } else {
+        (s1 as f64) * 1000.0 / (ms1 as f64)
+    };
     println!(
-        "[demo3] prefetch=1 elapsed_ms={} samples={} bytes={} inflight_high_water={}",
-        ms1, s1, b1, hw1
+        "[demo3] prefetch=1 elapsed_ms={} samples={} bytes={} inflight_high_water={} samples_per_sec={}",
+        ms1, s1, b1, hw1, sps1
     );
 
     let compare_caps = RuntimeCaps {
@@ -336,9 +360,14 @@ async fn main() -> Result<()> {
         ..base_caps
     };
     let (s2, b2, hw2, ms2) = run_once(&manifest_bytes, compare_caps).await?;
+    let sps2 = if ms2 == 0 {
+        0.0
+    } else {
+        (s2 as f64) * 1000.0 / (ms2 as f64)
+    };
     println!(
-        "[demo3] prefetch={} elapsed_ms={} samples={} bytes={} inflight_high_water={}",
-        args.prefetch_compare, ms2, s2, b2, hw2
+        "[demo3] prefetch={} elapsed_ms={} samples={} bytes={} inflight_high_water={} samples_per_sec={}",
+        args.prefetch_compare, ms2, s2, b2, hw2, sps2
     );
 
     let _ = shutdown.send(());
