@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList};
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList};
 
 use mx8_manifest_store::fs::FsManifestStore;
 use mx8_manifest_store::LockOwner;
@@ -173,6 +173,62 @@ impl PyBatch {
         // but total process RSS may exceed `max_inflight_bytes` if the consumer also holds
         // onto many copied payloads.
         Ok(PyBytes::new_bound(py, &self.lease.batch.payload))
+    }
+
+    fn to_torch<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use to_torch): {e}"
+            ))
+        })?;
+
+        let torch_uint8 = torch.getattr("uint8")?;
+        let torch_int64 = torch.getattr("int64")?;
+
+        // Payload: one contiguous uint8 buffer.
+        //
+        // v0: copy bytes into a Python-owned bytearray, then build a torch tensor view on it.
+        // This is not zero-copy from the Rust runtime buffer, but it keeps the PyTorch API
+        // frictionless while we validate product fit.
+        let payload = PyByteArray::new_bound(py, &self.lease.batch.payload);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_uint8)?;
+        let payload_u8 = torch.call_method("frombuffer", (payload,), Some(&kwargs))?;
+
+        // Offsets: convert u64 -> i64 for torch indexing.
+        let mut offsets_i64 = Vec::with_capacity(self.lease.batch.offsets.len());
+        for &off in self.lease.batch.offsets.iter() {
+            let off_i64 = i64::try_from(off).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "offset overflow converting u64 -> i64 (offset={off})"
+                ))
+            })?;
+            offsets_i64.push(off_i64);
+        }
+        let offsets_list = PyList::new_bound(py, offsets_i64);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        let offsets_i64 = torch.call_method("tensor", (offsets_list,), Some(&kwargs))?;
+
+        // Sample IDs: convert u64 -> i64 (common consumer type in Python).
+        let mut sample_ids_i64 = Vec::with_capacity(self.lease.batch.sample_ids.len());
+        for &sid in self.lease.batch.sample_ids.iter() {
+            let sid_i64 = i64::try_from(sid).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "sample_id overflow converting u64 -> i64 (sample_id={sid})"
+                ))
+            })?;
+            sample_ids_i64.push(sid_i64);
+        }
+        let ids_list = PyList::new_bound(py, sample_ids_i64);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        let sample_ids_i64 = torch.call_method("tensor", (ids_list,), Some(&kwargs))?;
+
+        Ok((payload_u8, offsets_i64, sample_ids_i64))
     }
 }
 

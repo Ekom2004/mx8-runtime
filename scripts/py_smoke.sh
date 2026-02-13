@@ -68,4 +68,14 @@ MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
   MX8_DATASET_LINK="${TMP_ROOT}/dev@refresh" \
   "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_minimal.py"
 
+echo "[mx8] python torch example (optional)"
+if "${PYTHON_BIN}" -c "import torch" >/dev/null 2>&1; then
+  MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
+    MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
+    MX8_DATASET_LINK="${TMP_ROOT}/dev@refresh" \
+    "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_minimal.py"
+else
+  echo "[mx8] torch not installed in venv; skipping"
+fi
+
 echo "[mx8] py_smoke OK"
