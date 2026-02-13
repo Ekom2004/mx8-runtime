@@ -655,7 +655,18 @@ impl Coordinator for CoordinatorSvc {
         let progress_key = (req.node_id.clone(), req.lease_id.clone());
         if let Some(prev) = state.progress.get(&progress_key) {
             if req.cursor < *prev {
-                return Err(Status::invalid_argument("cursor moved backwards"));
+                tracing::warn!(
+                    target: "mx8_proof",
+                    event = "cursor_regressed",
+                    job_id = %req.job_id,
+                    node_id = %req.node_id,
+                    lease_id = %req.lease_id,
+                    manifest_hash = %self.manifest_hash,
+                    prev_cursor = *prev,
+                    cursor = req.cursor,
+                    "cursor moved backwards"
+                );
+                return Err(Status::failed_precondition("cursor moved backwards"));
             }
         }
 
@@ -666,7 +677,18 @@ impl Coordinator for CoordinatorSvc {
         }
 
         if req.cursor < existing_cursor {
-            return Err(Status::invalid_argument(
+            tracing::warn!(
+                target: "mx8_proof",
+                event = "cursor_regressed",
+                job_id = %req.job_id,
+                node_id = %req.node_id,
+                lease_id = %req.lease_id,
+                manifest_hash = %self.manifest_hash,
+                prev_cursor = existing_cursor,
+                cursor = req.cursor,
+                "cursor moved backwards (relative to lease cursor)"
+            );
+            return Err(Status::failed_precondition(
                 "cursor moved backwards (relative to lease cursor)",
             ));
         }
@@ -1214,6 +1236,79 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("expected requeued range"))?;
         assert_eq!(front.start_id, 40);
         assert_eq!(front.end_id, 100);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn report_progress_rejects_cursor_regression() -> anyhow::Result<()> {
+        let state = Arc::new(RwLock::new(CoordinatorState {
+            nodes: std::collections::BTreeMap::new(),
+            available_ranges: std::collections::VecDeque::from([WorkRange {
+                start_id: 0,
+                end_id: 100,
+                epoch: 0,
+                seed: 0,
+            }]),
+            leases: std::collections::BTreeMap::new(),
+            progress: std::collections::BTreeMap::new(),
+            next_lease_id: 0,
+            drained_emitted: false,
+        }));
+
+        let svc = CoordinatorSvc {
+            state: state.clone(),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+        };
+
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node".to_string(),
+            caps: Some(NodeCaps::default()),
+        }))
+        .await?;
+
+        let lease = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner()
+            .leases
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected lease"))?;
+
+        svc.report_progress(Request::new(ReportProgressRequest {
+            job_id: "job".to_string(),
+            node_id: "node".to_string(),
+            lease_id: lease.lease_id.clone(),
+            cursor: 10,
+            delivered_samples: 0,
+            delivered_bytes: 0,
+            unix_time_ms: CoordinatorSvc::unix_time_ms(),
+        }))
+        .await?;
+
+        let err = svc
+            .report_progress(Request::new(ReportProgressRequest {
+                job_id: "job".to_string(),
+                node_id: "node".to_string(),
+                lease_id: lease.lease_id.clone(),
+                cursor: 9,
+                delivered_samples: 0,
+                delivered_bytes: 0,
+                unix_time_ms: CoordinatorSvc::unix_time_ms(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         Ok(())
     }
 }
