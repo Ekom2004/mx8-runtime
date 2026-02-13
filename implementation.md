@@ -228,11 +228,16 @@ This section exists to prevent “milestone drift” where crates/features are b
 3) Storage IO characteristics:
    - S3: range reads; readahead policy; retry/backoff.
    - Local: sequential reads; optional OS cache hints where safe.
+4) Demo 3 — “S3-like latency simulator” (local):
+   - Add a local HTTP range server + injected latency/bandwidth caps to simulate S3 behavior.
+   - Use it to prove prefetch/readahead hides fetch latency while respecting inflight/RAM caps.
+   - Keep it fully offline (no AWS credentials required).
 
 **Acceptance:**
 - Stable RAM under a configured cap across extended run.
 - Throughput is stable (no oscillation from prefetch bursts).
 - Metrics show bounded queue depths and predictable p95 stage times.
+ - Demo 3 is repeatable and shows: with injected latency, prefetch improves throughput/idle time without violating caps.
 
 ---
 

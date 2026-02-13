@@ -49,6 +49,9 @@ struct Args {
     #[arg(long, env = "MX8_BATCH_SIZE_SAMPLES", default_value_t = 512)]
     batch_size_samples: usize,
 
+    #[arg(long, env = "MX8_PREFETCH_BATCHES", default_value_t = 1)]
+    prefetch_batches: usize,
+
     #[arg(long, env = "MX8_MAX_QUEUE_BATCHES", default_value_t = 64)]
     max_queue_batches: usize,
 
@@ -146,6 +149,7 @@ async fn main() -> Result<()> {
             max_inflight_bytes: args.max_inflight_bytes,
             max_queue_batches: args.max_queue_batches,
             batch_size_samples: args.batch_size_samples,
+            prefetch_batches: args.prefetch_batches,
         };
 
         let pipeline = Pipeline::new(caps);
