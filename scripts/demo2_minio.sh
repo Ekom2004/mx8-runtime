@@ -10,6 +10,7 @@ set -euo pipefail
 #
 # Prereqs:
 # - docker (daemon running)
+# - python3
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -25,6 +26,11 @@ fi
 
 if ! command -v curl >/dev/null 2>&1; then
   echo "[demo2_minio] curl not found" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[demo2_minio] python3 not found" >&2
   exit 1
 fi
 
@@ -68,6 +74,26 @@ sleep_ms() {
   python3 - "$1" <<'PY'
 import sys, time
 time.sleep(int(sys.argv[1]) / 1000.0)
+PY
+}
+
+log_has_line_with_all() {
+  # Usage: log_has_line_with_all <path> <substr1> [<substr2> ...]
+  python3 - "$@" <<'PY'
+import sys
+
+path = sys.argv[1]
+need = sys.argv[2:]
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if all(s in line for s in need):
+                sys.exit(0)
+except FileNotFoundError:
+    sys.exit(1)
+
+sys.exit(1)
 PY
 }
 
@@ -203,7 +229,7 @@ kill_node_id="node${KILL_NODE_INDEX}"
 echo "[demo2_minio] waiting for first lease_granted to ${kill_node_id}"
 start_ms="$(ts_ms)"
 while true; do
-  if rg -q "event=\"lease_granted\".*node_id=${kill_node_id}" "${COORD_LOG}"; then
+  if log_has_line_with_all "${COORD_LOG}" 'event="lease_granted"' "node_id=${kill_node_id}"; then
     echo "[demo2_minio] saw first lease_granted for ${kill_node_id}"
     break
   fi
@@ -224,7 +250,7 @@ kill -KILL "${kill_pid}" >/dev/null 2>&1 || true
 echo "[demo2_minio] waiting for coordinator to emit range_requeued"
 start_ms="$(ts_ms)"
 while true; do
-  if rg -q 'event="range_requeued"' "${COORD_LOG}"; then
+  if log_has_line_with_all "${COORD_LOG}" 'event="range_requeued"'; then
     echo "[demo2_minio] saw range_requeued"
     break
   fi
@@ -239,7 +265,7 @@ done
 echo "[demo2_minio] waiting for coordinator to emit job_drained"
 start_ms="$(ts_ms)"
 while true; do
-  if rg -q 'event="job_drained"' "${COORD_LOG}"; then
+  if log_has_line_with_all "${COORD_LOG}" 'event="job_drained"'; then
     echo "[demo2_minio] saw job_drained"
     break
   fi
