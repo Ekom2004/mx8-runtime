@@ -670,6 +670,9 @@ impl Coordinator for CoordinatorSvc {
         if completed {
             let removed = state.leases.remove(&req.lease_id);
             state.progress.retain(|(_, id), _| id != &req.lease_id);
+            // Drop the write lock BEFORE calling update_gauges() to avoid deadlock.
+            // update_gauges() needs a read lock; holding write + requesting read = deadlock.
+            drop(state);
             if let Some(removed) = removed {
                 if let Some(range) = &removed.range {
                     tracing::info!(
