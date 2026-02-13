@@ -54,6 +54,7 @@ KILL_AFTER_MS="${KILL_AFTER_MS:-750}"         # kill during first leases
 WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-15000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-15000}"
 WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-60000}"
+WAIT_COORD_READY_TIMEOUT_MS="${WAIT_COORD_READY_TIMEOUT_MS:-30000}"
 
 JOB_ID="${JOB_ID:-demo2-minio}"
 DATASET_LINK="${DATASET_LINK:-s3://mx8-demo/data.bin}"
@@ -98,6 +99,39 @@ except FileNotFoundError:
     sys.exit(1)
 
 sys.exit(1)
+PY
+}
+
+wait_for_tcp_listen() {
+  # Usage: wait_for_tcp_listen <host> <port> <timeout_ms>
+  python3 - "$@" <<'PY'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+timeout_ms = int(sys.argv[3])
+
+deadline = time.time() + (timeout_ms / 1000.0)
+last = None
+while time.time() < deadline:
+    s = socket.socket()
+    s.settimeout(0.2)
+    try:
+        s.connect((host, port))
+        s.close()
+        sys.exit(0)
+    except Exception as e:
+        last = e
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    time.sleep(0.1)
+
+raise SystemExit(f"timeout waiting for {host}:{port} to accept TCP connections (last_error={last})")
 PY
 }
 
@@ -154,6 +188,12 @@ export MX8_S3_FORCE_PATH_STYLE=1
 BUCKET="${MX8_MINIO_BUCKET:-mx8-demo}"
 KEY="${MX8_MINIO_KEY:-data.bin}"
 
+MANIFEST_STORE_BUCKET="${MX8_MANIFEST_STORE_BUCKET:-mx8-manifests}"
+MANIFEST_STORE_PREFIX_DEFAULT="demo2-${MINIO_NAME}"
+MANIFEST_STORE_PREFIX="${MX8_MANIFEST_STORE_PREFIX:-${MANIFEST_STORE_PREFIX_DEFAULT}}"
+MANIFEST_STORE_ROOT_DEFAULT="s3://${MANIFEST_STORE_BUCKET}/${MANIFEST_STORE_PREFIX}"
+MANIFEST_STORE_ROOT="${MX8_MANIFEST_STORE_ROOT:-${MANIFEST_STORE_ROOT_DEFAULT}}"
+
 echo "[demo2_minio] creating local data file (${TOTAL_SAMPLES} samples, ${BYTES_PER_SAMPLE} bytes/sample)"
 total_bytes="$(( TOTAL_SAMPLES * BYTES_PER_SAMPLE ))"
 python3 - "${DATA_FILE}" "${total_bytes}" <<'PY'
@@ -179,8 +219,8 @@ echo "[demo2_minio] writing dev manifest (${DEV_MANIFEST})"
   }'
 } > "${DEV_MANIFEST}"
 
-echo "[demo2_minio] building binaries (agent with s3 feature)"
-cargo build -p mx8-coordinator >/dev/null
+echo "[demo2_minio] building binaries (coordinator+agent with s3 feature)"
+cargo build -p mx8-coordinator --features s3 >/dev/null
 cargo build -p mx8d-agent --features s3 >/dev/null
 
 if [[ -z "${COORD_PORT}" ]]; then
@@ -200,14 +240,14 @@ MX8_WORLD_SIZE="${WORLD_SIZE}" \
 MX8_HEARTBEAT_INTERVAL_MS="${HEARTBEAT_INTERVAL_MS}" \
 MX8_LEASE_TTL_MS="${LEASE_TTL_MS}" \
 MX8_DATASET_LINK="s3://${BUCKET}/${KEY}@refresh" \
-MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
+MX8_MANIFEST_STORE_ROOT="${MANIFEST_STORE_ROOT}" \
 MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
 MX8_DEV_BLOCK_SIZE="${BLOCK_SIZE}" \
 MX8_METRICS_SNAPSHOT_INTERVAL_MS=0 \
 target/debug/mx8-coordinator --world-size "${WORLD_SIZE}" >"${COORD_LOG}" 2>&1 &
 COORD_PID="$!"
 
-sleep 1
+wait_for_tcp_listen 127.0.0.1 "${COORD_PORT}" "${WAIT_COORD_READY_TIMEOUT_MS}"
 
 AGENT_PIDS=""
 for i in $(seq 1 "${WORLD_SIZE}"); do
