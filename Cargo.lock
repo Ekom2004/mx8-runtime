@@ -1745,8 +1745,11 @@ name = "mx8-manifest-store"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "aws-config",
+ "aws-sdk-s3",
  "mx8-core",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1799,8 +1802,10 @@ name = "mx8-snapshot"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "clap",
  "mx8-core",
  "mx8-manifest-store",
+ "mx8-observe",
  "thiserror 1.0.69",
  "tracing",
 ]

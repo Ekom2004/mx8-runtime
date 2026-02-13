@@ -8,7 +8,8 @@ use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 
-use mx8_manifest_store::fs::{FsManifestStore, LockOwner};
+use mx8_manifest_store::fs::FsManifestStore;
+use mx8_manifest_store::LockOwner;
 use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps};
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 
@@ -60,7 +61,7 @@ impl DataLoader {
 
         let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
-        let store = FsManifestStore::new(root);
+        let store = std::sync::Arc::new(FsManifestStore::new(root));
         let resolver = SnapshotResolver::new(
             store,
             SnapshotResolverConfig {
@@ -188,7 +189,7 @@ fn resolve_manifest_hash(
         .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
     let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
-    let store = FsManifestStore::new(root);
+    let store = std::sync::Arc::new(FsManifestStore::new(root));
     let resolver = SnapshotResolver::new(
         store,
         SnapshotResolverConfig {

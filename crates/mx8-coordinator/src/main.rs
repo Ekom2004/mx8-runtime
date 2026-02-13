@@ -56,7 +56,7 @@ struct Args {
         env = "MX8_MANIFEST_STORE_ROOT",
         default_value = "/var/lib/mx8/manifests"
     )]
-    manifest_store_root: PathBuf,
+    manifest_store_root: String,
 
     /// Development-only: path to a TSV manifest used to create a snapshot when needed.
     ///
@@ -156,7 +156,7 @@ struct CoordinatorMetrics {
     registered_nodes: Gauge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CoordinatorSvc {
     state: Arc<RwLock<CoordinatorState>>,
     metrics: Arc<CoordinatorMetrics>,
@@ -164,7 +164,7 @@ struct CoordinatorSvc {
     heartbeat_interval_ms: u32,
     lease_ttl_ms: u32,
     manifest_hash: String,
-    manifest_store: Option<Arc<mx8_manifest_store::fs::FsManifestStore>>,
+    manifest_store: Option<Arc<dyn ManifestStore>>,
 }
 
 impl CoordinatorSvc {
@@ -838,9 +838,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let store = Arc::new(mx8_manifest_store::fs::FsManifestStore::new(
-        args.manifest_store_root.clone(),
-    ));
+    let store: Arc<dyn ManifestStore> = Arc::from(mx8_manifest_store::open_from_root(
+        &args.manifest_store_root,
+    )?);
 
     let resolved_manifest_hash = if let Some(link) = &args.dataset_link {
         let cfg = SnapshotResolverConfig {
@@ -849,10 +849,10 @@ async fn main() -> Result<()> {
             dev_manifest_path: args.dev_manifest_path.clone(),
             ..Default::default()
         };
-        let resolver = SnapshotResolver::new((*store).clone(), cfg);
+        let resolver = SnapshotResolver::new(store.clone(), cfg);
         let resolved = resolver.resolve(
             link,
-            mx8_manifest_store::fs::LockOwner {
+            mx8_manifest_store::LockOwner {
                 node_id: Some("coordinator".to_string()),
             },
         )?;
@@ -916,7 +916,7 @@ async fn main() -> Result<()> {
             heartbeat_interval_ms: args.heartbeat_interval_ms,
             lease_ttl_ms: args.lease_ttl_ms,
             manifest_hash: resolved_manifest_hash,
-            manifest_store: Some(store),
+            manifest_store: Some(store.clone()),
         };
 
         let maintenance_svc = svc.clone();
@@ -1074,7 +1074,8 @@ mod tests {
     #[tokio::test]
     async fn get_manifest_serves_bytes_from_store() -> anyhow::Result<()> {
         let root = temp_store_root("get-manifest")?;
-        let store = Arc::new(mx8_manifest_store::fs::FsManifestStore::new(root));
+        let store: Arc<dyn ManifestStore> =
+            Arc::new(mx8_manifest_store::fs::FsManifestStore::new(root));
 
         let hash = ManifestHash("h".to_string());
         store.put_manifest_bytes(&hash, b"manifest")?;
@@ -1107,7 +1108,8 @@ mod tests {
         use tokio_stream::StreamExt;
 
         let root = temp_store_root("get-manifest-stream")?;
-        let store = Arc::new(mx8_manifest_store::fs::FsManifestStore::new(root));
+        let store: Arc<dyn ManifestStore> =
+            Arc::new(mx8_manifest_store::fs::FsManifestStore::new(root));
 
         let mut manifest = Vec::new();
         manifest.extend_from_slice(b"schema_version=0\n");
