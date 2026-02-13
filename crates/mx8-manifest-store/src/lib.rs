@@ -2,9 +2,12 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod fs;
+#[cfg(feature = "s3")]
+pub mod s3;
 mod sha256;
 
 use std::path::Path;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mx8_core::types::ManifestHash;
@@ -20,6 +23,10 @@ pub enum ManifestStoreError {
     NotFound(String),
     #[error("manifest bytes do not match existing content for hash {hash}")]
     HashCollision { hash: String },
+    #[error("unsupported manifest_store root: {0}")]
+    UnsupportedRoot(String),
+    #[error("runtime error: {0}")]
+    Runtime(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -29,6 +36,13 @@ pub enum ManifestStoreError {
 /// - Manifests are immutable by `manifest_hash`.
 /// - `intent_key` is the stable identifier for “what the user pointed at”.
 pub trait ManifestStore: Send + Sync + 'static {
+    fn try_acquire_index_lock(
+        &self,
+        intent_key: &str,
+        stale_after: Duration,
+        owner: LockOwner,
+    ) -> Result<Option<Box<dyn IndexLockGuard>>, ManifestStoreError>;
+
     fn put_manifest_bytes(
         &self,
         hash: &ManifestHash,
@@ -45,6 +59,19 @@ pub trait ManifestStore: Send + Sync + 'static {
         intent_key: &str,
         hash: &ManifestHash,
     ) -> Result<(), ManifestStoreError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct LockOwner {
+    pub node_id: Option<String>,
+}
+
+pub trait IndexLockGuard: Send {}
+
+pub fn intent_key_for_base(base: &str) -> String {
+    let normalized = normalize_intent_base(base);
+    let hash_hex = sha256_hex(normalized.as_bytes());
+    format!("sha256_{hash_hex}")
 }
 
 fn validate_key_component(value: &str) -> bool {
@@ -107,4 +134,32 @@ pub(crate) fn unix_time_ms() -> u64 {
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     sha256::to_lower_hex(&sha256::sha256(bytes))
+}
+
+pub fn open_from_root(root: &str) -> Result<Box<dyn ManifestStore>, ManifestStoreError> {
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return Err(ManifestStoreError::UnsupportedRoot(root.to_string()));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            return Ok(Box::new(s3::S3ManifestStore::from_env_url(rest)?));
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = rest;
+            return Err(ManifestStoreError::UnsupportedRoot(format!(
+                "s3://... requires feature 's3' (got {root:?})"
+            )));
+        }
+    }
+
+    Ok(Box::new(fs::FsManifestStore::new(trimmed)))
+}
+
+fn normalize_intent_base(base: &str) -> String {
+    let trimmed = base.trim();
+    trimmed.trim_end_matches('/').to_string()
 }

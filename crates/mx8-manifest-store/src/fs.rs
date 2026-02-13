@@ -4,8 +4,8 @@ use std::time::Duration;
 use mx8_core::types::ManifestHash;
 
 use crate::{
-    unix_time_ms, validate_intent_key, validate_manifest_hash, write_atomic, ManifestStore,
-    ManifestStoreError,
+    unix_time_ms, validate_intent_key, validate_manifest_hash, write_atomic, IndexLockGuard,
+    LockOwner, ManifestStore, ManifestStoreError,
 };
 
 #[derive(Debug, Clone)]
@@ -13,15 +13,12 @@ pub struct FsManifestStore {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone)]
-pub struct LockOwner {
-    pub node_id: Option<String>,
-}
-
 #[derive(Debug)]
 pub struct FsIndexLockGuard {
     path: PathBuf,
 }
+
+impl IndexLockGuard for FsIndexLockGuard {}
 
 impl Drop for FsIndexLockGuard {
     fn drop(&mut self) {
@@ -39,9 +36,7 @@ impl FsManifestStore {
     }
 
     pub fn intent_key_for_base(base: &str) -> String {
-        let normalized = normalize_intent_base(base);
-        let hash_hex = crate::sha256_hex(normalized.as_bytes());
-        format!("sha256_{hash_hex}")
+        crate::intent_key_for_base(base)
     }
 
     fn by_hash_path(&self, hash: &ManifestHash) -> Result<PathBuf, ManifestStoreError> {
@@ -127,6 +122,18 @@ impl FsManifestStore {
 }
 
 impl ManifestStore for FsManifestStore {
+    fn try_acquire_index_lock(
+        &self,
+        intent_key: &str,
+        stale_after: Duration,
+        owner: LockOwner,
+    ) -> Result<Option<Box<dyn IndexLockGuard>>, ManifestStoreError> {
+        Ok(
+            FsManifestStore::try_acquire_index_lock(self, intent_key, stale_after, owner)?
+                .map(|g| Box::new(g) as Box<dyn IndexLockGuard>),
+        )
+    }
+
     fn put_manifest_bytes(
         &self,
         hash: &ManifestHash,
@@ -201,11 +208,6 @@ impl ManifestStore for FsManifestStore {
         write_atomic(&path, hash.0.as_bytes())?;
         Ok(())
     }
-}
-
-fn normalize_intent_base(base: &str) -> String {
-    let trimmed = base.trim();
-    trimmed.trim_end_matches('/').to_string()
 }
 
 fn lock_file_content(unix_time_ms: u64, owner: &LockOwner) -> String {

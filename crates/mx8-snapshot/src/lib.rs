@@ -2,12 +2,12 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mx8_core::dataset_link::DatasetLink;
 use mx8_core::types::{ManifestHash, ManifestRecord, MANIFEST_SCHEMA_VERSION};
-use mx8_manifest_store::fs::{FsManifestStore, LockOwner};
-use mx8_manifest_store::{ManifestStore, ManifestStoreError};
+use mx8_manifest_store::{intent_key_for_base, LockOwner, ManifestStore, ManifestStoreError};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -56,14 +56,14 @@ impl Default for SnapshotResolverConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SnapshotResolver {
-    store: FsManifestStore,
+    store: Arc<dyn ManifestStore>,
     cfg: SnapshotResolverConfig,
 }
 
 impl SnapshotResolver {
-    pub fn new(store: FsManifestStore, cfg: SnapshotResolverConfig) -> Self {
+    pub fn new(store: Arc<dyn ManifestStore>, cfg: SnapshotResolverConfig) -> Self {
         Self { store, cfg }
     }
 
@@ -99,7 +99,7 @@ impl SnapshotResolver {
         refresh: bool,
         owner: LockOwner,
     ) -> Result<ResolvedSnapshot, SnapshotError> {
-        let intent_key = FsManifestStore::intent_key_for_base(base);
+        let intent_key = intent_key_for_base(base);
 
         if !refresh {
             if let Some(hash) = self.store.get_current_snapshot(&intent_key)? {
@@ -343,6 +343,7 @@ fn canonicalize_manifest_bytes(records: &[ManifestRecord]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mx8_manifest_store::fs::FsManifestStore;
 
     #[test]
     fn canonical_hash_is_deterministic() -> anyhow::Result<()> {
@@ -357,7 +358,7 @@ mod tests {
             p
         };
 
-        let store = FsManifestStore::new(root);
+        let store: Arc<dyn ManifestStore> = Arc::new(FsManifestStore::new(root));
         let cfg = SnapshotResolverConfig {
             dev_manifest_path: None,
             ..Default::default()
@@ -406,7 +407,7 @@ mod tests {
         let manifest_path = root.join("dev_manifest.tsv");
         std::fs::write(&manifest_path, "0\ta\n1\tb\t0\t10\tx\n")?;
 
-        let store = FsManifestStore::new(root.clone());
+        let store: Arc<dyn ManifestStore> = Arc::new(FsManifestStore::new(root.clone()));
         let cfg = SnapshotResolverConfig {
             dev_manifest_path: Some(manifest_path),
             ..Default::default()
@@ -445,7 +446,7 @@ mod tests {
     fn missing_dev_manifest_path_surfaces_as_dev_manifest_io() {
         let root =
             std::env::temp_dir().join(format!("mx8-snapshot-missing-{}", std::process::id()));
-        let store = FsManifestStore::new(root);
+        let store: Arc<dyn ManifestStore> = Arc::new(FsManifestStore::new(root));
         let resolver = SnapshotResolver::new(
             store,
             SnapshotResolverConfig {

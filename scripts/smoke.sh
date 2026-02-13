@@ -53,4 +53,9 @@ if [[ "${MX8_SMOKE_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
   ./scripts/demo2_minio_scale.sh
 fi
 
+if [[ "${MX8_SMOKE_MINIO_MANIFEST_STORE:-0}" == "1" ]]; then
+  echo "[mx8] minio_manifest_store_gate (S3 manifest_store locks + deterministic hash)"
+  ./scripts/minio_manifest_store_gate.sh
+fi
+
 echo "[mx8] smoke OK"
