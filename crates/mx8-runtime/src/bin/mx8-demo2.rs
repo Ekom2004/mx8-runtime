@@ -289,6 +289,9 @@ async fn main() -> Result<()> {
         .env("MX8_DEV_MANIFEST_PATH", &dev_manifest)
         .env("MX8_DEV_BLOCK_SIZE", args.block_size.to_string())
         .env("MX8_METRICS_SNAPSHOT_INTERVAL_MS", "0")
+        // Disable ANSI escape codes in tracing output so that event
+        // string matching in read_coordinator_logs works correctly.
+        .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
