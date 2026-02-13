@@ -19,6 +19,24 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! docker info >/dev/null 2>&1; then
+  echo "[mx8] docker daemon not running (cannot connect to Docker socket)" >&2
+  case "$(uname -s)" in
+    Darwin)
+      echo "[mx8] start Docker Desktop, then rerun (tip: \`open -a Docker\`)" >&2
+      ;;
+    *)
+      echo "[mx8] start Docker engine/service, then rerun (e.g., systemctl start docker)" >&2
+      ;;
+  esac
+  exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "[mx8] curl not found (needed for MinIO health check)" >&2
+  exit 1
+fi
+
 IMAGE="${MX8_MINIO_IMAGE:-minio/minio:latest}"
 PORT="${MX8_MINIO_PORT:-9000}"
 CONSOLE_PORT="${MX8_MINIO_CONSOLE_PORT:-9001}"
@@ -64,4 +82,3 @@ echo "[mx8] running demo4-minio (s3 feature enabled)"
 (cd "${ROOT}" && RUST_LOG="${RUST_LOG:-warn}" cargo run -p mx8-runtime --features s3 --bin mx8-demo4-minio)
 
 echo "[mx8] minio_gate OK"
-
