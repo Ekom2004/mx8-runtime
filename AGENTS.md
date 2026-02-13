@@ -20,6 +20,12 @@ Once the Rust workspace exists:
 - `cargo clippy --all-targets --all-features`: lint for common Rust issues.
 - `./scripts/smoke.sh`: run format/lint/tests plus internal demo gates (Demo 2 + Demo 3).
 
+## Troubleshooting
+
+- If you see `error: crate reqwest required to be available in rlib format, but was not found in this form` during `cargo run` or `./scripts/smoke.sh`, the incremental build artifacts can be in a bad state. Fix with:
+  - `cargo clean -p reqwest`
+  - then rerun the command (e.g., `./scripts/smoke.sh`).
+
 ## Coding Style & Naming Conventions
 
 - Rust: run `cargo fmt` before commits; prefer explicit types at boundaries and clear error types.
