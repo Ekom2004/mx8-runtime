@@ -48,4 +48,9 @@ if [[ "${MX8_SMOKE_DEMO2_MINIO:-0}" == "1" ]]; then
   ./scripts/demo2_minio.sh
 fi
 
+if [[ "${MX8_SMOKE_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
+  echo "[mx8] demo2_minio_scale (scale gate: >4MiB manifest + MinIO + recovery)"
+  ./scripts/demo2_minio_scale.sh
+fi
+
 echo "[mx8] smoke OK"
