@@ -7,6 +7,8 @@ set -euo pipefail
 #
 # Usage:
 #   ./scripts/demo2_minio_scale.sh
+#   MX8_DEV_LEASE_WANT=4 ./scripts/demo2_minio_scale.sh
+#   MX8_BENCH_WANTS=1,4 ./scripts/demo2_minio_scale.sh
 #
 # Prereqs:
 # - docker (daemon running)
@@ -19,6 +21,8 @@ WORLD_SIZE="${WORLD_SIZE:-4}"
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-200000}"
 BYTES_PER_SAMPLE="${BYTES_PER_SAMPLE:-256}"
 BLOCK_SIZE="${BLOCK_SIZE:-10000}"
+DEV_LEASE_WANT="${MX8_DEV_LEASE_WANT:-1}"
+BENCH_WANTS="${MX8_BENCH_WANTS:-}"
 
 SINK_SLEEP_MS="${SINK_SLEEP_MS:-0}"
 KILL_AFTER_MS="${KILL_AFTER_MS:-750}"
@@ -26,24 +30,8 @@ WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-30000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-30000}"
 WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-240000}"
 
-tmp_log_base="$(mktemp "${TMPDIR:-/tmp}/mx8-demo2-minio-scale.XXXXXX")"
-tmp_log="${tmp_log_base}.log"
-mv "${tmp_log_base}" "${tmp_log}"
-echo "[demo2_minio_scale] running WORLD_SIZE=${WORLD_SIZE} TOTAL_SAMPLES=${TOTAL_SAMPLES} BLOCK_SIZE=${BLOCK_SIZE}"
-
-WORLD_SIZE="${WORLD_SIZE}" \
-TOTAL_SAMPLES="${TOTAL_SAMPLES}" \
-BYTES_PER_SAMPLE="${BYTES_PER_SAMPLE}" \
-BLOCK_SIZE="${BLOCK_SIZE}" \
-SINK_SLEEP_MS="${SINK_SLEEP_MS}" \
-KILL_AFTER_MS="${KILL_AFTER_MS}" \
-WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS}" \
-WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS}" \
-WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS}" \
-./scripts/demo2_minio.sh | tee "${tmp_log}"
-
-artifacts="$(
-  python3 - "${tmp_log}" <<'PY'
+extract_artifacts() {
+  python3 - "$1" <<'PY'
 import sys
 
 path = sys.argv[1]
@@ -54,11 +42,10 @@ with open(path, "r", encoding="utf-8", errors="replace") as f:
             raise SystemExit(0)
 raise SystemExit(1)
 PY
-)"
+}
 
-echo "[demo2_minio_scale] artifacts=${artifacts}"
-
-python3 - "${artifacts}" "${WORLD_SIZE}" <<'PY'
+validate_and_elapsed_ms() {
+  python3 - "$1" "$2" <<'PY'
 import os
 import re
 import sys
@@ -86,6 +73,34 @@ def find_manifest_cached_bytes(path: str) -> int:
                 return int(m.group(1))
     raise SystemExit(f"{path} missing manifest_cached with manifest_bytes=...")
 
+def find_elapsed_ms(path: str) -> int:
+    txt = read_text(path)
+    lines = txt.splitlines()
+
+    start = None
+    for line in lines:
+        if 'event="progress"' in line:
+            m = re.search(r"\bunix_time_ms=(\d+)\b", line)
+            if m:
+                start = int(m.group(1))
+                break
+
+    end = None
+    for line in reversed(lines):
+        if 'event="job_drained"' in line:
+            m = re.search(r"\bunix_time_ms=(\d+)\b", line)
+            if m:
+                end = int(m.group(1))
+                break
+
+    if start is None:
+        raise SystemExit(f"{path} missing progress unix_time_ms")
+    if end is None:
+        raise SystemExit(f"{path} missing job_drained unix_time_ms")
+    if end < start:
+        raise SystemExit(f"{path} end < start (end={end}, start={start})")
+    return end - start
+
 min_expected = 4 * 1024 * 1024 + 1
 
 coord_log = os.path.join(root, "coordinator.log")
@@ -107,7 +122,67 @@ if not any_ok:
         f"expected at least one agent to cache a >4MiB manifest (>= {min_expected} bytes)"
     )
 
-print("[demo2_minio_scale] OK: large manifest cached without gRPC limit errors")
+elapsed_ms = find_elapsed_ms(coord_log)
+print(elapsed_ms)
 PY
+}
+
+run_once() {
+  local want="$1"
+  local tmp_log_base
+  tmp_log_base="$(mktemp "${TMPDIR:-/tmp}/mx8-demo2-minio-scale.XXXXXX")"
+  local tmp_log="${tmp_log_base}.log"
+  mv "${tmp_log_base}" "${tmp_log}"
+
+  echo "[demo2_minio_scale] running want=${want} WORLD_SIZE=${WORLD_SIZE} TOTAL_SAMPLES=${TOTAL_SAMPLES} BLOCK_SIZE=${BLOCK_SIZE}" >&2
+
+  WORLD_SIZE="${WORLD_SIZE}" \
+  TOTAL_SAMPLES="${TOTAL_SAMPLES}" \
+  BYTES_PER_SAMPLE="${BYTES_PER_SAMPLE}" \
+  BLOCK_SIZE="${BLOCK_SIZE}" \
+  SINK_SLEEP_MS="${SINK_SLEEP_MS}" \
+  KILL_AFTER_MS="${KILL_AFTER_MS}" \
+  WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS}" \
+  WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS}" \
+  WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS}" \
+  MX8_DEV_LEASE_WANT="${want}" \
+  ./scripts/demo2_minio.sh | tee "${tmp_log}" >&2
+
+  local artifacts
+  artifacts="$(extract_artifacts "${tmp_log}")"
+  echo "[demo2_minio_scale] artifacts=${artifacts}" >&2
+
+  local elapsed_ms
+  elapsed_ms="$(validate_and_elapsed_ms "${artifacts}" "${WORLD_SIZE}")"
+  echo "[demo2_minio_scale] OK: large manifest cached without gRPC limit errors elapsed_ms=${elapsed_ms} (want=${want})" >&2
+  echo "${elapsed_ms}"
+}
+
+if [[ -n "${BENCH_WANTS}" ]]; then
+  echo "[demo2_minio_scale] bench wants=${BENCH_WANTS}"
+  python3 - "${BENCH_WANTS}" <<'PY' >/dev/null
+import sys
+wants = [w.strip() for w in sys.argv[1].split(",") if w.strip()]
+for w in wants:
+    int(w)  # validate
+PY
+
+  IFS=',' read -r -a wants <<<"${BENCH_WANTS}"
+  elapsed_by_want=()
+  for w in "${wants[@]}"; do
+    w="$(echo "${w}" | tr -d '[:space:]')"
+    if [[ -z "${w}" ]]; then
+      continue
+    fi
+    elapsed_by_want+=("${w}:$(run_once "${w}")")
+  done
+
+  echo "[demo2_minio_scale] bench results:"
+  for entry in "${elapsed_by_want[@]}"; do
+    echo "  ${entry}"
+  done
+else
+  run_once "${DEV_LEASE_WANT}" >/dev/null
+fi
 
 echo "[demo2_minio_scale] done"

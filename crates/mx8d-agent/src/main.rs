@@ -96,6 +96,7 @@ struct AgentMetrics {
     heartbeat_err_total: Counter,
     inflight_bytes: Gauge,
     ram_high_water_bytes: Gauge,
+    active_lease_tasks: Gauge,
     leases_started_total: Counter,
     leases_completed_total: Counter,
     delivered_samples_total: Counter,
@@ -115,6 +116,7 @@ impl AgentMetrics {
             heartbeat_err_total = self.heartbeat_err_total.get(),
             inflight_bytes = self.inflight_bytes.get(),
             ram_high_water_bytes = self.ram_high_water_bytes.get(),
+            active_lease_tasks = self.active_lease_tasks.get(),
             leases_started_total = self.leases_started_total.get(),
             leases_completed_total = self.leases_completed_total.get(),
             delivered_samples_total = self.delivered_samples_total.get(),
@@ -550,7 +552,7 @@ async fn main() -> Result<()> {
 
                 // `want` is interpreted as "max concurrent leases per node".
                 let target_concurrency = std::cmp::max(1, want as usize);
-                let mut joinset: tokio::task::JoinSet<anyhow::Result<()>> =
+                let mut joinset: tokio::task::JoinSet<(String, anyhow::Result<()>)> =
                     tokio::task::JoinSet::new();
                 let mut active: usize = 0;
                 let mut next_request_at = tokio::time::Instant::now();
@@ -596,8 +598,20 @@ async fn main() -> Result<()> {
                             let manifest_bytes = manifest_bytes.clone();
                             let metrics = metrics_clone.clone();
                             let ch = lease_channel.clone();
+                            let lease_id = lease.lease_id.clone();
+
+                            tracing::info!(
+                                target: "mx8_proof",
+                                event = "lease_task_spawned",
+                                job_id = %args.job_id,
+                                node_id = %args.node_id,
+                                manifest_hash = %manifest_hash,
+                                lease_id = %lease_id,
+                                "lease task spawned"
+                            );
+
                             joinset.spawn(async move {
-                                run_lease(
+                                let res = run_lease(
                                     ch,
                                     pipeline,
                                     manifest_bytes,
@@ -606,9 +620,13 @@ async fn main() -> Result<()> {
                                     &metrics,
                                     lease,
                                 )
-                                .await
+                                .await;
+                                (lease_id, res)
                             });
                             active = active.saturating_add(1);
+                            metrics_clone
+                                .active_lease_tasks
+                                .set(u64::try_from(active).unwrap_or(u64::MAX));
                             if active >= target_concurrency {
                                 break;
                             }
@@ -626,9 +644,28 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         res = joinset.join_next() => {
                             match res {
-                                Some(Ok(Ok(()))) => {}
-                                Some(Ok(Err(err))) => {
-                                    tracing::error!(error = %err, "lease execution failed");
+                                Some(Ok((lease_id, Ok(())))) => {
+                                    tracing::info!(
+                                        target: "mx8_proof",
+                                        event = "lease_task_done",
+                                        job_id = %args_clone.job_id,
+                                        node_id = %args_clone.node_id,
+                                        manifest_hash = %manifest_hash_clone,
+                                        lease_id = %lease_id,
+                                        "lease task done"
+                                    );
+                                }
+                                Some(Ok((lease_id, Err(err)))) => {
+                                    tracing::error!(
+                                        target: "mx8_proof",
+                                        event = "lease_task_done",
+                                        job_id = %args_clone.job_id,
+                                        node_id = %args_clone.node_id,
+                                        manifest_hash = %manifest_hash_clone,
+                                        lease_id = %lease_id,
+                                        error = %err,
+                                        "lease task done (error)"
+                                    );
                                 }
                                 Some(Err(err)) => {
                                     tracing::error!(error = %err, "lease task join failed");
@@ -636,6 +673,9 @@ async fn main() -> Result<()> {
                                 None => {}
                             }
                             active = active.saturating_sub(1);
+                            metrics_clone
+                                .active_lease_tasks
+                                .set(u64::try_from(active).unwrap_or(u64::MAX));
                         }
                         _ = tokio::time::sleep_until(next_request_at), if active < target_concurrency => {
                             // Time to ask for more leases.
