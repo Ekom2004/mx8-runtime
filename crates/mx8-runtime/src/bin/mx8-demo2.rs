@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -55,7 +56,8 @@ struct Args {
     #[arg(long, env = "MX8_DATASET_LINK", default_value = "demo://demo2/")]
     dataset_link: String,
 
-    #[arg(long, env = "MX8_KILL_NODE_INDEX", default_value_t = 1)]
+    /// Which node to kill after startup (1-based). 0 means "auto: kill the first lease owner".
+    #[arg(long, env = "MX8_KILL_NODE_INDEX", default_value_t = 0)]
     kill_node_index: u32,
 
     #[arg(long, env = "MX8_KILL_AFTER_MS", default_value_t = 750)]
@@ -77,10 +79,21 @@ struct Args {
     keep_artifacts: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct DemoEvents {
     saw_requeued: bool,
     saw_drained: bool,
+    first_lease_node_id: Option<String>,
+}
+
+fn find_free_local_port(start: u16) -> anyhow::Result<u16> {
+    for port in start..=start.saturating_add(200) {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return Ok(port);
+        }
+    }
+    Err(anyhow::anyhow!("no free port found starting at {start}"))
 }
 
 fn workspace_root() -> anyhow::Result<PathBuf> {
@@ -105,7 +118,6 @@ fn write_dev_manifest(
     bytes_per_sample: u64,
 ) -> anyhow::Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
-    writeln!(w, "schema_version=0")?;
     let data_path = data_file.display();
     for i in 0..total_samples {
         let off = i
@@ -134,16 +146,35 @@ async fn read_coordinator_logs(
     let mut reader = BufReader::new(&mut stdout).lines();
     while let Some(line) = reader.next_line().await? {
         println!("coord| {line}");
-        let mut cur = *events_tx.borrow();
+        let mut cur = (*events_tx.borrow()).clone();
         if line.contains("event=\"range_requeued\"") {
             cur.saw_requeued = true;
         }
         if line.contains("event=\"job_drained\"") {
             cur.saw_drained = true;
         }
+        if cur.first_lease_node_id.is_none() && line.contains("event=\"lease_granted\"") {
+            if let Some(node_id) = parse_field_value(&line, "node_id=") {
+                cur.first_lease_node_id = Some(node_id);
+            }
+        }
         let _ = events_tx.send(cur);
     }
     Ok(())
+}
+
+fn parse_field_value(line: &str, key: &str) -> Option<String> {
+    let idx = line.find(key)?;
+    let rest = &line[idx + key.len()..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ',' || c == '}')
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 async fn wait_for<F>(
@@ -156,7 +187,7 @@ where
 {
     let fut = async move {
         loop {
-            if f(*rx.borrow()) {
+            if f(rx.borrow().clone()) {
                 return Ok(());
             }
             rx.changed().await.map_err(anyhow::Error::from)?;
@@ -175,10 +206,12 @@ async fn main() -> Result<()> {
     anyhow::ensure!(args.world_size >= 2, "world_size must be >= 2 for demo2");
     anyhow::ensure!(args.bytes_per_sample > 0, "bytes_per_sample must be > 0");
     anyhow::ensure!(args.block_size > 0, "block_size must be > 0");
-    anyhow::ensure!(
-        args.kill_node_index >= 1 && args.kill_node_index <= args.world_size,
-        "kill_node_index must be in [1..world_size]"
-    );
+    if args.kill_node_index != 0 {
+        anyhow::ensure!(
+            args.kill_node_index >= 1 && args.kill_node_index <= args.world_size,
+            "kill_node_index must be 0 (auto) or in [1..world_size]"
+        );
+    }
 
     let root = demo_temp_root();
     let store_root = root.join("store");
@@ -221,11 +254,28 @@ async fn main() -> Result<()> {
     anyhow::ensure!(coord_bin.exists(), "missing {}", coord_bin.display());
     anyhow::ensure!(agent_bin.exists(), "missing {}", agent_bin.display());
 
-    println!("[demo2] starting coordinator");
+    let (coord_bind_addr, coord_url) = {
+        let default_bind = "127.0.0.1:50051";
+        let default_url = "http://127.0.0.1:50051";
+        if args.coord_bind_addr == default_bind && args.coord_url == default_url {
+            let port = find_free_local_port(50051)?;
+            (
+                format!("127.0.0.1:{port}"),
+                format!("http://127.0.0.1:{port}"),
+            )
+        } else {
+            (args.coord_bind_addr.clone(), args.coord_url.clone())
+        }
+    };
+
+    println!(
+        "[demo2] starting coordinator (bind={}, url={})",
+        coord_bind_addr, coord_url
+    );
     let mut coord = Command::new(&coord_bin)
         .arg("--world-size")
         .arg(args.world_size.to_string())
-        .env("MX8_COORD_BIND_ADDR", &args.coord_bind_addr)
+        .env("MX8_COORD_BIND_ADDR", &coord_bind_addr)
         .env("MX8_WORLD_SIZE", args.world_size.to_string())
         .env(
             "MX8_HEARTBEAT_INTERVAL_MS",
@@ -253,10 +303,12 @@ async fn main() -> Result<()> {
 
     println!("[demo2] starting agents (world_size={})", args.world_size);
     let mut agents = Vec::new();
+    let mut agent_node_ids = Vec::new();
     for i in 1..=args.world_size {
         let node_id = format!("node{i}");
+        agent_node_ids.push(node_id.clone());
         let child = Command::new(&agent_bin)
-            .env("MX8_COORD_URL", &args.coord_url)
+            .env("MX8_COORD_URL", &coord_url)
             .env("MX8_JOB_ID", &args.job_id)
             .env("MX8_NODE_ID", node_id)
             .env("MX8_MANIFEST_CACHE_DIR", &cache_dir)
@@ -277,14 +329,39 @@ async fn main() -> Result<()> {
             )
             .env("MX8_METRICS_SNAPSHOT_INTERVAL_MS", "0")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()?;
         agents.push(child);
     }
 
+    let kill_idx = if args.kill_node_index == 0 {
+        println!("[demo2] waiting for first lease_granted (to pick kill target)");
+        wait_for(events_rx.clone(), Duration::from_millis(5000), |e| {
+            e.first_lease_node_id.is_some()
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout waiting for first lease_granted"))?;
+        let lease_owner = events_rx
+            .borrow()
+            .first_lease_node_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing first lease owner node_id"))?;
+        let idx = agent_node_ids
+            .iter()
+            .position(|n| n == &lease_owner)
+            .ok_or_else(|| anyhow::anyhow!("unknown lease owner node_id={lease_owner}"))?;
+        println!("[demo2] auto kill lease owner node_id={lease_owner}");
+        idx
+    } else {
+        usize::try_from(args.kill_node_index - 1)?
+    };
+
     tokio::time::sleep(Duration::from_millis(args.kill_after_ms)).await;
-    println!("[demo2] killing agent index={}", args.kill_node_index);
-    let kill_idx = usize::try_from(args.kill_node_index - 1)?;
+    println!(
+        "[demo2] killing agent index={} node_id={}",
+        kill_idx + 1,
+        agent_node_ids[kill_idx]
+    );
     if let Some(child) = agents.get_mut(kill_idx) {
         let _ = child.kill().await;
     }

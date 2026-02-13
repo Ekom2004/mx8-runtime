@@ -36,6 +36,7 @@ WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-60000}"
 
 JOB_ID="${JOB_ID:-demo2}"
 DATASET_LINK="${DATASET_LINK:-demo://demo2/}"
+COORD_PORT="${COORD_PORT:-}"
 
 ts_ms() {
   python3 - <<'PY'
@@ -87,7 +88,6 @@ PY
 
 echo "[demo2] writing dev manifest (${DEV_MANIFEST})"
 {
-  echo "schema_version=0"
   awk -v n="${TOTAL_SAMPLES}" -v p="${DATA_FILE}" -v b="${BYTES_PER_SAMPLE}" 'BEGIN{
     for (i=0;i<n;i++) {
       printf "%d\t%s\t%d\t%d\n", i, p, i*b, b
@@ -98,8 +98,19 @@ echo "[demo2] writing dev manifest (${DEV_MANIFEST})"
 echo "[demo2] building binaries"
 cargo build -p mx8-coordinator -p mx8d-agent >/dev/null
 
+if [[ -z "${COORD_PORT}" ]]; then
+  COORD_PORT="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+fi
+
 echo "[demo2] starting coordinator"
-MX8_COORD_BIND_ADDR="127.0.0.1:50051" \
+MX8_COORD_BIND_ADDR="127.0.0.1:${COORD_PORT}" \
 MX8_WORLD_SIZE="${WORLD_SIZE}" \
 MX8_HEARTBEAT_INTERVAL_MS="${HEARTBEAT_INTERVAL_MS}" \
 MX8_LEASE_TTL_MS="${LEASE_TTL_MS}" \
@@ -118,7 +129,7 @@ for i in $(seq 1 "${WORLD_SIZE}"); do
   node_id="node${i}"
   log="${TMP_ROOT}/agent_${node_id}.log"
   echo "[demo2] starting agent ${node_id}"
-  MX8_COORD_URL="http://127.0.0.1:50051" \
+  MX8_COORD_URL="http://127.0.0.1:${COORD_PORT}" \
   MX8_JOB_ID="${JOB_ID}" \
   MX8_NODE_ID="${node_id}" \
   MX8_MANIFEST_CACHE_DIR="${CACHE_DIR}" \
@@ -172,4 +183,3 @@ done
 echo "[demo2] done"
 echo "[demo2] artifacts: ${TMP_ROOT}"
 echo "[demo2] coordinator log: ${COORD_LOG}"
-
