@@ -106,8 +106,7 @@ impl Pipeline {
         let s3_client: Option<S3Client> = if has_s3 {
             #[cfg(feature = "s3")]
             {
-                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                Some(aws_sdk_s3::Client::new(&cfg))
+                Some(crate::s3::client_from_env().await?)
             }
             #[cfg(not(feature = "s3"))]
             {
@@ -159,8 +158,7 @@ impl Pipeline {
         let s3_client: Option<S3Client> = if has_s3 {
             #[cfg(feature = "s3")]
             {
-                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                Some(aws_sdk_s3::Client::new(&cfg))
+                Some(crate::s3::client_from_env().await?)
             }
             #[cfg(not(feature = "s3"))]
             {
@@ -254,8 +252,7 @@ impl Pipeline {
         let s3_client: Option<S3Client> = if has_s3 {
             #[cfg(feature = "s3")]
             {
-                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                Some(aws_sdk_s3::Client::new(&cfg))
+                Some(crate::s3::client_from_env().await?)
             }
             #[cfg(not(feature = "s3"))]
             {
@@ -303,8 +300,7 @@ impl Pipeline {
         let s3_client: Option<S3Client> = if has_s3 {
             #[cfg(feature = "s3")]
             {
-                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                Some(aws_sdk_s3::Client::new(&cfg))
+                Some(crate::s3::client_from_env().await?)
             }
             #[cfg(not(feature = "s3"))]
             {
