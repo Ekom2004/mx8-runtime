@@ -37,6 +37,8 @@ echo "[mx8] install maturin"
 if [[ "${MX8_PY_SMOKE_INSTALL_TORCH:-0}" == "1" ]]; then
   echo "[mx8] install torch (optional)"
   "${PYTHON_BIN}" -m pip install -U torch
+  echo "[mx8] install numpy (optional; silences torch warning)"
+  "${PYTHON_BIN}" -m pip install -U numpy >/dev/null
 fi
 
 STORE_ROOT="${TMP_ROOT}/store"
