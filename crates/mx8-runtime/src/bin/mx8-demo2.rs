@@ -56,8 +56,10 @@ struct Args {
     #[arg(long, env = "MX8_DATASET_LINK", default_value = "demo://demo2/")]
     dataset_link: String,
 
-    /// Which node to kill after startup (1-based). 0 means "auto: kill the first lease owner".
-    #[arg(long, env = "MX8_KILL_NODE_INDEX", default_value_t = 0)]
+    /// Which node to kill after startup (1-based).
+    ///
+    /// Use 0 to attempt auto-selecting the first observed lease owner (best-effort).
+    #[arg(long, env = "MX8_KILL_NODE_INDEX", default_value_t = 1)]
     kill_node_index: u32,
 
     #[arg(long, env = "MX8_KILL_AFTER_MS", default_value_t = 750)]
@@ -312,7 +314,7 @@ async fn main() -> Result<()> {
             .env("MX8_JOB_ID", &args.job_id)
             .env("MX8_NODE_ID", node_id)
             .env("MX8_MANIFEST_CACHE_DIR", &cache_dir)
-            .env("MX8_DEV_LEASE_WANT", "2")
+            .env("MX8_DEV_LEASE_WANT", "1")
             .env(
                 "MX8_BATCH_SIZE_SAMPLES",
                 args.batch_size_samples.to_string(),
@@ -336,22 +338,26 @@ async fn main() -> Result<()> {
 
     let kill_idx = if args.kill_node_index == 0 {
         println!("[demo2] waiting for first lease_granted (to pick kill target)");
-        wait_for(events_rx.clone(), Duration::from_millis(5000), |e| {
+        let _ = wait_for(events_rx.clone(), Duration::from_millis(5000), |e| {
             e.first_lease_node_id.is_some()
         })
-        .await
-        .map_err(|_| anyhow::anyhow!("timeout waiting for first lease_granted"))?;
-        let lease_owner = events_rx
-            .borrow()
-            .first_lease_node_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("missing first lease owner node_id"))?;
-        let idx = agent_node_ids
-            .iter()
-            .position(|n| n == &lease_owner)
-            .ok_or_else(|| anyhow::anyhow!("unknown lease owner node_id={lease_owner}"))?;
-        println!("[demo2] auto kill lease owner node_id={lease_owner}");
-        idx
+        .await;
+
+        let lease_owner = events_rx.borrow().first_lease_node_id.clone();
+        match lease_owner {
+            Some(lease_owner) => {
+                let idx = agent_node_ids
+                    .iter()
+                    .position(|n| n == &lease_owner)
+                    .unwrap_or(0);
+                println!("[demo2] auto kill lease owner node_id={lease_owner}");
+                idx
+            }
+            None => {
+                println!("[demo2] auto-select failed; falling back to kill node index=1");
+                0
+            }
+        }
     } else {
         usize::try_from(args.kill_node_index - 1)?
     };
