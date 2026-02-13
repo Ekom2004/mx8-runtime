@@ -43,4 +43,9 @@ if [[ "${MX8_SMOKE_MINIO:-0}" == "1" ]]; then
   ./scripts/minio_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_DEMO2_MINIO:-0}" == "1" ]]; then
+  echo "[mx8] demo2_minio (distributed lease recovery + MinIO bytes)"
+  ./scripts/demo2_minio.sh
+fi
+
 echo "[mx8] smoke OK"
