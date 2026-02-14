@@ -11,6 +11,9 @@ use mx8_manifest_store::{intent_key_for_base, LockOwner, ManifestStore, Manifest
 use thiserror::Error;
 use tracing::{info, warn};
 
+pub mod labels;
+pub mod pack_dir;
+
 #[cfg(feature = "s3")]
 pub mod pack_s3;
 
@@ -30,6 +33,10 @@ pub enum SnapshotError {
     DevManifestInvariant(String),
     #[error("indexing is not supported for dataset link base: {0}")]
     IndexUnsupported(String),
+    #[error("indexing IO error: {0}")]
+    IndexIo(String),
+    #[error("indexing parse error: {0}")]
+    IndexParse(String),
     #[error("s3 indexing requires feature 's3' (dataset base: {0})")]
     S3FeatureRequired(String),
     #[error("s3 indexing failed: {0}")]
@@ -234,7 +241,178 @@ fn index_manifest_for_base(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>),
         }
     }
 
+    // Local FS prefix indexing (directory path).
+    if std::path::Path::new(trimmed).is_dir() {
+        return index_local_prefix(trimmed);
+    }
+
     Err(SnapshotError::IndexUnsupported(trimmed.to_string()))
+}
+
+fn parse_canonical_manifest_tsv_bytes(
+    bytes: &[u8],
+) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+    let s = std::str::from_utf8(bytes)
+        .map_err(|e| SnapshotError::IndexParse(format!("manifest is not utf-8: {e}")))?;
+
+    let mut lines = s.lines();
+    let first = lines
+        .by_ref()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| SnapshotError::IndexParse("empty manifest".to_string()))?;
+
+    let Some((k, v)) = first.split_once('=') else {
+        return Err(SnapshotError::IndexParse(
+            "manifest header missing schema_version".to_string(),
+        ));
+    };
+    if k.trim() != "schema_version" {
+        return Err(SnapshotError::IndexParse(
+            "manifest header must be schema_version=<n>".to_string(),
+        ));
+    }
+    let schema_version: u32 = v
+        .trim()
+        .parse()
+        .map_err(|_| SnapshotError::IndexParse("invalid schema_version".to_string()))?;
+    if schema_version != MANIFEST_SCHEMA_VERSION {
+        return Err(SnapshotError::IndexParse(format!(
+            "unsupported schema_version {schema_version}"
+        )));
+    }
+
+    let mut records: Vec<ManifestRecord> = Vec::new();
+    for (line_no, raw) in lines.enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 5 {
+            return Err(SnapshotError::IndexParse(format!(
+                "line {}: expected 5 columns (sample_id<TAB>location<TAB>byte_offset<TAB>byte_length<TAB>decode_hint)",
+                line_no + 2
+            )));
+        }
+        let sample_id: u64 = cols[0].trim().parse().map_err(|_| {
+            SnapshotError::IndexParse(format!("line {}: bad sample_id", line_no + 2))
+        })?;
+        let location = cols[1].trim().to_string();
+        if location.contains('\n') || location.contains('\t') {
+            return Err(SnapshotError::IndexParse(format!(
+                "line {}: location must not contain tabs/newlines",
+                line_no + 2
+            )));
+        }
+        let byte_offset = if cols[2].trim().is_empty() {
+            None
+        } else {
+            Some(cols[2].trim().parse().map_err(|_| {
+                SnapshotError::IndexParse(format!("line {}: bad byte_offset", line_no + 2))
+            })?)
+        };
+        let byte_length = if cols[3].trim().is_empty() {
+            None
+        } else {
+            Some(cols[3].trim().parse().map_err(|_| {
+                SnapshotError::IndexParse(format!("line {}: bad byte_length", line_no + 2))
+            })?)
+        };
+        let decode_hint = if cols[4].trim().is_empty() {
+            None
+        } else {
+            Some(cols[4].trim().to_string())
+        };
+
+        let record = ManifestRecord {
+            sample_id,
+            location,
+            byte_offset,
+            byte_length,
+            decode_hint,
+        };
+        record
+            .validate()
+            .map_err(|e| SnapshotError::IndexParse(format!("line {}: {e}", line_no + 2)))?;
+        records.push(record);
+    }
+
+    records.sort_by_key(|r| r.sample_id);
+    ensure_sequential_sample_ids(&records)?;
+
+    let canonical = canonicalize_manifest_bytes(&records);
+    Ok((records, canonical))
+}
+
+fn index_local_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+    let root = std::path::PathBuf::from(base.trim());
+    let manifest_path = root.join("_mx8").join("manifest.tsv");
+    if manifest_path.exists() {
+        let bytes = std::fs::read(&manifest_path).map_err(|e| {
+            SnapshotError::IndexIo(format!(
+                "read precomputed manifest failed: {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        info!(
+            target: "mx8_proof",
+            event = "snapshot_index_precomputed_manifest",
+            base = %base,
+            manifest_path = %manifest_path.display(),
+            "indexed from precomputed manifest"
+        );
+        return parse_canonical_manifest_tsv_bytes(&bytes);
+    }
+
+    // Fallback: index directory by walking files (no byte ranges, no labels).
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| {
+            SnapshotError::IndexIo(format!("read_dir failed: {}: {e}", dir.display()))
+        })? {
+            let entry = entry.map_err(|e| SnapshotError::IndexIo(format!("{e}")))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "_mx8" || name == "shards" {
+                continue;
+            }
+            let meta = entry
+                .metadata()
+                .map_err(|e| SnapshotError::IndexIo(format!("{e}")))?;
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return Err(SnapshotError::IndexParse(
+            "local index produced zero files".to_string(),
+        ));
+    }
+
+    let mut records: Vec<ManifestRecord> = Vec::with_capacity(files.len());
+    for (i, path) in files.into_iter().enumerate() {
+        let abs = path.canonicalize().unwrap_or(path);
+        let record = ManifestRecord {
+            sample_id: i as u64,
+            location: abs.display().to_string(),
+            byte_offset: None,
+            byte_length: None,
+            decode_hint: None,
+        };
+        record
+            .validate()
+            .map_err(|e| SnapshotError::IndexParse(format!("indexed record invalid: {e}")))?;
+        records.push(record);
+    }
+
+    let canonical = canonicalize_manifest_bytes(&records);
+    Ok((records, canonical))
 }
 
 #[cfg(feature = "s3")]
@@ -264,23 +442,6 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
                 "read env var MX8_S3_LABEL_MODE failed: {e}"
             ))),
         }
-    }
-
-    fn percent_encode(s: &str) -> String {
-        // Minimal percent-encoding for embedding arbitrary labels into decode_hint.
-        //
-        // We encode everything outside a safe set to avoid introducing separators.
-        // (decode_hint must not contain tabs/newlines; we keep it ASCII-stable.)
-        let mut out = String::with_capacity(s.len());
-        for b in s.as_bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    out.push(*b as char)
-                }
-                _ => out.push_str(&format!("%{:02X}", b)),
-            }
-        }
-        out
     }
 
     fn imagefolder_label_for_key(prefix: &str, key: &str) -> Option<String> {
@@ -664,10 +825,7 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
                     "internal error: label not present in label map (sample_id={i}, label={label:?})"
                 ))
             })?;
-            let label_enc = percent_encode(&label);
-            Some(format!(
-                "mx8:vision:imagefolder;label_id={label_id};label={label_enc}"
-            ))
+            Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
         } else {
             None
         };

@@ -37,6 +37,7 @@ You can run the packer either via the CLI:
 Or via the Python API (after installing `mx8`):
 
 - `python -c "import mx8; mx8.pack('s3://bucket/raw/train/', out='s3://bucket/mx8/train/', shard_mb=512, label_mode='auto')"`
+- Local: `python -c "import mx8; mx8.pack_dir('/path/to/raw', out='/path/to/mx8', shard_mb=512, label_mode='imagefolder', require_labels=True)"`
 
 Then point MX8 at the packed prefix (snapshot resolver will use the precomputed manifest, avoiding large LIST operations).
 
