@@ -90,6 +90,23 @@ struct Args {
     #[arg(long, env = "MX8_DEV_BLOCK_SIZE", default_value_t = 65_536)]
     dev_block_size: u64,
 
+    /// Shuffle block order deterministically for this run.
+    #[arg(
+        long,
+        env = "MX8_SHUFFLE",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    shuffle: bool,
+
+    /// Shuffle seed for deterministic block order.
+    #[arg(long, env = "MX8_SEED", default_value_t = 0)]
+    seed: u64,
+
+    /// Epoch for deterministic block order (changes the permutation).
+    #[arg(long, env = "MX8_EPOCH", default_value_t = 0)]
+    epoch: u32,
+
     /// Optional: periodically emit a metrics snapshot to logs.
     #[arg(long, env = "MX8_METRICS_SNAPSHOT_INTERVAL_MS", default_value_t = 0)]
     metrics_snapshot_interval_ms: u64,
@@ -136,7 +153,16 @@ struct NodeEntry {
 #[derive(Debug, Default)]
 struct CoordinatorState {
     nodes: std::collections::BTreeMap<String, NodeEntry>,
+    /// Global ranges available to any node (used for requeued remainders after failures).
     available_ranges: std::collections::VecDeque<WorkRange>,
+    /// Deterministic per-rank schedule (failure-free determinism).
+    ///
+    /// Once membership is frozen at `world_size`, initial work is partitioned into these queues.
+    /// Nodes draw from their own queue first; if empty, they may steal from others to complete
+    /// the job under failure.
+    rank_ranges: Option<Vec<std::collections::VecDeque<WorkRange>>>,
+    /// Frozen membership ordering used for deterministic rank assignment.
+    frozen_membership: Option<Vec<String>>,
     leases: std::collections::BTreeMap<String, Lease>,
     progress: std::collections::BTreeMap<(String, String), u64>,
     next_lease_id: u64,
@@ -163,6 +189,9 @@ struct CoordinatorSvc {
     world_size: u32,
     heartbeat_interval_ms: u32,
     lease_ttl_ms: u32,
+    shuffle: bool,
+    seed: u64,
+    epoch: u32,
     manifest_hash: String,
     manifest_store: Option<Arc<dyn ManifestStore>>,
 }
@@ -190,6 +219,91 @@ impl CoordinatorSvc {
     async fn is_job_ready(&self) -> bool {
         let state = self.state.read().await;
         state.nodes.len() as u32 >= self.world_size
+    }
+
+    fn mix64(mut x: u64) -> u64 {
+        // Deterministic, stable mixing for shuffle keys (splitmix64 variant).
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+        x ^ (x >> 31)
+    }
+
+    fn shuffle_key(seed: u64, epoch: u32, start_id: u64) -> u64 {
+        let epoch_u64 = epoch as u64;
+        Self::mix64(seed ^ (epoch_u64.wrapping_mul(0x9E3779B97F4A7C15)) ^ start_id)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn freeze_membership_and_partition_ranges(
+        state: &mut CoordinatorState,
+        world_size: u32,
+        shuffle: bool,
+        seed: u64,
+        epoch: u32,
+    ) -> Result<(), Status> {
+        if state.frozen_membership.is_some() {
+            return Ok(());
+        }
+        if state.nodes.len() as u32 != world_size {
+            return Err(Status::failed_precondition(
+                "cannot freeze membership before barrier is met",
+            ));
+        }
+
+        let membership: Vec<String> = state.nodes.keys().cloned().collect();
+        state.frozen_membership = Some(membership);
+
+        let mut ranges: Vec<WorkRange> = Vec::new();
+        while let Some(mut r) = state.available_ranges.pop_front() {
+            r.seed = seed;
+            r.epoch = epoch;
+            ranges.push(r);
+        }
+
+        if shuffle {
+            ranges.sort_by(|a, b| {
+                let ka = Self::shuffle_key(seed, epoch, a.start_id);
+                let kb = Self::shuffle_key(seed, epoch, b.start_id);
+                ka.cmp(&kb).then(a.start_id.cmp(&b.start_id))
+            });
+        }
+
+        let mut rank_ranges: Vec<std::collections::VecDeque<WorkRange>> = (0..world_size)
+            .map(|_| std::collections::VecDeque::new())
+            .collect();
+
+        for (i, r) in ranges.into_iter().enumerate() {
+            let rank = (i as u32) % world_size;
+            rank_ranges[rank as usize].push_back(r);
+        }
+        state.rank_ranges = Some(rank_ranges);
+        Ok(())
+    }
+
+    fn rank_for_node(state: &CoordinatorState, node_id: &str) -> Option<u32> {
+        let members = state.frozen_membership.as_ref()?;
+        members
+            .iter()
+            .position(|id| id == node_id)
+            .map(|i| i as u32)
+    }
+
+    fn pop_next_range_for_node(state: &mut CoordinatorState, node_id: &str) -> Option<WorkRange> {
+        // 1) Requeued remainders are global priority.
+        if let Some(r) = state.available_ranges.pop_front() {
+            return Some(r);
+        }
+
+        let rank = Self::rank_for_node(state, node_id)?;
+        let rank_ranges = state.rank_ranges.as_mut()?;
+
+        // 2) Failure-free deterministic schedule: take from own queue.
+        if let Some(r) = rank_ranges.get_mut(rank as usize)?.pop_front() {
+            return Some(r);
+        }
+
+        None
     }
 
     fn unix_time_ms() -> u64 {
@@ -227,6 +341,7 @@ impl CoordinatorSvc {
     async fn tick_once_at(&self, now_unix_time_ms: u64) {
         let mut expired: Vec<(Lease, u64)> = Vec::new();
         let mut requeued: Vec<(String, String, WorkRange, u64)> = Vec::new();
+        let mut released: Vec<(String, u32, u64)> = Vec::new();
         let mut intervals_snapshot: Option<String> = None;
         let live_lease_count: usize;
         let mut drained_event: Option<(u64, u32)> = None;
@@ -272,6 +387,42 @@ impl CoordinatorSvc {
                     remainder,
                     cursor,
                 ));
+            }
+
+            // If a node is dead (no heartbeats), release its remaining scheduled ranges so the job
+            // can drain under failure. Failure-free determinism is preserved because this only
+            // triggers when heartbeats stop.
+            let dead_after_ms = self.lease_ttl_ms as u64;
+            let dead_ranks: Vec<(usize, String)> = match state.frozen_membership.as_ref() {
+                None => Vec::new(),
+                Some(members) => members
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(rank, node_id)| {
+                        let entry = state.nodes.get(node_id)?;
+                        let last = entry.last_heartbeat_unix_time_ms?;
+                        if now_unix_time_ms.saturating_sub(last) > dead_after_ms {
+                            Some((rank, node_id.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            };
+
+            if let Some(mut rank_ranges) = state.rank_ranges.take() {
+                for (rank, node_id) in dead_ranks {
+                    let q = &mut rank_ranges[rank];
+                    let mut count = 0u64;
+                    while let Some(r) = q.pop_front() {
+                        state.available_ranges.push_back(r);
+                        count = count.saturating_add(1);
+                    }
+                    if count > 0 {
+                        released.push((node_id, rank as u32, count));
+                    }
+                }
+                state.rank_ranges = Some(rank_ranges);
             }
 
             let mut intervals: Vec<(u64, u64, String, String)> = Vec::new();
@@ -328,10 +479,15 @@ impl CoordinatorSvc {
             }
 
             let job_ready = state.nodes.len() as u32 >= self.world_size;
+            let rank_ranges_empty = match &state.rank_ranges {
+                None => true,
+                Some(qs) => qs.iter().all(|q| q.is_empty()),
+            };
             if job_ready
                 && !state.drained_emitted
                 && state.leases.is_empty()
                 && state.available_ranges.is_empty()
+                && rank_ranges_empty
             {
                 state.drained_emitted = true;
                 drained_event = Some((now_unix_time_ms, state.nodes.len() as u32));
@@ -347,6 +503,18 @@ impl CoordinatorSvc {
             self.metrics
                 .ranges_requeued_total
                 .inc_by(requeued.len() as u64);
+        }
+
+        for (node_id, rank, count) in released {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "rank_released",
+                node_id = %node_id,
+                rank = rank,
+                released_ranges = count,
+                manifest_hash = %self.manifest_hash,
+                "released ranges from dead rank"
+            );
         }
 
         for (lease, cursor) in expired {
@@ -443,9 +611,19 @@ impl Coordinator for CoordinatorSvc {
             return Err(Status::invalid_argument("caps is required"));
         }
 
-        let (assigned_rank, registered_nodes) = {
+        let (assigned_rank, registered_nodes, became_ready) = {
             let mut state = self.state.write().await;
             let now_ms = Self::unix_time_ms();
+
+            // If the barrier is already met, membership is frozen: only allow re-registration
+            // of known node_ids (e.g., restart with same identity).
+            if state.nodes.len() as u32 >= self.world_size
+                && !state.nodes.contains_key(&req.node_id)
+            {
+                return Err(Status::failed_precondition(
+                    "membership is frozen after world_size barrier; unknown node_id",
+                ));
+            }
 
             if let Some(existing) = state.nodes.get_mut(&req.node_id) {
                 if existing.caps != req.caps {
@@ -469,7 +647,9 @@ impl Coordinator for CoordinatorSvc {
                 .ok_or_else(|| Status::internal("registered node missing from state"))?
                 as u32;
 
-            (assigned_rank, state.nodes.len() as u32)
+            let registered_nodes = state.nodes.len() as u32;
+            let became_ready = registered_nodes == self.world_size;
+            (assigned_rank, registered_nodes, became_ready)
         };
 
         if assigned_rank >= self.world_size {
@@ -487,6 +667,17 @@ impl Coordinator for CoordinatorSvc {
             registered_nodes,
             job_ready: registered_nodes >= self.world_size,
         };
+
+        if became_ready {
+            let mut state = self.state.write().await;
+            Self::freeze_membership_and_partition_ranges(
+                &mut state,
+                self.world_size,
+                self.shuffle,
+                self.seed,
+                self.epoch,
+            )?;
+        }
 
         tracing::info!(
             job_id = %req.job_id,
@@ -564,8 +755,18 @@ impl Coordinator for CoordinatorSvc {
         let mut leases = Vec::new();
         {
             let mut state = self.state.write().await;
+            if state.frozen_membership.is_none() {
+                // Should have been initialized when the barrier was met, but be defensive.
+                Self::freeze_membership_and_partition_ranges(
+                    &mut state,
+                    self.world_size,
+                    self.shuffle,
+                    self.seed,
+                    self.epoch,
+                )?;
+            }
             for _ in 0..req.want {
-                let Some(range) = state.available_ranges.pop_front() else {
+                let Some(range) = Self::pop_next_range_for_node(&mut state, &req.node_id) else {
                     break;
                 };
 
@@ -906,6 +1107,8 @@ async fn main() -> Result<()> {
             state: Arc::new(RwLock::new(CoordinatorState {
                 nodes: std::collections::BTreeMap::new(),
                 available_ranges,
+                rank_ranges: None,
+                frozen_membership: None,
                 leases: std::collections::BTreeMap::new(),
                 progress: std::collections::BTreeMap::new(),
                 next_lease_id: 0,
@@ -915,6 +1118,9 @@ async fn main() -> Result<()> {
             world_size: args.world_size,
             heartbeat_interval_ms: args.heartbeat_interval_ms,
             lease_ttl_ms: args.lease_ttl_ms,
+            shuffle: args.shuffle,
+            seed: args.seed,
+            epoch: args.epoch,
             manifest_hash: resolved_manifest_hash,
             manifest_store: Some(store.clone()),
         };
@@ -978,6 +1184,9 @@ mod tests {
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
         };
@@ -1001,6 +1210,9 @@ mod tests {
             world_size: 2,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
         };
@@ -1048,6 +1260,9 @@ mod tests {
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
         };
@@ -1086,6 +1301,9 @@ mod tests {
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
             manifest_hash: "h".to_string(),
             manifest_store: Some(store),
         };
@@ -1124,6 +1342,9 @@ mod tests {
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
             manifest_hash: "h".to_string(),
             manifest_store: Some(store),
         };
@@ -1165,6 +1386,8 @@ mod tests {
                 epoch: 0,
                 seed: 0,
             }]),
+            rank_ranges: None,
+            frozen_membership: None,
             leases: std::collections::BTreeMap::new(),
             progress: std::collections::BTreeMap::new(),
             next_lease_id: 0,
@@ -1177,6 +1400,9 @@ mod tests {
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
         };
@@ -1251,6 +1477,8 @@ mod tests {
                 epoch: 0,
                 seed: 0,
             }]),
+            rank_ranges: None,
+            frozen_membership: None,
             leases: std::collections::BTreeMap::new(),
             progress: std::collections::BTreeMap::new(),
             next_lease_id: 0,
@@ -1263,6 +1491,9 @@ mod tests {
             world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
         };

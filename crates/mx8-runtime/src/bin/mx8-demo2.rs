@@ -59,7 +59,7 @@ struct Args {
     /// Which node to kill after startup (1-based).
     ///
     /// Use 0 to attempt auto-selecting the first observed lease owner (best-effort).
-    #[arg(long, env = "MX8_KILL_NODE_INDEX", default_value_t = 1)]
+    #[arg(long, env = "MX8_KILL_NODE_INDEX", default_value_t = 0)]
     kill_node_index: u32,
 
     #[arg(long, env = "MX8_KILL_AFTER_MS", default_value_t = 750)]
