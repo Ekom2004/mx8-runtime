@@ -22,6 +22,10 @@ use mx8_proto::v0::RegisterNodeRequest;
 use mx8_proto::v0::ReportProgressRequest;
 use mx8_proto::v0::RequestLeaseRequest;
 use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps};
+use mx8_snapshot::labels::load_labels_for_base;
+use mx8_snapshot::pack_dir::{
+    pack_dir as pack_dir_impl, LabelMode as PackDirLabelMode, PackDirConfig,
+};
 use mx8_snapshot::pack_s3::{pack_s3, LabelMode as PackLabelMode, PackS3Config};
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 use mx8_wire::TryToCore;
@@ -40,10 +44,12 @@ struct ImageFolderLoader {
     loader: DataLoader,
     resize_hw: Option<(u32, u32)>,
     to_float: bool,
+    classes: Option<Vec<String>>,
 }
 
 #[pyclass]
 struct DataLoader {
+    dataset_base: String,
     manifest_hash: String,
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -79,6 +85,14 @@ impl DataLoader {
         end_id: Option<u64>,
         node_id: Option<String>,
     ) -> PyResult<Self> {
+        let parsed = mx8_core::dataset_link::DatasetLink::parse(&dataset_link)
+            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        let dataset_base = match parsed {
+            mx8_core::dataset_link::DatasetLink::Plain(b) => b,
+            mx8_core::dataset_link::DatasetLink::Refresh(b) => b,
+            mx8_core::dataset_link::DatasetLink::Pinned { base, .. } => base,
+        };
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -135,6 +149,7 @@ impl DataLoader {
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
         Ok(Self {
+            dataset_base,
             manifest_hash: snapshot.manifest_hash.0,
             rx,
             task: Some(task),
@@ -220,11 +235,25 @@ impl ImageFolderLoader {
             end_id,
             node_id,
         )?;
+        let base = loader.dataset_base.clone();
+        let classes = loader
+            .rt
+            .block_on(async { load_labels_for_base(&base).await })
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(Self {
             loader,
             resize_hw,
             to_float,
+            classes,
         })
+    }
+
+    #[getter]
+    fn classes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.classes {
+            Some(v) => Ok(PyList::new_bound(py, v).into_any()),
+            None => Ok(py.None().into_bound(py).into_any()),
+        }
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -544,6 +573,44 @@ fn pack<'py>(
     Ok(d.into_any())
 }
 
+#[pyfunction(name = "pack_dir")]
+#[pyo3(signature = (in_dir, *, out, shard_mb=512, label_mode=None, require_labels=false))]
+fn pack_dir<'py>(
+    py: Python<'py>,
+    in_dir: PathBuf,
+    out: PathBuf,
+    shard_mb: u64,
+    label_mode: Option<String>,
+    require_labels: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let label_mode = parse_pack_dir_label_mode(label_mode.as_deref().unwrap_or("auto"))
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+
+    let res = py
+        .allow_threads(|| {
+            pack_dir_impl(PackDirConfig {
+                in_dir,
+                out_dir: out,
+                shard_mb,
+                label_mode,
+                require_labels,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+    let d = PyDict::new_bound(py);
+    d.set_item("samples", res.samples)?;
+    d.set_item("shards", res.shards)?;
+    d.set_item("manifest_path", res.manifest_path.display().to_string())?;
+    d.set_item("manifest_hash", res.manifest_hash)?;
+    d.set_item(
+        "labels_path",
+        res.labels_path.map(|p| p.display().to_string()),
+    )?;
+    d.set_item("labels_hash", res.labels_hash)?;
+    Ok(d.into_any())
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     dataset_link,
@@ -599,6 +666,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DistributedDataLoader>()?;
     m.add_class::<PyBatch>()?;
     m.add_function(wrap_pyfunction!(pack, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
     Ok(())
@@ -615,6 +683,16 @@ fn parse_pack_label_mode(s: &str) -> Result<PackLabelMode> {
     Ok(mode)
 }
 
+fn parse_pack_dir_label_mode(s: &str) -> Result<PackDirLabelMode> {
+    let s = s.trim().to_ascii_lowercase();
+    let mode = match s.as_str() {
+        "none" | "off" | "false" | "0" => PackDirLabelMode::None,
+        "imagefolder" | "image_folder" | "image-folder" => PackDirLabelMode::ImageFolder,
+        "auto" | "" => PackDirLabelMode::Auto,
+        _ => anyhow::bail!("invalid label mode {s:?} (expected: auto|none|imagefolder)"),
+    };
+    Ok(mode)
+}
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
