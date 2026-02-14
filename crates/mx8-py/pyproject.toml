@@ -4,8 +4,16 @@ build-backend = "maturin"
 
 [project]
 name = "mx8"
-version = "0.0.0"
+dynamic = ["version"]
+description = "MX8: bounded data runtime (Rust) exposed to Python."
+readme = "README.md"
 requires-python = ">=3.8"
+license = { text = "UNLICENSED" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Operating System :: OS Independent",
+]
 
 [tool.maturin]
 bindings = "pyo3"
