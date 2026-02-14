@@ -94,6 +94,10 @@ Link forms (v0):
 - Pinned: `...@sha256:<manifest_hash>` → uses that snapshot; no listing/indexing.
 - Refresh: `...@refresh` → forces a new snapshot at job start; updates the intent pointer.
 
+Packing convention (v0, optional):
+- If a prefix contains a precomputed canonical manifest at `s3://bucket/prefix/_mx8/manifest.tsv`,
+  the snapshot resolver should use it instead of listing objects.
+
 Refresh scope:
 - v0 refresh is **job-start only** (frozen within a run).
 

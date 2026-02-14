@@ -12,11 +12,23 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 - MinIO (S3-compatible) gates:
   - `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_DEMO2_MINIO_SCALE=1 MX8_SMOKE_MINIO_MANIFEST_STORE=1 ./scripts/smoke.sh`
+  - `MX8_SMOKE_MINIO_PACK=1 ./scripts/smoke.sh`
 - PyTorch DDP gates (local multi-process):
   - `MX8_SMOKE_TORCH_DDP=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_TORCH_DDP_NODUPES=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_TORCH_DDP_DETERMINISM=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_TORCH_DDP_RESTART=1 ./scripts/smoke.sh`
+
+## Packing (v0)
+
+If your dataset is “many small S3 objects” (e.g. ImageFolder layout with millions of files), run `mx8-pack-s3` once to create tar shards plus a byte-range manifest:
+
+- Input: `s3://bucket/raw/train/`
+- Output: `s3://bucket/mx8/train/`
+  - shards: `s3://bucket/mx8/train/shards/shard-00000.tar`
+  - manifest: `s3://bucket/mx8/train/_mx8/manifest.tsv`
+
+Then point MX8 at the packed prefix (snapshot resolver will use the precomputed manifest, avoiding large LIST operations).
 
 ## Training semantics (v0)
 
