@@ -3,5 +3,8 @@
 # Rust
 /target/
 
+# Python packaging
+/dist/
+
 # Private notes
 VISION.md

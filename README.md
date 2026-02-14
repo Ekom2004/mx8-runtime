@@ -9,6 +9,9 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 - Python smoke:
   - `./scripts/py_smoke.sh`
   - `MX8_PY_SMOKE_INSTALL_TORCH=1 ./scripts/py_smoke.sh`
+- Wheel build + pip smoke:
+  - `./scripts/build_wheel.sh`
+  - `./scripts/pip_wheel_smoke.sh`
 - MinIO (S3-compatible) gates:
   - `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_DEMO2_MINIO_SCALE=1 MX8_SMOKE_MINIO_MANIFEST_STORE=1 ./scripts/smoke.sh`
