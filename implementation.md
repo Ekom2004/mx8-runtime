@@ -173,6 +173,11 @@ This section exists to prevent “milestone drift” where crates/features are b
      `decode_hint="mx8:vision:imagefolder;label_id=<n>;..."` with a deterministic `label_id` mapping.
    - **Success:** Python can train classification loops without a separate label sidecar file.
 
+5.2) **Packing (optional, v0)**
+   - Add a packer that converts many small S3 objects into tar shards plus a canonical byte-range manifest at
+     `prefix/_mx8/manifest.tsv`, so snapshot resolution can avoid large LIST operations.
+   - **Success:** “point to packed prefix” has predictable startup and high throughput.
+
 6) **Coordinator integration**
    - `mx8-coordinator` calls resolver at startup and stores `manifest_hash`.
    - `RegisterNodeResponse.manifest_hash` returns the pinned hash.

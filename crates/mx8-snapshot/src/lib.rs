@@ -303,6 +303,119 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
         Some(label.to_string())
     }
 
+    fn parse_canonical_manifest_tsv_bytes(
+        bytes: &[u8],
+    ) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+        let s = std::str::from_utf8(bytes)
+            .map_err(|e| SnapshotError::S3Index(format!("manifest not utf-8: {e}")))?;
+
+        let mut lines = s.lines();
+        let first = lines
+            .by_ref()
+            .find(|l| !l.trim().is_empty())
+            .ok_or_else(|| SnapshotError::S3Index("empty manifest".to_string()))?;
+
+        let Some((k, v)) = first.split_once('=') else {
+            return Err(SnapshotError::S3Index(
+                "manifest header missing schema_version".to_string(),
+            ));
+        };
+        if k.trim() != "schema_version" {
+            return Err(SnapshotError::S3Index(
+                "manifest header must be schema_version=<n>".to_string(),
+            ));
+        }
+        let schema_version: u32 = v
+            .trim()
+            .parse()
+            .map_err(|_| SnapshotError::S3Index("invalid schema_version".to_string()))?;
+        if schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(SnapshotError::S3Index(format!(
+                "unsupported schema_version {schema_version}"
+            )));
+        }
+
+        let mut records: Vec<ManifestRecord> = Vec::new();
+        for (i, raw) in lines.enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 2 {
+                return Err(SnapshotError::S3Index(format!(
+                    "line {}: expected at least 2 columns",
+                    i + 2
+                )));
+            }
+
+            let sample_id: u64 = cols[0]
+                .trim()
+                .parse()
+                .map_err(|_| SnapshotError::S3Index(format!("line {}: bad sample_id", i + 2)))?;
+            let location = cols[1].trim().to_string();
+            if location.contains('\n') || location.contains('\t') {
+                return Err(SnapshotError::S3Index(format!(
+                    "line {}: location must not contain tabs/newlines",
+                    i + 2
+                )));
+            }
+
+            let mut byte_offset: Option<u64> = None;
+            let mut byte_length: Option<u64> = None;
+            let mut decode_hint: Option<String> = None;
+
+            if cols.len() >= 4 {
+                if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
+                    byte_offset = Some(cols[2].trim().parse().map_err(|_| {
+                        SnapshotError::S3Index(format!("line {}: bad byte_offset", i + 2))
+                    })?);
+                    byte_length = Some(cols[3].trim().parse().map_err(|_| {
+                        SnapshotError::S3Index(format!("line {}: bad byte_length", i + 2))
+                    })?);
+                }
+            } else if cols.len() == 3 {
+                return Err(SnapshotError::S3Index(format!(
+                    "line {}: byte_offset and byte_length must be set together",
+                    i + 2
+                )));
+            }
+
+            if cols.len() >= 5 && !cols[4].trim().is_empty() {
+                let hint = cols[4].trim().to_string();
+                if hint.contains('\n') || hint.contains('\t') {
+                    return Err(SnapshotError::S3Index(format!(
+                        "line {}: decode_hint must not contain tabs/newlines",
+                        i + 2
+                    )));
+                }
+                decode_hint = Some(hint);
+            }
+
+            let record = ManifestRecord {
+                sample_id,
+                location,
+                byte_offset,
+                byte_length,
+                decode_hint,
+            };
+            record.validate().map_err(|e| {
+                SnapshotError::S3Index(format!(
+                    "line {}: indexed record failed validation: {e}",
+                    i + 2
+                ))
+            })?;
+            records.push(record);
+        }
+
+        records.sort_by_key(|r| r.sample_id);
+        ensure_sequential_sample_ids(&records)
+            .map_err(|e| SnapshotError::S3Index(format!("manifest invariant violated: {e}")))?;
+
+        let canonical = canonicalize_manifest_bytes(&records);
+        Ok((records, canonical))
+    }
+
     fn parse_env_bool(key: &str) -> Result<Option<bool>, SnapshotError> {
         match std::env::var(key) {
             Ok(v) => {
@@ -384,6 +497,60 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
     let (bucket, prefix) = parse_s3_base(base)?;
     let client = block_on(client_from_env())??;
     let label_mode = parse_label_mode()?;
+
+    // Fast path: if the dataset prefix is already packed, use the precomputed canonical manifest.
+    //
+    // Convention: `s3://bucket/prefix/_mx8/manifest.tsv` (or `_mx8/manifest.tsv` at bucket root if prefix is empty).
+    let precomputed_key = if prefix.is_empty() {
+        "_mx8/manifest.tsv".to_string()
+    } else {
+        format!("{prefix}/_mx8/manifest.tsv")
+    };
+    let precomputed = block_on(async {
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&precomputed_key)
+            .send()
+            .await;
+        match head {
+            Ok(_) => {
+                let obj = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&precomputed_key)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        SnapshotError::S3Index(format!(
+                            "get_object precomputed manifest failed: {e:?}"
+                        ))
+                    })?;
+                let collected = obj
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| SnapshotError::S3Index(format!("collect failed: {e:?}")))?;
+                Ok::<_, SnapshotError>(Some(collected.into_bytes().to_vec()))
+            }
+            Err(_) => Ok::<_, SnapshotError>(None),
+        }
+    })??;
+
+    if let Some(bytes) = precomputed {
+        let (records, canonical) = parse_canonical_manifest_tsv_bytes(&bytes)?;
+        info!(
+            target: "mx8_proof",
+            event = "snapshot_index_precomputed_manifest",
+            base = %base,
+            bucket = %bucket,
+            prefix = %prefix,
+            key = %precomputed_key,
+            objects = records.len() as u64,
+            "indexed from precomputed manifest"
+        );
+        return Ok((records, canonical));
+    }
 
     let keys = block_on(async {
         let mut out: Vec<String> = Vec::new();
