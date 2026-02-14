@@ -51,7 +51,9 @@ jobs:
     name: publish (PyPI)
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') && secrets.PYPI_API_TOKEN != ''
+    if: startsWith(github.ref, 'refs/tags/v')
+    env:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -63,10 +65,16 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
+      - name: Check PyPI token
+        run: |
+          if [ -z "${PYPI_API_TOKEN}" ]; then
+            echo "PYPI_API_TOKEN missing; skipping publish."
+          fi
       - name: Publish
         uses: PyO3/maturin-action@v1
+        if: env.PYPI_API_TOKEN != ''
         env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          MATURIN_PYPI_TOKEN: ${{ env.PYPI_API_TOKEN }}
         with:
           command: upload
           args: --skip-existing dist/*.whl
