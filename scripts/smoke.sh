@@ -73,6 +73,11 @@ if [[ "${MX8_SMOKE_PY_MINIO_IMAGEFOLDER:-0}" == "1" ]]; then
   ./scripts/py_minio_imagefolder_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_PY_VISION_PILLOW:-0}" == "1" ]]; then
+  echo "[mx8] py_minio_vision_pillow_gate (Pillow decode + torch train)"
+  ./scripts/py_minio_vision_pillow_gate.sh
+fi
+
 if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
   echo "[mx8] soak_demo2_minio_scale (soak gate: repeated node failures)"
   ./scripts/soak_demo2_minio_scale.sh

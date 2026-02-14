@@ -13,6 +13,7 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
   - `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_DEMO2_MINIO_SCALE=1 MX8_SMOKE_MINIO_MANIFEST_STORE=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_MINIO_PACK=1 ./scripts/smoke.sh`
+  - `MX8_SMOKE_PY_VISION_PILLOW=1 ./scripts/smoke.sh` (heavier; installs torch+pillow in a temp venv)
 - PyTorch DDP gates (local multi-process):
   - `MX8_SMOKE_TORCH_DDP=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_TORCH_DDP_NODUPES=1 ./scripts/smoke.sh`
