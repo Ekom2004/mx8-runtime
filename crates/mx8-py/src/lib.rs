@@ -2,6 +2,9 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
@@ -10,8 +13,18 @@ use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList};
 
 use mx8_manifest_store::fs::FsManifestStore;
 use mx8_manifest_store::LockOwner;
+use mx8_proto::v0::coordinator_client::CoordinatorClient;
+use mx8_proto::v0::GetManifestRequest;
+use mx8_proto::v0::HeartbeatRequest;
+use mx8_proto::v0::NodeCaps;
+use mx8_proto::v0::NodeStats;
+use mx8_proto::v0::RegisterNodeRequest;
+use mx8_proto::v0::ReportProgressRequest;
+use mx8_proto::v0::RequestLeaseRequest;
 use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps};
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
+use mx8_wire::TryToCore;
+use tonic::transport::Channel;
 
 #[pyclass]
 struct DataLoader {
@@ -269,6 +282,7 @@ fn resolve_manifest_hash(
 #[pymodule]
 fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DataLoader>()?;
+    m.add_class::<DistributedDataLoader>()?;
     m.add_class::<PyBatch>()?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
     Ok(())
@@ -278,4 +292,497 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
+}
+
+const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+fn unix_time_ms() -> u64 {
+    let now = std::time::SystemTime::now();
+    now.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+#[derive(Debug)]
+struct LeaseProgress {
+    start_id: u64,
+    end_id: u64,
+    cursor: AtomicU64,
+    delivered_samples: AtomicU64,
+    delivered_bytes: AtomicU64,
+}
+
+impl LeaseProgress {
+    fn new(start_id: u64, end_id: u64) -> Self {
+        Self {
+            start_id,
+            end_id,
+            cursor: AtomicU64::new(start_id),
+            delivered_samples: AtomicU64::new(0),
+            delivered_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn cursor(&self) -> u64 {
+        self.cursor.load(Ordering::Acquire)
+    }
+
+    fn delivered_samples(&self) -> u64 {
+        self.delivered_samples.load(Ordering::Relaxed)
+    }
+
+    fn delivered_bytes(&self) -> u64 {
+        self.delivered_bytes.load(Ordering::Relaxed)
+    }
+
+    fn on_deliver(&self, batch: &mx8_runtime::types::Batch) {
+        self.delivered_samples
+            .fetch_add(batch.sample_count() as u64, Ordering::Relaxed);
+        self.delivered_bytes
+            .fetch_add(batch.payload_len() as u64, Ordering::Relaxed);
+
+        let max_id = batch
+            .sample_ids
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(self.start_id);
+        let next_cursor = max_id.saturating_add(1).clamp(self.start_id, self.end_id);
+
+        let mut cur = self.cursor.load(Ordering::Relaxed);
+        while cur < next_cursor {
+            match self.cursor.compare_exchange_weak(
+                cur,
+                next_cursor,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+async fn fetch_manifest_bytes(
+    channel: Channel,
+    grpc_max_message_bytes: usize,
+    job_id: &str,
+    manifest_hash: &str,
+) -> Result<Vec<u8>> {
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(grpc_max_message_bytes)
+        .max_encoding_message_size(grpc_max_message_bytes);
+
+    let req = GetManifestRequest {
+        job_id: job_id.to_string(),
+        manifest_hash: manifest_hash.to_string(),
+    };
+
+    let resp = client.get_manifest_stream(req.clone()).await;
+    match resp {
+        Ok(resp) => {
+            let mut stream = resp.into_inner();
+            let mut out: Vec<u8> = Vec::new();
+            let mut schema_version: Option<u32> = None;
+            while let Some(chunk) = stream.message().await? {
+                if let Some(existing) = schema_version {
+                    if chunk.schema_version != existing {
+                        anyhow::bail!("GetManifestStream returned inconsistent schema_version");
+                    }
+                } else {
+                    schema_version = Some(chunk.schema_version);
+                }
+                out.extend_from_slice(chunk.data.as_slice());
+            }
+            if schema_version.is_none() {
+                anyhow::bail!("GetManifestStream returned no chunks (empty manifest)");
+            }
+            Ok(out)
+        }
+        Err(status) => {
+            if status.code() != tonic::Code::Unimplemented {
+                return Err(anyhow::anyhow!("GetManifestStream failed: {status}"));
+            }
+            let resp = client.get_manifest(req).await?.into_inner();
+            Ok(resp.manifest_bytes)
+        }
+    }
+}
+
+async fn heartbeat_loop(
+    channel: Channel,
+    grpc_max_message_bytes: usize,
+    interval: Duration,
+    job_id: String,
+    node_id: String,
+    pipeline: Arc<Pipeline>,
+) {
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(grpc_max_message_bytes)
+        .max_encoding_message_size(grpc_max_message_bytes);
+
+    loop {
+        tokio::time::sleep(interval).await;
+        let now_ms = unix_time_ms();
+
+        let metrics = pipeline.metrics();
+        let stats = NodeStats {
+            inflight_bytes: metrics.inflight_bytes.get(),
+            ram_high_water_bytes: metrics.inflight_bytes_high_water.get(),
+            fetch_queue_depth: 0,
+            decode_queue_depth: 0,
+            pack_queue_depth: 0,
+        };
+
+        let _ = client
+            .heartbeat(HeartbeatRequest {
+                job_id: job_id.clone(),
+                node_id: node_id.clone(),
+                unix_time_ms: now_ms,
+                stats: Some(stats),
+            })
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn progress_loop(
+    channel: Channel,
+    grpc_max_message_bytes: usize,
+    interval: Duration,
+    job_id: String,
+    node_id: String,
+    lease_id: String,
+    progress: Arc<LeaseProgress>,
+    mut done: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(grpc_max_message_bytes)
+        .max_encoding_message_size(grpc_max_message_bytes);
+
+    let mut ticker = tokio::time::interval(std::cmp::max(Duration::from_millis(1), interval));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let _ = client
+                    .report_progress(ReportProgressRequest {
+                        job_id: job_id.clone(),
+                        node_id: node_id.clone(),
+                        lease_id: lease_id.clone(),
+                        cursor: progress.cursor(),
+                        delivered_samples: progress.delivered_samples(),
+                        delivered_bytes: progress.delivered_bytes(),
+                        unix_time_ms: unix_time_ms(),
+                    })
+                    .await;
+            }
+            _ = &mut done => {
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_lease_and_stream_batches(
+    channel: Channel,
+    grpc_max_message_bytes: usize,
+    pipeline: Arc<Pipeline>,
+    manifest_bytes: Arc<Vec<u8>>,
+    job_id: String,
+    node_id: String,
+    lease: mx8_core::types::Lease,
+    tx: tokio::sync::mpsc::Sender<BatchLease>,
+    progress_interval_ms: u64,
+) -> Result<()> {
+    let range = lease.range;
+
+    let progress = Arc::new(LeaseProgress::new(range.start_id, range.end_id));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let reporter = tokio::spawn(progress_loop(
+        channel.clone(),
+        grpc_max_message_bytes,
+        Duration::from_millis(progress_interval_ms.max(1)),
+        job_id.clone(),
+        node_id.clone(),
+        lease.lease_id.0.clone(),
+        progress.clone(),
+        done_rx,
+    ));
+
+    let (mut rx, task) = pipeline
+        .spawn_manifest_bytes_range_stream((*manifest_bytes).clone(), range.start_id, range.end_id)
+        .await?;
+
+    while let Some(batch_lease) = rx.recv().await {
+        progress.on_deliver(&batch_lease.batch);
+        if tx.send(batch_lease).await.is_err() {
+            break;
+        }
+    }
+
+    task.await??;
+    let _ = done_tx.send(());
+    let _ = reporter.await;
+
+    // Final progress report.
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(grpc_max_message_bytes)
+        .max_encoding_message_size(grpc_max_message_bytes);
+    let _ = client
+        .report_progress(ReportProgressRequest {
+            job_id,
+            node_id,
+            lease_id: lease.lease_id.0,
+            cursor: progress.cursor(),
+            delivered_samples: progress.delivered_samples(),
+            delivered_bytes: progress.delivered_bytes(),
+            unix_time_ms: unix_time_ms(),
+        })
+        .await;
+
+    Ok(())
+}
+
+#[pyclass]
+struct DistributedDataLoader {
+    manifest_hash: String,
+    assigned_rank: u32,
+    world_size: u32,
+    rx: tokio::sync::mpsc::Receiver<BatchLease>,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    rt: tokio::runtime::Runtime,
+}
+
+#[pymethods]
+impl DistributedDataLoader {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        coord_url,
+        job_id,
+        node_id,
+        batch_size_samples=512,
+        max_inflight_bytes=128*1024*1024,
+        max_queue_batches=64,
+        prefetch_batches=1,
+        want=1,
+        progress_interval_ms=500,
+        grpc_max_message_bytes=DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        coord_url: String,
+        job_id: String,
+        node_id: String,
+        batch_size_samples: usize,
+        max_inflight_bytes: u64,
+        max_queue_batches: usize,
+        prefetch_batches: usize,
+        want: u32,
+        progress_interval_ms: u64,
+        grpc_max_message_bytes: usize,
+    ) -> PyResult<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}")))?;
+
+        let (manifest_hash, assigned_rank, world_size, heartbeat_interval_ms, channel) = rt
+            .block_on(async {
+                let channel = Channel::from_shared(coord_url.clone())?.connect().await?;
+                let mut client = CoordinatorClient::new(channel.clone())
+                    .max_decoding_message_size(grpc_max_message_bytes)
+                    .max_encoding_message_size(grpc_max_message_bytes);
+
+                let caps = Some(NodeCaps {
+                    max_fetch_concurrency: 32,
+                    max_decode_concurrency: 8,
+                    max_inflight_bytes,
+                    max_ram_bytes: max_inflight_bytes,
+                });
+
+                let mut resp = client
+                    .register_node(RegisterNodeRequest {
+                        job_id: job_id.clone(),
+                        node_id: node_id.clone(),
+                        caps: caps.clone(),
+                    })
+                    .await?
+                    .into_inner();
+
+                while !resp.job_ready {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    resp = client
+                        .register_node(RegisterNodeRequest {
+                            job_id: job_id.clone(),
+                            node_id: node_id.clone(),
+                            caps: caps.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                }
+
+                Ok::<_, anyhow::Error>((
+                    resp.manifest_hash,
+                    resp.assigned_rank,
+                    resp.world_size,
+                    resp.heartbeat_interval_ms,
+                    channel,
+                ))
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+        let manifest_bytes = rt
+            .block_on(fetch_manifest_bytes(
+                channel.clone(),
+                grpc_max_message_bytes,
+                &job_id,
+                &manifest_hash,
+            ))
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+        let caps = RuntimeCaps {
+            max_inflight_bytes,
+            max_queue_batches,
+            batch_size_samples,
+            prefetch_batches,
+        };
+        let pipeline = Arc::new(Pipeline::new(caps));
+
+        let heartbeat_task = {
+            let interval = Duration::from_millis(std::cmp::max(1, heartbeat_interval_ms) as u64);
+            let pipeline = pipeline.clone();
+            let job_id = job_id.clone();
+            let node_id = node_id.clone();
+            let channel = channel.clone();
+            Some(rt.spawn(heartbeat_loop(
+                channel,
+                grpc_max_message_bytes,
+                interval,
+                job_id,
+                node_id,
+                pipeline,
+            )))
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<BatchLease>(max_queue_batches);
+        let manifest_bytes = Arc::new(manifest_bytes);
+        let task = rt.spawn(async move {
+            let mut next_request_at = tokio::time::Instant::now();
+            let want = std::cmp::max(1, want);
+            loop {
+                let now = tokio::time::Instant::now();
+                if now < next_request_at {
+                    tokio::time::sleep_until(next_request_at).await;
+                }
+
+                let mut client = CoordinatorClient::new(channel.clone())
+                    .max_decoding_message_size(grpc_max_message_bytes)
+                    .max_encoding_message_size(grpc_max_message_bytes);
+                let resp = client
+                    .request_lease(RequestLeaseRequest {
+                        job_id: job_id.clone(),
+                        node_id: node_id.clone(),
+                        want,
+                    })
+                    .await;
+
+                let resp = match resp {
+                    Ok(resp) => resp.into_inner(),
+                    Err(err) => {
+                        next_request_at = tokio::time::Instant::now() + Duration::from_millis(500);
+                        let _ = err;
+                        continue;
+                    }
+                };
+
+                if resp.leases.is_empty() {
+                    let wait_ms = std::cmp::max(1, resp.wait_ms);
+                    next_request_at =
+                        tokio::time::Instant::now() + Duration::from_millis(wait_ms as u64);
+                    continue;
+                }
+
+                for lease in resp.leases {
+                    let core_lease = lease.try_to_core().map_err(anyhow::Error::from)?;
+                    run_lease_and_stream_batches(
+                        channel.clone(),
+                        grpc_max_message_bytes,
+                        pipeline.clone(),
+                        manifest_bytes.clone(),
+                        job_id.clone(),
+                        node_id.clone(),
+                        core_lease,
+                        tx.clone(),
+                        progress_interval_ms,
+                    )
+                    .await?;
+                }
+            }
+        });
+
+        Ok(Self {
+            manifest_hash,
+            assigned_rank,
+            world_size,
+            rx,
+            task: Some(task),
+            heartbeat_task,
+            rt,
+        })
+    }
+
+    #[getter]
+    fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
+    #[getter]
+    fn assigned_rank(&self) -> u32 {
+        self.assigned_rank
+    }
+
+    #[getter]
+    fn world_size(&self) -> u32 {
+        self.world_size
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> PyResult<PyBatch> {
+        self.rt.block_on(async {
+            match self.rx.recv().await {
+                Some(lease) => Ok(PyBatch { lease }),
+                None => match self.task.take() {
+                    Some(handle) => match handle.await {
+                        Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                        Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                        Err(err) => Err(PyRuntimeError::new_err(format!(
+                            "producer task failed: {err}"
+                        ))),
+                    },
+                    None => Err(PyStopIteration::new_err(())),
+                },
+            }
+        })
+    }
+
+    fn close(&mut self) {
+        if let Some(handle) = self.task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.heartbeat_task.take() {
+            handle.abort();
+        }
+    }
+
+    fn __del__(&mut self) {
+        self.close();
+    }
 }
