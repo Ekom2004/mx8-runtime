@@ -63,4 +63,9 @@ if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
   ./scripts/soak_demo2_minio_scale.sh
 fi
 
+if [[ "${MX8_SMOKE_TORCH_DDP:-0}" == "1" ]]; then
+  echo "[mx8] torch_ddp_gate (multi-process PyTorch training gate)"
+  ./scripts/torch_ddp_gate.sh
+fi
+
 echo "[mx8] smoke OK"

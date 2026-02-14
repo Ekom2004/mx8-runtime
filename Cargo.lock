@@ -1775,11 +1775,15 @@ name = "mx8-py"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "mx8-core",
  "mx8-manifest-store",
+ "mx8-proto",
  "mx8-runtime",
  "mx8-snapshot",
+ "mx8-wire",
  "pyo3",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

@@ -13,8 +13,12 @@ bench = false
 
 [dependencies]
 anyhow.workspace = true
+mx8-core = { path = "../mx8-core" }
 mx8-manifest-store = { path = "../mx8-manifest-store" }
+mx8-proto = { path = "../mx8-proto" }
 mx8-runtime = { path = "../mx8-runtime" }
 mx8-snapshot = { path = "../mx8-snapshot" }
+mx8-wire = { path = "../mx8-wire" }
 pyo3 = { workspace = true, features = ["extension-module"] }
 tokio.workspace = true
+tonic.workspace = true
