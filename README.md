@@ -2,6 +2,27 @@
 
 MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus a tiny per-job coordinator/agent layer for multi-node correctness and pacing.
 
+## Bounded memory (v0)
+
+MX8 is designed to be *hard-capped* by config (backpressure via inflight permits).
+
+```python
+import mx8
+
+loader = mx8.vision.ImageFolderLoader(
+    "/path/to/mx8-dataset@refresh",
+    batch_size_samples=64,
+    max_inflight_bytes=256 * 1024 * 1024,
+    max_queue_batches=8,
+    prefetch_batches=4,
+)
+
+for step, (images, labels) in enumerate(loader):
+    if step % 100 == 0:
+        print(loader.stats())  # includes ram_high_water_bytes
+    # Consume batch; do not accumulate batches in a list.
+```
+
 ## Quick gates
 
 - Repo smoke (offline + online sub-gates):
