@@ -168,6 +168,11 @@ This section exists to prevent “milestone drift” where crates/features are b
      - `MX8_DEV_MANIFEST_PATH=/path/to/manifest.jsonl` (or CSV) → load into `mx8-core::ManifestRecord`.
    - **Success:** coordinator can generate a pinned snapshot without touching S3.
 
+5.1) **Vision metadata (optional, v0)**
+   - When indexing an S3 prefix that matches ImageFolder layout (`prefix/<label>/<file>`), attach
+     `decode_hint="mx8:vision:imagefolder;label_id=<n>;..."` with a deterministic `label_id` mapping.
+   - **Success:** Python can train classification loops without a separate label sidecar file.
+
 6) **Coordinator integration**
    - `mx8-coordinator` calls resolver at startup and stores `manifest_hash`.
    - `RegisterNodeResponse.manifest_hash` returns the pinned hash.

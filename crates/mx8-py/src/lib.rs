@@ -26,6 +26,14 @@ use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 use mx8_wire::TryToCore;
 use tonic::transport::Channel;
 
+type TorchBatch3<'py> = (Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>);
+type TorchBatch4<'py> = (
+    Bound<'py, PyAny>,
+    Bound<'py, PyAny>,
+    Bound<'py, PyAny>,
+    Bound<'py, PyAny>,
+);
+
 #[pyclass]
 struct DataLoader {
     manifest_hash: String,
@@ -188,10 +196,18 @@ impl PyBatch {
         Ok(PyBytes::new_bound(py, &self.lease.batch.payload))
     }
 
-    fn to_torch<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    #[getter]
+    fn label_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.lease.batch.label_ids {
+            Some(ids) => {
+                let out: Vec<u64> = ids.iter().copied().collect();
+                Ok(PyList::new_bound(py, out).into_any())
+            }
+            None => Ok(py.None().into_bound(py).into_any()),
+        }
+    }
+
+    fn to_torch<'py>(&self, py: Python<'py>) -> PyResult<TorchBatch3<'py>> {
         let torch = py.import_bound("torch").map_err(|e| {
             PyRuntimeError::new_err(format!(
                 "failed to import torch (install PyTorch to use to_torch): {e}"
@@ -242,6 +258,39 @@ impl PyBatch {
         let sample_ids_i64 = torch.call_method("tensor", (ids_list,), Some(&kwargs))?;
 
         Ok((payload_u8, offsets_i64, sample_ids_i64))
+    }
+
+    fn to_torch_with_labels<'py>(&self, py: Python<'py>) -> PyResult<TorchBatch4<'py>> {
+        let (payload_u8, offsets_i64, sample_ids_i64) = self.to_torch(py)?;
+
+        let ids = self.lease.batch.label_ids.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "batch has no label_ids (expected mx8:vision:imagefolder label hints in manifest)",
+            )
+        })?;
+
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use to_torch_with_labels): {e}"
+            ))
+        })?;
+        let torch_int64 = torch.getattr("int64")?;
+
+        let mut labels_i64 = Vec::with_capacity(ids.len());
+        for &lab in ids.iter() {
+            let lab_i64 = i64::try_from(lab).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "label_id overflow converting u64 -> i64 (label_id={lab})"
+                ))
+            })?;
+            labels_i64.push(lab_i64);
+        }
+        let labels_list = PyList::new_bound(py, labels_i64);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        let labels_i64 = torch.call_method("tensor", (labels_list,), Some(&kwargs))?;
+
+        Ok((payload_u8, offsets_i64, sample_ids_i64, labels_i64))
     }
 }
 

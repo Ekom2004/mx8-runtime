@@ -154,8 +154,27 @@ need = [
 for s in need:
     if s not in txt:
         raise SystemExit(f"manifest missing expected location: {s}")
+
+# If ImageFolder label extraction is enabled/auto-detected, decode_hint should carry label_id.
+# For these seeded keys, lexicographic label order is class1..class5 => label_id 0..4.
+lines = [l for l in txt.splitlines() if l.strip() and not l.startswith("schema_version=")]
+by_loc = {}
+for l in lines:
+    cols = l.split("\t")
+    if len(cols) < 2:
+        continue
+    loc = cols[1].strip()
+    hint = cols[4].strip() if len(cols) >= 5 else ""
+    by_loc[loc] = hint
+
+def must_have_label(loc: str, want: str) -> None:
+    hint = by_loc.get(loc, "")
+    if want not in hint:
+        raise SystemExit(f"decode_hint mismatch for {loc}: expected to contain {want!r}, got {hint!r}")
+
+must_have_label(f"s3://{bucket}/{prefix}class1/img1.jpg", "label_id=0")
+must_have_label(f"s3://{bucket}/{prefix}class5/img5.jpg", "label_id=4")
 print("[mx8] minio_s3_prefix_snapshot_gate OK")
 PY
 
 echo "[mx8] manifest_hash: ${h1}"
-

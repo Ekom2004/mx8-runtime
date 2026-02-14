@@ -561,6 +561,7 @@ impl Pipeline {
 
         let batch = Batch {
             sample_ids: Arc::from(ids.as_slice()),
+            label_ids: None,
             offsets: Arc::from(offsets.as_slice()),
             payload: Arc::from(payload.as_slice()),
         };
@@ -609,8 +610,47 @@ enum SpecLocation {
 #[derive(Debug, Clone)]
 struct BatchPlan {
     sample_ids: Vec<u64>,
+    label_ids: Option<Vec<u64>>,
     specs: Vec<ReadSpec>,
     total_bytes: u64,
+}
+
+fn parse_imagefolder_label_id(decode_hint: Option<&str>, sample_id: u64) -> Result<Option<u64>> {
+    let Some(h) = decode_hint else {
+        return Ok(None);
+    };
+
+    // v0 convention (produced by mx8-snapshot S3 prefix indexing):
+    //   mx8:vision:imagefolder;label_id=<n>;label=<...>
+    const PREFIX: &str = "mx8:vision:imagefolder;";
+    if !h.starts_with(PREFIX) {
+        return Ok(None);
+    }
+
+    let rest = &h[PREFIX.len()..];
+    for part in rest.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "label_id" {
+            continue;
+        }
+        let v = v.trim();
+        let id: u64 = v.parse().map_err(|_| {
+            anyhow::anyhow!("bad imagefolder label_id (sample_id={sample_id}): {v:?}")
+        })?;
+        return Ok(Some(id));
+    }
+
+    anyhow::bail!(
+        "imagefolder decode_hint missing label_id (sample_id={}): {:?}",
+        sample_id,
+        h
+    );
 }
 
 async fn build_batch_plan(
@@ -622,11 +662,13 @@ async fn build_batch_plan(
     let _ = s3_client;
 
     let mut sample_ids = Vec::with_capacity(records.len());
+    let mut label_ids: Vec<Option<u64>> = Vec::with_capacity(records.len());
     let mut specs = Vec::with_capacity(records.len());
     let mut total_bytes: u64 = 0;
 
     for r in records {
         let location = parse_location(&r.location)?;
+        let label_id = parse_imagefolder_label_id(r.decode_hint.as_deref(), r.sample_id)?;
 
         let (offset, len, expect_eof) = match (r.byte_offset, r.byte_length) {
             (Some(off), Some(len)) => (off, len, false),
@@ -672,6 +714,7 @@ async fn build_batch_plan(
         };
 
         sample_ids.push(r.sample_id);
+        label_ids.push(label_id);
         specs.push(ReadSpec {
             sample_id: r.sample_id,
             location,
@@ -685,8 +728,29 @@ async fn build_batch_plan(
             .ok_or_else(|| anyhow::anyhow!("byte size overflow"))?;
     }
 
+    let saw_any_label = label_ids.iter().any(|v| v.is_some());
+    let label_ids = if saw_any_label {
+        if label_ids.iter().any(|v| v.is_none()) {
+            anyhow::bail!("mixed labeled/unlabeled records in a batch plan (imagefolder hints must be all-or-none)");
+        }
+        let mut out: Vec<u64> = Vec::with_capacity(label_ids.len());
+        for (i, v) in label_ids.into_iter().enumerate() {
+            let Some(id) = v else {
+                anyhow::bail!(
+                    "internal error: missing label_id after all-or-none check (index={})",
+                    i
+                );
+            };
+            out.push(id);
+        }
+        Some(out)
+    } else {
+        None
+    };
+
     Ok(BatchPlan {
         sample_ids,
+        label_ids,
         specs,
         total_bytes,
     })
@@ -1057,6 +1121,7 @@ async fn build_manifest_inflight_batch(
 
     let batch = Batch {
         sample_ids: Arc::from(plan.sample_ids.as_slice()),
+        label_ids: plan.label_ids.as_ref().map(|v| Arc::from(v.as_slice())),
         offsets: Arc::from(offsets.as_slice()),
         payload: Arc::from(payload.as_slice()),
     };

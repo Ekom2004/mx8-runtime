@@ -4,6 +4,11 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct Batch {
     pub sample_ids: Arc<[u64]>,
+    /// Optional per-sample label IDs aligned with `sample_ids`.
+    ///
+    /// v0: this is populated when the manifest's `decode_hint` encodes
+    /// `mx8:vision:imagefolder;label_id=<n>;...` for every sample in the batch.
+    pub label_ids: Option<Arc<[u64]>>,
     /// Prefix-sum offsets into `payload` for each sample (length = sample_count + 1).
     ///
     /// Invariants:
