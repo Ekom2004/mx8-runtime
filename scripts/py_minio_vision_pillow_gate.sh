@@ -6,8 +6,8 @@ set -euo pipefail
 # Proves the end-to-end "vision v0" user story:
 # - Seed ImageFolder-style JPEGs into MinIO (S3-compatible).
 # - Pack raw prefix -> tar shards + `_mx8/manifest.tsv`.
-# - `mx8.DataLoader` reads byte ranges from the packed prefix.
-# - Pillow decodes JPEG bytes in Python, and a tiny Torch loop trains for N steps.
+# - `mx8.vision.ImageFolderLoader` reads + decodes JPEGs and yields `(images, labels)` torch tensors.
+# - A tiny Torch loop trains for N steps.
 #
 # Usage:
 #   ./scripts/py_minio_vision_pillow_gate.sh
