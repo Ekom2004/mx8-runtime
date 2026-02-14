@@ -25,6 +25,12 @@ pub enum SnapshotError {
     DevManifestParse(String),
     #[error("dev manifest invariant violated: {0}")]
     DevManifestInvariant(String),
+    #[error("indexing is not supported for dataset link base: {0}")]
+    IndexUnsupported(String),
+    #[error("s3 indexing requires feature 's3' (dataset base: {0})")]
+    S3FeatureRequired(String),
+    #[error("s3 indexing failed: {0}")]
+    S3Index(String),
     #[error("snapshot wait timed out after {0:?}")]
     WaitTimeout(Duration),
 }
@@ -141,13 +147,11 @@ impl SnapshotResolver {
                 intent_key = %intent_key,
                 "elected indexer"
             );
-            let path = self
-                .cfg
-                .dev_manifest_path
-                .clone()
-                .ok_or(SnapshotError::DevManifestPathRequired)?;
 
-            let (_records, canonical_bytes) = load_dev_manifest_tsv(&path)?;
+            let (_records, canonical_bytes) = match self.cfg.dev_manifest_path.clone() {
+                Some(path) => load_dev_manifest_tsv(&path)?,
+                None => index_manifest_for_base(base)?,
+            };
             let manifest_hash = ManifestHash(mx8_manifest_store::sha256_hex(&canonical_bytes));
 
             self.store
@@ -212,6 +216,194 @@ impl SnapshotResolver {
         );
         Err(SnapshotError::WaitTimeout(self.cfg.wait_timeout))
     }
+}
+
+fn index_manifest_for_base(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+    let trimmed = base.trim();
+    if trimmed.starts_with("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            return index_s3_prefix(trimmed);
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            return Err(SnapshotError::S3FeatureRequired(trimmed.to_string()));
+        }
+    }
+
+    Err(SnapshotError::IndexUnsupported(trimmed.to_string()))
+}
+
+#[cfg(feature = "s3")]
+fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+    fn parse_env_bool(key: &str) -> Result<Option<bool>, SnapshotError> {
+        match std::env::var(key) {
+            Ok(v) => {
+                let s = v.trim().to_ascii_lowercase();
+                let b = match s.as_str() {
+                    "1" | "true" | "yes" | "y" | "on" => true,
+                    "0" | "false" | "no" | "n" | "off" => false,
+                    _ => {
+                        return Err(SnapshotError::S3Index(format!(
+                            "invalid boolean env var {}={:?} (expected true/false/1/0)",
+                            key, v
+                        )))
+                    }
+                };
+                Ok(Some(b))
+            }
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(e) => Err(SnapshotError::S3Index(format!(
+                "read env var {key} failed: {e}"
+            ))),
+        }
+    }
+
+    fn parse_s3_base(url: &str) -> Result<(String, String), SnapshotError> {
+        // url: s3://bucket/prefix[/]
+        let rest = url
+            .strip_prefix("s3://")
+            .ok_or_else(|| SnapshotError::S3Index(format!("invalid s3 url: {url}")))?;
+        let s = rest.trim().trim_matches('/');
+        let mut it = s.splitn(2, '/');
+        let bucket = it.next().unwrap_or("").trim();
+        if bucket.is_empty() {
+            return Err(SnapshotError::S3Index(format!(
+                "invalid s3 url (missing bucket): {url}"
+            )));
+        }
+        let prefix = it.next().unwrap_or("").trim_matches('/').to_string();
+        Ok((bucket.to_string(), prefix))
+    }
+
+    fn block_on<Fut>(fut: Fut) -> Result<Fut::Output, SnapshotError>
+    where
+        Fut: std::future::Future,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(fut))),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        SnapshotError::S3Index(format!("tokio runtime init failed: {e}"))
+                    })?;
+                Ok(rt.block_on(fut))
+            }
+        }
+    }
+
+    async fn client_from_env() -> Result<aws_sdk_s3::Client, SnapshotError> {
+        let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+
+        let endpoint_url: Option<String> = std::env::var("MX8_S3_ENDPOINT_URL").ok();
+        let force_path_style = match parse_env_bool("MX8_S3_FORCE_PATH_STYLE")? {
+            Some(v) => v,
+            None => endpoint_url.is_some(),
+        };
+
+        let mut b = aws_sdk_s3::config::Builder::from(&cfg);
+        if let Some(url) = endpoint_url {
+            b = b.endpoint_url(url);
+        }
+        if force_path_style {
+            b = b.force_path_style(true);
+        }
+
+        Ok(aws_sdk_s3::Client::from_conf(b.build()))
+    }
+
+    let (bucket, prefix) = parse_s3_base(base)?;
+    let client = block_on(client_from_env())??;
+
+    let keys = block_on(async {
+        let mut out: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client.list_objects_v2().bucket(&bucket);
+            if !prefix.is_empty() {
+                req = req.prefix(&prefix);
+            }
+            if let Some(t) = token.as_deref() {
+                req = req.continuation_token(t);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| SnapshotError::S3Index(format!("list_objects_v2 failed: {e:?}")))?;
+
+            if let Some(contents) = resp.contents {
+                for obj in contents {
+                    let Some(k) = obj.key else { continue };
+                    if k.ends_with('/') {
+                        continue;
+                    }
+                    out.push(k);
+                }
+            }
+
+            if resp.is_truncated.unwrap_or(false) {
+                token = resp.next_continuation_token;
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok::<_, SnapshotError>(out)
+    })??;
+
+    if keys.is_empty() {
+        warn!(
+            target: "mx8_proof",
+            event = "snapshot_index_empty",
+            base = %base,
+            bucket = %bucket,
+            prefix = %prefix,
+            "s3 index produced zero objects"
+        );
+    }
+
+    let mut locations: Vec<String> = keys
+        .into_iter()
+        .map(|k| format!("s3://{bucket}/{k}"))
+        .collect();
+    locations.sort();
+
+    let mut records: Vec<ManifestRecord> = Vec::with_capacity(locations.len());
+    for (i, location) in locations.into_iter().enumerate() {
+        if location.contains('\n') || location.contains('\t') {
+            return Err(SnapshotError::S3Index(format!(
+                "s3 object url contains tabs/newlines (sample_id={i}): {location:?}"
+            )));
+        }
+        let record = ManifestRecord {
+            sample_id: i as u64,
+            location,
+            byte_offset: None,
+            byte_length: None,
+            decode_hint: None,
+        };
+        record.validate().map_err(|e| {
+            SnapshotError::S3Index(format!("indexed record failed validation: {e}"))
+        })?;
+        records.push(record);
+    }
+
+    info!(
+        target: "mx8_proof",
+        event = "snapshot_indexed",
+        base = %base,
+        bucket = %bucket,
+        prefix = %prefix,
+        objects = records.len() as u64,
+        "indexed s3 prefix"
+    );
+
+    let canonical = canonicalize_manifest_bytes(&records);
+    Ok((records, canonical))
 }
 
 fn load_dev_manifest_tsv(path: &PathBuf) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
