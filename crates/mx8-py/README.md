@@ -34,3 +34,15 @@ for images, labels in loader:
     pass
 ```
 
+## Labels (optional)
+
+`label_mode="imagefolder"` is designed to scale:
+
+- Per-sample records reference a numeric `label_id` (u64), not a repeated string.
+- The human-readable mapping is stored once at `out/_mx8/labels.tsv`.
+
+If your input layout is mixed (files directly under the prefix *and* subfolders), `label_mode="auto"` may disable ImageFolder labeling. To enforce ImageFolder semantics, use:
+
+```python
+mx8.pack_dir(..., label_mode="imagefolder", require_labels=True)
+```
