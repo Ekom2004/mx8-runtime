@@ -16,8 +16,6 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-          - os: ubuntu-latest
-            target: aarch64
           - os: macos-14
             target: universal2
     steps:
@@ -26,11 +24,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.9"
-      - name: Set up QEMU (aarch64)
-        if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
