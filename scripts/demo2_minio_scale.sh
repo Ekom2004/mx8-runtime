@@ -18,9 +18,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 WORLD_SIZE="${WORLD_SIZE:-4}"
-TOTAL_SAMPLES="${TOTAL_SAMPLES:-200000}"
+# This gate's goal is to validate *large manifest handling* (>4MiB) and recovery, not to
+# benchmark S3 throughput on localhost MinIO. Keep the data plane small and inflate the
+# manifest size by using a long object key.
+TOTAL_SAMPLES="${TOTAL_SAMPLES:-8000}"
 BYTES_PER_SAMPLE="${BYTES_PER_SAMPLE:-256}"
-BLOCK_SIZE="${BLOCK_SIZE:-10000}"
+BLOCK_SIZE="${BLOCK_SIZE:-1000}"
 DEV_LEASE_WANT="${MX8_DEV_LEASE_WANT:-1}"
 BENCH_WANTS="${MX8_BENCH_WANTS:-}"
 
@@ -34,6 +37,29 @@ KILL_AFTER_MS="${KILL_AFTER_MS:-0}"
 WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-30000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-30000}"
 WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-240000}"
+
+# Inflate the manifest size deterministically by default (without increasing sample count).
+# Override by setting `MX8_MINIO_KEY` directly if desired.
+if [[ -z "${MX8_MINIO_KEY:-}" ]]; then
+  KEY_PAD_BYTES="${MX8_SCALE_KEY_PAD_BYTES:-900}"
+  # MinIO uses a filesystem backend; individual path segments are typically limited to 255 bytes.
+  # Build a deep key with multiple <=240B segments so it's valid, while still inflating the
+  # manifest TSV beyond 4MiB.
+  export MX8_MINIO_KEY
+  MX8_MINIO_KEY="$(python3 - "${KEY_PAD_BYTES}" <<'PY'
+import sys
+
+n = int(sys.argv[1])
+chunk = 240
+segs = []
+while n > 0:
+    k = min(chunk, n)
+    segs.append("x" * k)
+    n -= k
+print("pad/" + "/".join(segs) + "/data.bin")
+PY
+)"
+fi
 
 extract_artifacts() {
   python3 - "$1" <<'PY'
