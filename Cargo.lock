@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-py"
-version = "0.0.0"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "mx8-core",
