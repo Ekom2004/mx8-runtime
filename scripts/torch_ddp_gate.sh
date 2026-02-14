@@ -70,18 +70,52 @@ COORD_URL="http://127.0.0.1:${COORD_PORT}"
 WORLD_SIZE="${WORLD_SIZE:-2}"
 JOB_ID="${MX8_JOB_ID:-m5-ddp-demo}"
 
-COORD_LOG="${TMP_ROOT}/coordinator.log"
-echo "[mx8] starting coordinator (world_size=${WORLD_SIZE}, url=${COORD_URL})"
-MX8_COORD_BIND_ADDR="127.0.0.1:${COORD_PORT}" \
-MX8_WORLD_SIZE="${WORLD_SIZE}" \
-MX8_DATASET_LINK="${TMP_ROOT}/dev@refresh" \
-MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
-MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
-MX8_DEV_BLOCK_SIZE="${MX8_DEV_BLOCK_SIZE:-1000}" \
-MX8_METRICS_SNAPSHOT_INTERVAL_MS=0 \
-target/debug/mx8-coordinator --world-size "${WORLD_SIZE}" >"${COORD_LOG}" 2>&1 &
-COORD_PID="$!"
-trap 'kill -TERM "${COORD_PID}" >/dev/null 2>&1 || true' EXIT
+start_coordinator() {
+  local coord_log="$1"
+  MX8_COORD_BIND_ADDR="127.0.0.1:${COORD_PORT}" \
+  MX8_WORLD_SIZE="${WORLD_SIZE}" \
+  MX8_SHUFFLE="${MX8_SHUFFLE:-true}" \
+  MX8_SEED="${MX8_SEED:-0}" \
+  MX8_EPOCH="${MX8_EPOCH:-0}" \
+  MX8_DATASET_LINK="${TMP_ROOT}/dev@refresh" \
+  MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
+  MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
+  MX8_DEV_BLOCK_SIZE="${MX8_DEV_BLOCK_SIZE:-1000}" \
+  MX8_METRICS_SNAPSHOT_INTERVAL_MS=0 \
+  target/debug/mx8-coordinator --world-size "${WORLD_SIZE}" >"${coord_log}" 2>&1 &
+  echo "$!"
+}
+
+wait_coordinator_ready() {
+  local pid="$1"
+  local coord_log="$2"
+  local tries=200
+  for ((i=0; i<tries; i++)); do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      echo "[mx8] coordinator exited early (pid=${pid})" >&2
+      echo "[mx8] coordinator log (${coord_log}):" >&2
+      tail -n 200 "${coord_log}" >&2 || true
+      return 1
+    fi
+    if (echo >/dev/tcp/127.0.0.1/"${COORD_PORT}") >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[mx8] coordinator not ready on 127.0.0.1:${COORD_PORT} (pid=${pid})" >&2
+  echo "[mx8] coordinator log (${coord_log}):" >&2
+  tail -n 200 "${coord_log}" >&2 || true
+  return 1
+}
+
+stop_coordinator() {
+  local pid="$1"
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
+  wait "${pid}" >/dev/null 2>&1 || true
+}
+
+COORD_PID=""
+trap '[[ -n "${COORD_PID}" ]] && stop_coordinator "${COORD_PID}"' EXIT
 
 echo "[mx8] maturin develop"
 (
@@ -92,6 +126,11 @@ echo "[mx8] maturin develop"
   "${PYTHON_BIN}" -m maturin develop --pip-path "${VENV_DIR}/bin/pip" --manifest-path crates/mx8-py/Cargo.toml
 )
 
+COORD_LOG="${TMP_ROOT}/coordinator.log"
+echo "[mx8] starting coordinator (world_size=${WORLD_SIZE}, url=${COORD_URL})"
+COORD_PID="$(start_coordinator "${COORD_LOG}")"
+wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+
 echo "[mx8] running ddp demo (local spawn)"
 MX8_COORD_URL="${COORD_URL}" \
 MX8_JOB_ID="${JOB_ID}" \
@@ -99,5 +138,198 @@ WORLD_SIZE="${WORLD_SIZE}" \
 MX8_TORCH_STEPS="${MX8_TORCH_STEPS:-8}" \
 MX8_TORCH_LR="${MX8_TORCH_LR:-0.01}" \
 "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_demo.py"
+
+stop_coordinator "${COORD_PID}"
+COORD_PID=""
+
+if [[ "${MX8_TORCH_DDP_NODUPES:-0}" == "1" ]]; then
+  COORD_LOG="${TMP_ROOT}/coordinator_nodupes.log"
+  echo "[mx8] starting coordinator (nodupes, world_size=${WORLD_SIZE}, url=${COORD_URL})"
+  COORD_PID="$(start_coordinator "${COORD_LOG}")"
+  wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+  echo "[mx8] running ddp nodupes gate (local spawn)"
+  MX8_COORD_URL="${COORD_URL}" \
+  MX8_JOB_ID="${MX8_JOB_ID_NODUPES:-m5-ddp-nodupes}" \
+  WORLD_SIZE="${WORLD_SIZE}" \
+  MX8_TORCH_NODUPES_STEPS="${MX8_TORCH_NODUPES_STEPS:-64}" \
+  MX8_DEV_LEASE_WANT="${MX8_DEV_LEASE_WANT:-1}" \
+  "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_nodupes_gate.py"
+  stop_coordinator "${COORD_PID}"
+  COORD_PID=""
+fi
+
+if [[ "${MX8_TORCH_DDP_DETERMINISM:-0}" == "1" ]]; then
+  echo "[mx8] running ddp determinism gate (same seed/epoch -> same digests; different epoch -> different digests)"
+
+  BATCH_SIZE_SAMPLES="${MX8_TORCH_BATCH_SIZE_SAMPLES:-32}"
+  DET_STEPS="${MX8_TORCH_NODUPES_STEPS:-$(( (TOTAL_SAMPLES / WORLD_SIZE) / BATCH_SIZE_SAMPLES ))}"
+  if [[ "${DET_STEPS}" -le 0 ]]; then
+    DET_STEPS=1
+  fi
+
+  run_nodupes_with_epoch() {
+    local epoch="$1"
+    local tag="$2"
+    local coord_log="${TMP_ROOT}/coordinator_determinism_${tag}.log"
+    local out_log="${TMP_ROOT}/ddp_nodupes_${tag}.log"
+
+    echo "[mx8] starting coordinator (determinism tag=${tag}, epoch=${epoch})" >&2
+    MX8_EPOCH="${epoch}" COORD_PID="$(start_coordinator "${coord_log}")"
+    wait_coordinator_ready "${COORD_PID}" "${coord_log}"
+    MX8_COORD_URL="${COORD_URL}" \
+    MX8_JOB_ID="${MX8_JOB_ID_DETERMINISM:-m5-ddp-determinism}" \
+    WORLD_SIZE="${WORLD_SIZE}" \
+    MX8_TORCH_NODUPES_STEPS="${DET_STEPS}" \
+    MX8_TORCH_BATCH_SIZE_SAMPLES="${BATCH_SIZE_SAMPLES}" \
+    MX8_DEV_LEASE_WANT=1 \
+    "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_nodupes_gate.py" | tee "${out_log}" >&2
+
+    stop_coordinator "${COORD_PID}"
+    COORD_PID=""
+
+    local digests
+    digests="$(grep -E '^digests:' "${out_log}" | head -n 1 | sed -e 's/^digests: //')"
+    if [[ -z "${digests}" ]]; then
+      echo "[mx8] determinism gate: failed to parse digests from ${out_log}" >&2
+      exit 1
+    fi
+    echo "${digests}"
+  }
+
+  SEED="${MX8_SEED:-0}"
+  echo "[mx8] determinism config: seed=${SEED} (MX8_SEED), shuffle=${MX8_SHUFFLE:-true} (MX8_SHUFFLE)"
+
+  base_a="$(run_nodupes_with_epoch 0 a)"
+  base_b="$(run_nodupes_with_epoch 0 b)"
+
+  if [[ "${base_a}" != "${base_b}" ]]; then
+    echo "[mx8] determinism gate FAILED: same seed/epoch produced different digests" >&2
+    echo "[mx8] a=${base_a}" >&2
+    echo "[mx8] b=${base_b}" >&2
+    exit 1
+  fi
+
+  epoch1="$(run_nodupes_with_epoch 1 e1)"
+  if [[ "${epoch1}" == "${base_a}" ]]; then
+    epoch2="$(run_nodupes_with_epoch 2 e2)"
+    if [[ "${epoch2}" == "${base_a}" ]]; then
+      echo "[mx8] determinism gate FAILED: epoch change did not change digests" >&2
+      echo "[mx8] base=${base_a}" >&2
+      echo "[mx8] e1=${epoch1}" >&2
+      echo "[mx8] e2=${epoch2}" >&2
+      exit 1
+    fi
+  fi
+
+  echo "[mx8] determinism gate OK"
+fi
+
+if [[ "${MX8_TORCH_DDP_RESTART:-0}" == "1" ]]; then
+  echo "[mx8] running ddp restartability gate (v0 epoch-level restart)"
+
+  BATCH_SIZE_SAMPLES="${MX8_TORCH_BATCH_SIZE_SAMPLES:-32}"
+  DET_STEPS="${MX8_TORCH_NODUPES_STEPS:-$(( (TOTAL_SAMPLES / WORLD_SIZE) / BATCH_SIZE_SAMPLES ))}"
+  if [[ "${DET_STEPS}" -le 0 ]]; then
+    DET_STEPS=1
+  fi
+
+  run_nodupes_epoch0() {
+    local tag="$1"
+    local coord_log="${TMP_ROOT}/coordinator_restart_${tag}.log"
+    local out_log="${TMP_ROOT}/ddp_restart_nodupes_${tag}.log"
+
+    echo "[mx8] starting coordinator (restart tag=${tag}, epoch=0)" >&2
+    MX8_EPOCH=0 COORD_PID="$(start_coordinator "${coord_log}")"
+    wait_coordinator_ready "${COORD_PID}" "${coord_log}"
+
+    MX8_COORD_URL="${COORD_URL}" \
+    MX8_JOB_ID="${MX8_JOB_ID_RESTART:-m5-ddp-restart}" \
+    WORLD_SIZE="${WORLD_SIZE}" \
+    MX8_TORCH_NODUPES_STEPS="${DET_STEPS}" \
+    MX8_TORCH_BATCH_SIZE_SAMPLES="${BATCH_SIZE_SAMPLES}" \
+    MX8_DEV_LEASE_WANT=1 \
+    "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_nodupes_gate.py" | tee "${out_log}" >&2
+
+    stop_coordinator "${COORD_PID}"
+    COORD_PID=""
+
+    local digests
+    digests="$(grep -E '^digests:' "${out_log}" | head -n 1 | sed -e 's/^digests: //')"
+    if [[ -z "${digests}" ]]; then
+      echo "[mx8] restart gate: failed to parse digests from ${out_log}" >&2
+      exit 1
+    fi
+    echo "${digests}"
+  }
+
+  base="$(run_nodupes_epoch0 base)"
+
+  CKPT_PATH="${TMP_ROOT}/ckpt.pt"
+  COORD_LOG="${TMP_ROOT}/coordinator_restart_crash.log"
+  echo "[mx8] starting coordinator (restart crash run, epoch=0)" >&2
+  MX8_EPOCH=0 COORD_PID="$(start_coordinator "${COORD_LOG}")"
+  wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+
+  echo "[mx8] running crash train (expect DDP failure; checkpoint should exist)" >&2
+  set +e
+  MX8_COORD_URL="${COORD_URL}" \
+  MX8_JOB_ID="${MX8_JOB_ID_RESTART:-m5-ddp-restart}" \
+  WORLD_SIZE="${WORLD_SIZE}" \
+  MX8_TORCH_STEPS="${MX8_TORCH_RESTART_STEPS:-8}" \
+  MX8_TORCH_LR="${MX8_TORCH_LR:-0.01}" \
+  MX8_TORCH_BATCH_SIZE_SAMPLES="${BATCH_SIZE_SAMPLES}" \
+  MX8_TORCH_SAVE_CKPT_PATH="${CKPT_PATH}" \
+  MX8_TORCH_SAVE_CKPT_STEP="${MX8_TORCH_SAVE_CKPT_STEP:-2}" \
+  MX8_TORCH_CRASH_RANK="${MX8_TORCH_CRASH_RANK:-1}" \
+  MX8_TORCH_CRASH_AFTER_STEP="${MX8_TORCH_CRASH_AFTER_STEP:-3}" \
+  "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_ckpt_crash_demo.py"
+  crash_rc="$?"
+  set -e
+
+  stop_coordinator "${COORD_PID}"
+  COORD_PID=""
+
+  if [[ "${crash_rc}" -eq 0 ]]; then
+    echo "[mx8] restart gate FAILED: crash run unexpectedly succeeded" >&2
+    exit 1
+  fi
+  if [[ ! -f "${CKPT_PATH}" ]]; then
+    echo "[mx8] restart gate FAILED: expected checkpoint at ${CKPT_PATH}" >&2
+    exit 1
+  fi
+
+  replay="$(run_nodupes_epoch0 replay)"
+  if [[ "${base}" != "${replay}" ]]; then
+    echo "[mx8] restart gate FAILED: epoch replay digests mismatch" >&2
+    echo "[mx8] base=${base}" >&2
+    echo "[mx8] replay=${replay}" >&2
+    exit 1
+  fi
+
+  COORD_LOG="${TMP_ROOT}/coordinator_restart_load.log"
+  echo "[mx8] starting coordinator (restart load run, epoch=0)" >&2
+  MX8_EPOCH=0 COORD_PID="$(start_coordinator "${COORD_LOG}")"
+  wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+
+  echo "[mx8] running load-from-checkpoint train (should succeed)" >&2
+  MX8_COORD_URL="${COORD_URL}" \
+  MX8_JOB_ID="${MX8_JOB_ID_RESTART:-m5-ddp-restart}" \
+  WORLD_SIZE="${WORLD_SIZE}" \
+  MX8_TORCH_STEPS="${MX8_TORCH_RESTART_LOAD_STEPS:-4}" \
+  MX8_TORCH_LR="${MX8_TORCH_LR:-0.01}" \
+  MX8_TORCH_BATCH_SIZE_SAMPLES="${BATCH_SIZE_SAMPLES}" \
+  MX8_TORCH_LOAD_CKPT_PATH="${CKPT_PATH}" \
+  "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_ckpt_crash_demo.py" | tee "${TMP_ROOT}/ddp_restart_load.log" >&2
+
+  stop_coordinator "${COORD_PID}"
+  COORD_PID=""
+
+  if ! grep -qE '^loaded_checkpoint: True$' "${TMP_ROOT}/ddp_restart_load.log"; then
+    echo "[mx8] restart gate FAILED: did not confirm checkpoint load" >&2
+    exit 1
+  fi
+
+  echo "[mx8] restart gate OK"
+fi
 
 echo "[mx8] torch_ddp_gate OK"

@@ -24,7 +24,7 @@ RUST_LOG=info \
   MX8_TOTAL_SAMPLES=8000 \
   MX8_DEV_BLOCK_SIZE=1000 \
   MX8_SINK_SLEEP_MS=25 \
-  MX8_KILL_AFTER_MS=750 \
+  MX8_KILL_AFTER_MS=25 \
   MX8_WAIT_REQUEUE_TIMEOUT_MS=15000 \
   MX8_WAIT_DRAIN_TIMEOUT_MS=30000 \
   cargo run -p mx8-runtime --bin mx8-demo2
@@ -63,7 +63,16 @@ if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
   ./scripts/soak_demo2_minio_scale.sh
 fi
 
-if [[ "${MX8_SMOKE_TORCH_DDP:-0}" == "1" ]]; then
+if [[ "${MX8_SMOKE_TORCH_DDP_DETERMINISM:-0}" == "1" ]]; then
+  echo "[mx8] torch_ddp_gate (multi-process PyTorch determinism gate)"
+  MX8_TORCH_DDP_DETERMINISM=1 ./scripts/torch_ddp_gate.sh
+elif [[ "${MX8_SMOKE_TORCH_DDP_RESTART:-0}" == "1" ]]; then
+  echo "[mx8] torch_ddp_gate (multi-process PyTorch restartability gate)"
+  MX8_TORCH_DDP_RESTART=1 ./scripts/torch_ddp_gate.sh
+elif [[ "${MX8_SMOKE_TORCH_DDP_NODUPES:-0}" == "1" ]]; then
+  echo "[mx8] torch_ddp_gate (multi-process PyTorch no-overlap gate)"
+  MX8_TORCH_DDP_NODUPES=1 ./scripts/torch_ddp_gate.sh
+elif [[ "${MX8_SMOKE_TORCH_DDP:-0}" == "1" ]]; then
   echo "[mx8] torch_ddp_gate (multi-process PyTorch training gate)"
   ./scripts/torch_ddp_gate.sh
 fi
