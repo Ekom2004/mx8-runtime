@@ -63,6 +63,11 @@ if [[ "${MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT:-0}" == "1" ]]; then
   ./scripts/minio_s3_prefix_snapshot_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_PY_MINIO_IMAGEFOLDER:-0}" == "1" ]]; then
+  echo "[mx8] py_minio_imagefolder_gate (Python DataLoader + MinIO labels)"
+  ./scripts/py_minio_imagefolder_gate.sh
+fi
+
 if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
   echo "[mx8] soak_demo2_minio_scale (soak gate: repeated node failures)"
   ./scripts/soak_demo2_minio_scale.sh

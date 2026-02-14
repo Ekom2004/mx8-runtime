@@ -236,6 +236,73 @@ fn index_manifest_for_base(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>),
 
 #[cfg(feature = "s3")]
 fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum S3LabelMode {
+        None,
+        ImageFolder,
+        Auto,
+    }
+
+    fn parse_label_mode() -> Result<S3LabelMode, SnapshotError> {
+        match std::env::var("MX8_S3_LABEL_MODE") {
+            Ok(v) => {
+                let s = v.trim().to_ascii_lowercase();
+                match s.as_str() {
+                    "none" | "off" | "false" | "0" => Ok(S3LabelMode::None),
+                    "imagefolder" | "image_folder" | "image-folder" => Ok(S3LabelMode::ImageFolder),
+                    "auto" | "" => Ok(S3LabelMode::Auto),
+                    _ => Err(SnapshotError::S3Index(format!(
+                        "invalid MX8_S3_LABEL_MODE={v:?} (expected: auto|none|imagefolder)"
+                    ))),
+                }
+            }
+            Err(std::env::VarError::NotPresent) => Ok(S3LabelMode::Auto),
+            Err(e) => Err(SnapshotError::S3Index(format!(
+                "read env var MX8_S3_LABEL_MODE failed: {e}"
+            ))),
+        }
+    }
+
+    fn percent_encode(s: &str) -> String {
+        // Minimal percent-encoding for embedding arbitrary labels into decode_hint.
+        //
+        // We encode everything outside a safe set to avoid introducing separators.
+        // (decode_hint must not contain tabs/newlines; we keep it ASCII-stable.)
+        let mut out = String::with_capacity(s.len());
+        for b in s.as_bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(*b as char)
+                }
+                _ => out.push_str(&format!("%{:02X}", b)),
+            }
+        }
+        out
+    }
+
+    fn imagefolder_label_for_key(prefix: &str, key: &str) -> Option<String> {
+        // If base is s3://bucket/prefix[/], we interpret "ImageFolder" labels as:
+        //   prefix/<label>/<file...>
+        //
+        // i.e. the first path segment after prefix.
+        let p = prefix.trim_matches('/');
+        let mut rest = key.trim_start_matches('/');
+        if !p.is_empty() {
+            // `list_objects_v2(prefix=p)` typically yields keys that start with `p`,
+            // but be defensive.
+            if let Some(after) = rest.strip_prefix(p) {
+                rest = after.strip_prefix('/').unwrap_or(after);
+            }
+        }
+        let rest = rest.trim_start_matches('/');
+        let (label, _tail) = rest.split_once('/')?;
+        let label = label.trim();
+        if label.is_empty() {
+            return None;
+        }
+        Some(label.to_string())
+    }
+
     fn parse_env_bool(key: &str) -> Result<Option<bool>, SnapshotError> {
         match std::env::var(key) {
             Ok(v) => {
@@ -316,6 +383,7 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
 
     let (bucket, prefix) = parse_s3_base(base)?;
     let client = block_on(client_from_env())??;
+    let label_mode = parse_label_mode()?;
 
     let keys = block_on(async {
         let mut out: Vec<String> = Vec::new();
@@ -366,25 +434,79 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
         );
     }
 
-    let mut locations: Vec<String> = keys
-        .into_iter()
-        .map(|k| format!("s3://{bucket}/{k}"))
-        .collect();
-    locations.sort();
+    let mut keys = keys;
+    keys.sort();
 
-    let mut records: Vec<ManifestRecord> = Vec::with_capacity(locations.len());
-    for (i, location) in locations.into_iter().enumerate() {
+    let mut maybe_labels: Vec<Option<String>> = Vec::with_capacity(keys.len());
+    let mut label_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if label_mode != S3LabelMode::None {
+        for k in &keys {
+            let label = imagefolder_label_for_key(&prefix, k);
+            if let Some(l) = &label {
+                label_set.insert(l.clone());
+            }
+            maybe_labels.push(label);
+        }
+    } else {
+        maybe_labels.resize_with(keys.len(), || None);
+    }
+
+    let mut label_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let use_imagefolder_labels = match label_mode {
+        S3LabelMode::None => false,
+        S3LabelMode::ImageFolder => {
+            if maybe_labels.iter().any(|l| l.is_none()) {
+                return Err(SnapshotError::S3Index(
+                    "MX8_S3_LABEL_MODE=imagefolder requires all keys to match prefix/<label>/<file>".to_string(),
+                ));
+            }
+            true
+        }
+        S3LabelMode::Auto => {
+            // Conservative auto-detection: only enable if every key has a label segment and
+            // we observe at least 2 distinct labels (otherwise treat as unlabeled).
+            maybe_labels.iter().all(|l| l.is_some()) && label_set.len() >= 2
+        }
+    };
+
+    if use_imagefolder_labels {
+        for (i, label) in label_set.into_iter().enumerate() {
+            label_map.insert(label, i as u64);
+        }
+    }
+
+    let mut records: Vec<ManifestRecord> = Vec::with_capacity(keys.len());
+    for (i, (key, label)) in keys.into_iter().zip(maybe_labels.into_iter()).enumerate() {
+        let location = format!("s3://{bucket}/{key}");
         if location.contains('\n') || location.contains('\t') {
             return Err(SnapshotError::S3Index(format!(
                 "s3 object url contains tabs/newlines (sample_id={i}): {location:?}"
             )));
         }
+        let decode_hint = if use_imagefolder_labels {
+            let label = label.ok_or_else(|| {
+                SnapshotError::S3Index(format!(
+                    "internal error: label missing under imagefolder mode (sample_id={i})"
+                ))
+            })?;
+            let label_id = *label_map.get(&label).ok_or_else(|| {
+                SnapshotError::S3Index(format!(
+                    "internal error: label not present in label map (sample_id={i}, label={label:?})"
+                ))
+            })?;
+            let label_enc = percent_encode(&label);
+            Some(format!(
+                "mx8:vision:imagefolder;label_id={label_id};label={label_enc}"
+            ))
+        } else {
+            None
+        };
         let record = ManifestRecord {
             sample_id: i as u64,
             location,
             byte_offset: None,
             byte_length: None,
-            decode_hint: None,
+            decode_hint,
         };
         record.validate().map_err(|e| {
             SnapshotError::S3Index(format!("indexed record failed validation: {e}"))
@@ -398,6 +520,7 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
         base = %base,
         bucket = %bucket,
         prefix = %prefix,
+        label_mode = if use_imagefolder_labels { "imagefolder" } else { "none" },
         objects = records.len() as u64,
         "indexed s3 prefix"
     );
