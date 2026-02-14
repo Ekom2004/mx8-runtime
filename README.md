@@ -40,6 +40,33 @@ Or via the Python API (after installing `mx8`):
 
 Then point MX8 at the packed prefix (snapshot resolver will use the precomputed manifest, avoiding large LIST operations).
 
+## Vision v0 (ImageFolder, PyTorch)
+
+For ImageFolder-style datasets (`prefix/<label>/<file>`), MX8 can deliver `(images, labels)` directly as torch tensors:
+
+```python
+import mx8
+
+mx8.pack(
+    "s3://bucket/raw/train/",
+    out="s3://bucket/mx8/train/",
+    shard_mb=512,
+    label_mode="imagefolder",
+    require_labels=True,
+)
+
+loader = mx8.vision.ImageFolderLoader(
+    "s3://bucket/mx8/train/@refresh",
+    batch_size_samples=64,
+    resize_hw=(224, 224),  # (H,W); optional
+)
+
+for images, labels in loader:
+    # images: [B,C,H,W] float32 in [0,1]
+    # labels: [B] int64
+    pass
+```
+
 ## Training semantics (v0)
 
 ### Non-elastic

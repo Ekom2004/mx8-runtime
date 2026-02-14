@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList};
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyTuple};
 
 use mx8_manifest_store::fs::FsManifestStore;
 use mx8_manifest_store::LockOwner;
@@ -34,6 +34,13 @@ type TorchBatch4<'py> = (
     Bound<'py, PyAny>,
     Bound<'py, PyAny>,
 );
+
+#[pyclass]
+struct ImageFolderLoader {
+    loader: DataLoader,
+    resize_hw: Option<(u32, u32)>,
+    to_float: bool,
+}
 
 #[pyclass]
 struct DataLoader {
@@ -165,6 +172,174 @@ impl DataLoader {
                 }
             }
         }
+    }
+}
+
+#[pymethods]
+impl ImageFolderLoader {
+    #[new]
+    #[pyo3(signature = (
+        dataset_link,
+        *,
+        manifest_store_root=None,
+        dev_manifest_path=None,
+        batch_size_samples=32,
+        max_inflight_bytes=128*1024*1024,
+        max_queue_batches=64,
+        prefetch_batches=1,
+        start_id=None,
+        end_id=None,
+        node_id=None,
+        resize_hw=None,
+        to_float=true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        dataset_link: String,
+        manifest_store_root: Option<PathBuf>,
+        dev_manifest_path: Option<PathBuf>,
+        batch_size_samples: usize,
+        max_inflight_bytes: u64,
+        max_queue_batches: usize,
+        prefetch_batches: usize,
+        start_id: Option<u64>,
+        end_id: Option<u64>,
+        node_id: Option<String>,
+        resize_hw: Option<(u32, u32)>,
+        to_float: bool,
+    ) -> PyResult<Self> {
+        let loader = DataLoader::new(
+            dataset_link,
+            manifest_store_root,
+            dev_manifest_path,
+            batch_size_samples,
+            max_inflight_bytes,
+            max_queue_batches,
+            prefetch_batches,
+            start_id,
+            end_id,
+            node_id,
+        )?;
+        Ok(Self {
+            loader,
+            resize_hw,
+            to_float,
+        })
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let lease = py.allow_threads(|| {
+            self.loader
+                .rt
+                .block_on(async { self.loader.rx.recv().await })
+        });
+
+        let Some(lease) = lease else {
+            let Some(task) = self.loader.task.take() else {
+                return Err(PyStopIteration::new_err(()));
+            };
+            let out = py.allow_threads(|| self.loader.rt.block_on(task));
+            return match out {
+                Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                Err(err) => Err(PyRuntimeError::new_err(format!(
+                    "producer task failed: {err}"
+                ))),
+            };
+        };
+
+        let labels = lease.batch.label_ids.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "batch has no label_ids (expected mx8:vision:imagefolder label hints in manifest)",
+            )
+        })?;
+
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use ImageFolderLoader): {e}"
+            ))
+        })?;
+        let np = py.import_bound("numpy").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import numpy (install numpy to use ImageFolderLoader): {e}"
+            ))
+        })?;
+        let pil = py.import_bound("PIL.Image").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import PIL.Image (install Pillow to use ImageFolderLoader): {e}"
+            ))
+        })?;
+        let io = py.import_bound("io")?;
+
+        let bytes_io = io.getattr("BytesIO")?;
+        let image_open = pil.getattr("open")?;
+
+        let mut xs: Vec<Bound<'py, PyAny>> = Vec::with_capacity(lease.batch.sample_count());
+
+        for i in 0..lease.batch.sample_count() {
+            let start = lease.batch.offsets[i] as usize;
+            let end = lease.batch.offsets[i + 1] as usize;
+            if end < start || end > lease.batch.payload.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "bad offsets for sample_id {} (start={} end={} payload_len={})",
+                    lease.batch.sample_ids[i],
+                    start,
+                    end,
+                    lease.batch.payload.len()
+                )));
+            }
+
+            let b = PyBytes::new_bound(py, &lease.batch.payload[start..end]);
+            let bio = bytes_io.call1((b,))?;
+
+            let mut img = image_open
+                .call1((bio,))?
+                .call_method1("convert", ("RGB",))?;
+            if let Some((h, w)) = self.resize_hw {
+                // PIL expects size=(width,height)
+                img = img.call_method1("resize", ((w, h),))?;
+            }
+
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("dtype", np.getattr("uint8")?)?;
+            kwargs.set_item("copy", true)?;
+            let arr = np.call_method("array", (img,), Some(&kwargs))?;
+
+            let x = torch.getattr("from_numpy")?.call1((arr,))?;
+            let x = x
+                .call_method1("permute", (2i64, 0i64, 1i64))?
+                .call_method0("contiguous")?;
+            let x = if self.to_float {
+                x.call_method0("float")?.call_method1("div", (255.0f32,))?
+            } else {
+                x
+            };
+            xs.push(x);
+        }
+
+        let xs_list = PyList::new_bound(py, xs);
+        let images = torch.getattr("stack")?.call1((xs_list, 0i64))?;
+
+        let torch_int64 = torch.getattr("int64")?;
+        let mut labels_i64 = Vec::with_capacity(labels.len());
+        for &lab in labels.iter() {
+            labels_i64.push(i64::try_from(lab).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "label_id overflow converting u64 -> i64 (label_id={lab})"
+                ))
+            })?);
+        }
+        let labels_list = PyList::new_bound(py, labels_i64);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        let labels = torch.call_method("tensor", (labels_list,), Some(&kwargs))?;
+
+        let out = PyTuple::new_bound(py, [images.to_object(py), labels.to_object(py)]);
+        Ok(out.into_any())
     }
 }
 
@@ -414,6 +589,12 @@ fn load(
 
 #[pymodule]
 fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
+    let vision = PyModule::new_bound(py, "vision")?;
+    vision.add_class::<ImageFolderLoader>()?;
+    m.add_submodule(&vision)?;
+    m.setattr("vision", &vision)?;
+
     m.add_class::<DataLoader>()?;
     m.add_class::<DistributedDataLoader>()?;
     m.add_class::<PyBatch>()?;
