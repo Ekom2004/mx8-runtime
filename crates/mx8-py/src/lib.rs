@@ -22,6 +22,7 @@ use mx8_proto::v0::RegisterNodeRequest;
 use mx8_proto::v0::ReportProgressRequest;
 use mx8_proto::v0::RequestLeaseRequest;
 use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps};
+use mx8_snapshot::pack_s3::{pack_s3, LabelMode as PackLabelMode, PackS3Config};
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 use mx8_wire::TryToCore;
 use tonic::transport::Channel;
@@ -328,13 +329,109 @@ fn resolve_manifest_hash(
     Ok(snapshot.manifest_hash.0)
 }
 
+#[pyfunction]
+#[pyo3(signature = (pack_in, *, out, shard_mb=512, label_mode=None, require_labels=false))]
+fn pack<'py>(
+    py: Python<'py>,
+    pack_in: String,
+    out: String,
+    shard_mb: u64,
+    label_mode: Option<String>,
+    require_labels: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let label_mode = parse_pack_label_mode(label_mode.as_deref().unwrap_or("auto"))
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}")))?;
+
+    let res = py
+        .allow_threads(|| {
+            rt.block_on(pack_s3(PackS3Config {
+                pack_in,
+                pack_out: out,
+                shard_mb,
+                label_mode,
+                require_labels,
+            }))
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+    let d = PyDict::new_bound(py);
+    d.set_item("samples", res.samples)?;
+    d.set_item("shards", res.shards)?;
+    d.set_item("manifest_key", res.manifest_key)?;
+    d.set_item("manifest_hash", res.manifest_hash)?;
+    d.set_item("labels_key", res.labels_key)?;
+    d.set_item("labels_hash", res.labels_hash)?;
+    Ok(d.into_any())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    dataset_link,
+    *,
+    manifest_store_root=None,
+    dev_manifest_path=None,
+    batch_size_samples=512,
+    max_inflight_bytes=128*1024*1024,
+    max_queue_batches=64,
+    prefetch_batches=1,
+    start_id=None,
+    end_id=None,
+    node_id=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn load(
+    py: Python<'_>,
+    dataset_link: String,
+    manifest_store_root: Option<PathBuf>,
+    dev_manifest_path: Option<PathBuf>,
+    batch_size_samples: usize,
+    max_inflight_bytes: u64,
+    max_queue_batches: usize,
+    prefetch_batches: usize,
+    start_id: Option<u64>,
+    end_id: Option<u64>,
+    node_id: Option<String>,
+) -> PyResult<Py<DataLoader>> {
+    let loader = DataLoader::new(
+        dataset_link,
+        manifest_store_root,
+        dev_manifest_path,
+        batch_size_samples,
+        max_inflight_bytes,
+        max_queue_batches,
+        prefetch_batches,
+        start_id,
+        end_id,
+        node_id,
+    )?;
+    Py::new(py, loader)
+}
+
 #[pymodule]
 fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DataLoader>()?;
     m.add_class::<DistributedDataLoader>()?;
     m.add_class::<PyBatch>()?;
+    m.add_function(wrap_pyfunction!(pack, m)?)?;
+    m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
     Ok(())
+}
+
+fn parse_pack_label_mode(s: &str) -> Result<PackLabelMode> {
+    let s = s.trim().to_ascii_lowercase();
+    let mode = match s.as_str() {
+        "none" | "off" | "false" | "0" => PackLabelMode::None,
+        "imagefolder" | "image_folder" | "image-folder" => PackLabelMode::ImageFolder,
+        "auto" | "" => PackLabelMode::Auto,
+        _ => anyhow::bail!("invalid label mode {s:?} (expected: auto|none|imagefolder)"),
+    };
+    Ok(mode)
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

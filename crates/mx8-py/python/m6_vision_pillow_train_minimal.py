@@ -29,7 +29,7 @@ def main() -> None:
     batch_size = int(os.environ.get("MX8_BATCH_SIZE_SAMPLES", "4"))
     steps = int(os.environ.get("MX8_TRAIN_STEPS", "8"))
 
-    loader = mx8.DataLoader(
+    loader = mx8.load(
         link,
         manifest_store_root=root,
         batch_size_samples=batch_size,

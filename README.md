@@ -28,6 +28,15 @@ If your dataset is “many small S3 objects” (e.g. ImageFolder layout with mil
 - Output: `s3://bucket/mx8/train/`
   - shards: `s3://bucket/mx8/train/shards/shard-00000.tar`
   - manifest: `s3://bucket/mx8/train/_mx8/manifest.tsv`
+  - labels (optional): `s3://bucket/mx8/train/_mx8/labels.tsv` (if ImageFolder labels are enabled)
+
+You can run the packer either via the CLI:
+
+- `MX8_PACK_IN=s3://bucket/raw/train/ MX8_PACK_OUT=s3://bucket/mx8/train/ cargo run -p mx8-snapshot --features s3 --bin mx8-pack-s3`
+
+Or via the Python API (after installing `mx8`):
+
+- `python -c "import mx8; mx8.pack('s3://bucket/raw/train/', out='s3://bucket/mx8/train/', shard_mb=512, label_mode='auto')"`
 
 Then point MX8 at the packed prefix (snapshot resolver will use the precomputed manifest, avoiding large LIST operations).
 

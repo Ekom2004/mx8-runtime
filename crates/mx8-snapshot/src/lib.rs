@@ -11,6 +11,9 @@ use mx8_manifest_store::{intent_key_for_base, LockOwner, ManifestStore, Manifest
 use thiserror::Error;
 use tracing::{info, warn};
 
+#[cfg(feature = "s3")]
+pub mod pack_s3;
+
 #[derive(Debug, Error)]
 pub enum SnapshotError {
     #[error("dataset link parse error: {0}")]
