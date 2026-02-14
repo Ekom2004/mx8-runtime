@@ -25,12 +25,15 @@ mx8.pack_dir(
 loader = mx8.vision.ImageFolderLoader(
     "/path/to/mx8-dataset@refresh",
     batch_size_samples=64,
+    max_inflight_bytes=256 * 1024 * 1024,
     resize_hw=(224, 224),  # (H,W); optional
 )
 
 print(loader.classes)  # ["cat", "dog", ...] if labels.tsv exists
 
 for images, labels in loader:
+    # Bounded-memory runtime stats (high-water is capped by max_inflight_bytes).
+    # stats = loader.stats()
     pass
 ```
 

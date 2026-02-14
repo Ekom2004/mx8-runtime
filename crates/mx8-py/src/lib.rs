@@ -21,7 +21,7 @@ use mx8_proto::v0::NodeStats;
 use mx8_proto::v0::RegisterNodeRequest;
 use mx8_proto::v0::ReportProgressRequest;
 use mx8_proto::v0::RequestLeaseRequest;
-use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps};
+use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps, RuntimeMetrics};
 use mx8_snapshot::labels::load_labels_for_base;
 use mx8_snapshot::pack_dir::{
     pack_dir as pack_dir_impl, LabelMode as PackDirLabelMode, PackDirConfig,
@@ -51,9 +51,28 @@ struct ImageFolderLoader {
 struct DataLoader {
     dataset_base: String,
     manifest_hash: String,
+    metrics: Arc<RuntimeMetrics>,
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     rt: tokio::runtime::Runtime,
+}
+
+fn metrics_to_dict<'py>(py: Python<'py>, metrics: &RuntimeMetrics) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new_bound(py);
+    out.set_item(
+        "delivered_batches_total",
+        metrics.delivered_batches_total.get(),
+    )?;
+    out.set_item(
+        "delivered_samples_total",
+        metrics.delivered_samples_total.get(),
+    )?;
+    out.set_item("inflight_bytes", metrics.inflight_bytes.get())?;
+    out.set_item(
+        "ram_high_water_bytes",
+        metrics.inflight_bytes_high_water.get(),
+    )?;
+    Ok(out)
 }
 
 #[pymethods]
@@ -129,6 +148,7 @@ impl DataLoader {
             prefetch_batches,
         };
         let pipeline = Pipeline::new(caps);
+        let metrics = pipeline.metrics();
 
         let (rx, task) = rt
             .block_on(async move {
@@ -151,6 +171,7 @@ impl DataLoader {
         Ok(Self {
             dataset_base,
             manifest_hash: snapshot.manifest_hash.0,
+            metrics,
             rx,
             task: Some(task),
             rt,
@@ -160,6 +181,10 @@ impl DataLoader {
     #[getter]
     fn manifest_hash(&self) -> &str {
         &self.manifest_hash
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(metrics_to_dict(py, self.metrics.as_ref())?.into_any())
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -254,6 +279,10 @@ impl ImageFolderLoader {
             Some(v) => Ok(PyList::new_bound(py, v).into_any()),
             None => Ok(py.None().into_bound(py).into_any()),
         }
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.loader.stats(py)
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -956,6 +985,7 @@ struct DistributedDataLoader {
     manifest_hash: String,
     assigned_rank: u32,
     world_size: u32,
+    metrics: Arc<RuntimeMetrics>,
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     heartbeat_task: Option<tokio::task::JoinHandle<()>>,
@@ -1057,6 +1087,7 @@ impl DistributedDataLoader {
             prefetch_batches,
         };
         let pipeline = Arc::new(Pipeline::new(caps));
+        let metrics = pipeline.metrics();
 
         let heartbeat_task = {
             let interval = Duration::from_millis(std::cmp::max(1, heartbeat_interval_ms) as u64);
@@ -1134,6 +1165,7 @@ impl DistributedDataLoader {
             manifest_hash,
             assigned_rank,
             world_size,
+            metrics,
             rx,
             task: Some(task),
             heartbeat_task,
@@ -1154,6 +1186,10 @@ impl DistributedDataLoader {
     #[getter]
     fn world_size(&self) -> u32 {
         self.world_size
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(metrics_to_dict(py, self.metrics.as_ref())?.into_any())
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

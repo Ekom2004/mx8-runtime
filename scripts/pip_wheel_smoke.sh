@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-WHEEL="$(ls -1 dist/mx8-*.whl 2>/dev/null | head -n 1 || true)"
+WHEEL="$(ls -1t dist/mx8-*.whl 2>/dev/null | head -n 1 || true)"
 if [[ -z "${WHEEL}" ]]; then
   echo "[mx8] no wheel found (expected dist/mx8-*.whl); run ./scripts/build_wheel.sh first" >&2
   exit 1
@@ -66,7 +66,9 @@ loader = mx8.vision.ImageFolderLoader(
     f"{out_dir}@refresh",
     manifest_store_root=store_root,
     batch_size_samples=2,
-    prefetch_batches=2,
+    max_inflight_bytes=64 * 1024,
+    max_queue_batches=4,
+    prefetch_batches=4,
     to_float=True,
 )
 
@@ -76,6 +78,8 @@ assert classes == ["cat", "dog"], classes
 images, labels = next(iter(loader))
 assert images.shape[0] == 2
 assert labels.shape[0] == 2
+
+stats = loader.stats()
+assert stats["ram_high_water_bytes"] <= 64 * 1024, stats
 print("[mx8] pip_wheel_smoke OK")
 PY
-
