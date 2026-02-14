@@ -58,6 +58,11 @@ if [[ "${MX8_SMOKE_MINIO_MANIFEST_STORE:-0}" == "1" ]]; then
   ./scripts/minio_manifest_store_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT:-0}" == "1" ]]; then
+  echo "[mx8] minio_s3_prefix_snapshot_gate (LIST S3 prefix -> pinned snapshot)"
+  ./scripts/minio_s3_prefix_snapshot_gate.sh
+fi
+
 if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
   echo "[mx8] soak_demo2_minio_scale (soak gate: repeated node failures)"
   ./scripts/soak_demo2_minio_scale.sh
