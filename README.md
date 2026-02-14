@@ -2,6 +2,10 @@
 
 MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus a tiny per-job coordinator/agent layer for multi-node correctness and pacing.
 
+## Install (PyPI)
+
+- `pip install mx8 pillow numpy torch`
+
 ## Bounded memory (v0)
 
 MX8 is designed to be *hard-capped* by config (backpressure via inflight permits).

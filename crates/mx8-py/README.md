@@ -1,6 +1,8 @@
 # mx8 (Python)
 
-This is the Python package for MX8 (built with PyO3 + maturin).
+MX8 is a bounded-memory data runtime exposed to Python (built with PyO3 + maturin).
+
+The v0 focus is “don’t OOM”: MX8 enforces backpressure with hard caps (so prefetch can’t runaway).
 
 ## Install (from wheel)
 
@@ -8,6 +10,11 @@ Once you have a wheel (from CI or local build):
 
 - `python -m venv .venv && . .venv/bin/activate`
 - `pip install mx8-*.whl`
+
+## Install (from PyPI)
+
+- `python -m venv .venv && . .venv/bin/activate`
+- `pip install mx8 pillow numpy torch`
 
 ## Quickstart (local, no S3)
 
@@ -32,9 +39,34 @@ loader = mx8.vision.ImageFolderLoader(
 print(loader.classes)  # ["cat", "dog", ...] if labels.tsv exists
 
 for images, labels in loader:
-    # Bounded-memory runtime stats (high-water is capped by max_inflight_bytes).
-    # stats = loader.stats()
     pass
+```
+
+## Bounded memory (v0)
+
+Set a hard cap and periodically print high-water marks:
+
+```python
+import mx8
+
+loader = mx8.vision.ImageFolderLoader(
+    "/path/to/mx8-dataset@refresh",
+    batch_size_samples=64,
+    max_inflight_bytes=256 * 1024 * 1024,
+    max_queue_batches=8,
+    prefetch_batches=4,
+)
+
+for step, (images, labels) in enumerate(loader):
+    if step % 100 == 0:
+        print(loader.stats())  # includes ram_high_water_bytes
+```
+
+Avoid patterns that intentionally accumulate batches:
+
+```python
+# ❌ Don't do this (will grow RSS regardless of any loader)
+all_batches = list(loader)
 ```
 
 ## Labels (optional)
