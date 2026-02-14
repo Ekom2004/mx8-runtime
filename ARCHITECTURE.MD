@@ -60,8 +60,10 @@ Everything is a global sample ID space. Files/objects are implementation detail.
   - decode hints (optional; may include lightweight semantics like ImageFolder label IDs)
 
 Vision v0 convention (optional):
-- `decode_hint="mx8:vision:imagefolder;label_id=<n>;label=<...>"` enables classification-style training loops to
-  consume `label_id` without separate sidecar metadata.
+- `decode_hint="mx8:vision:imagefolder;label_id=<n>"` enables classification-style training loops to consume
+  `label_id` without per-sample label strings.
+- When packing many small objects into `_mx8/manifest.tsv`, also write `_mx8/labels.tsv` once per dataset
+  (`label_id<TAB>label`, percent-encoded) so users can map IDs back to strings.
 
 v0 manifest format: **Parquet**, with a **canonical hashing rule** for `manifest_hash` (hash the canonical record stream + schema version; do not rely on raw file bytes).
 

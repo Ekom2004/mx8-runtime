@@ -170,12 +170,18 @@ This section exists to prevent “milestone drift” where crates/features are b
 
 5.1) **Vision metadata (optional, v0)**
    - When indexing an S3 prefix that matches ImageFolder layout (`prefix/<label>/<file>`), attach
-     `decode_hint="mx8:vision:imagefolder;label_id=<n>;..."` with a deterministic `label_id` mapping.
+     `decode_hint="mx8:vision:imagefolder;label_id=<n>"` with a deterministic `label_id` mapping.
+   - **Mixed layouts:** if the prefix contains a mix of labeled (`prefix/<label>/<file>`) and unlabeled
+     keys, `MX8_S3_LABEL_MODE=auto` disables labels (set `MX8_S3_LABEL_MODE=imagefolder` to require).
+   - **Huge class counts:** avoid storing label strings per-sample. Use `label_id` at the record level,
+     and (when packing) write a sidecar `labels.tsv` once per dataset.
    - **Success:** Python can train classification loops without a separate label sidecar file.
 
 5.2) **Packing (optional, v0)**
    - Add a packer that converts many small S3 objects into tar shards plus a canonical byte-range manifest at
      `prefix/_mx8/manifest.tsv`, so snapshot resolution can avoid large LIST operations.
+   - When ImageFolder labels are enabled, write a sidecar label map at `prefix/_mx8/labels.tsv`:
+     `label_id<TAB>label` (percent-encoded label string).
    - **Success:** “point to packed prefix” has predictable startup and high throughput.
 
 6) **Coordinator integration**

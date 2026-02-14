@@ -127,17 +127,6 @@ MX8_MINIO_BUCKET="${BUCKET}" MX8_MINIO_KEY="${RAW_PREFIX}cat/cat1.jpg" MX8_SEED_
 MX8_MINIO_BUCKET="${BUCKET}" MX8_MINIO_KEY="${RAW_PREFIX}dog/dog0.jpg" MX8_SEED_FILE="${IMG_DIR}/dog0.jpg" target/debug/mx8-seed-s3 >/dev/null
 MX8_MINIO_BUCKET="${BUCKET}" MX8_MINIO_KEY="${RAW_PREFIX}dog/dog1.jpg" MX8_SEED_FILE="${IMG_DIR}/dog1.jpg" target/debug/mx8-seed-s3 >/dev/null
 
-echo "[mx8] packing raw prefix -> tar shards"
-cargo build -p mx8-snapshot --features s3 --bin mx8-pack-s3 >/dev/null
-MX8_PACK_IN="s3://${BUCKET}/${RAW_PREFIX}" \
-MX8_PACK_OUT="s3://${BUCKET}/${OUT_PREFIX}" \
-MX8_PACK_SHARD_MB=1 \
-MX8_PACK_REQUIRE_LABELS=true \
-target/debug/mx8-pack-s3 >/dev/null
-
-echo "[mx8] install torch"
-"${PYTHON_BIN}" -m pip install -U torch >/dev/null
-
 echo "[mx8] maturin develop"
 (
   export VIRTUAL_ENV="${VENV_DIR}"
@@ -145,6 +134,29 @@ echo "[mx8] maturin develop"
   unset CONDA_PREFIX
   "${PYTHON_BIN}" -m maturin develop --pip-path "${VENV_DIR}/bin/pip" --manifest-path crates/mx8-py/Cargo.toml >/dev/null
 )
+
+echo "[mx8] python: mx8.pack raw prefix -> tar shards"
+MX8_PACK_IN="s3://${BUCKET}/${RAW_PREFIX}" \
+MX8_PACK_OUT="s3://${BUCKET}/${OUT_PREFIX}" \
+MX8_PACK_SHARD_MB=1 \
+MX8_PACK_REQUIRE_LABELS=true \
+"${PYTHON_BIN}" - <<'PY' >/dev/null
+import os
+import mx8
+
+res = mx8.pack(
+    os.environ["MX8_PACK_IN"],
+    out=os.environ["MX8_PACK_OUT"],
+    shard_mb=int(os.environ["MX8_PACK_SHARD_MB"]),
+    label_mode="imagefolder",
+    require_labels=(os.environ["MX8_PACK_REQUIRE_LABELS"].lower() == "true"),
+)
+if int(res["samples"]) != 4:
+    raise SystemExit(f"unexpected pack samples: {res}")
+PY
+
+echo "[mx8] install torch"
+"${PYTHON_BIN}" -m pip install -U torch >/dev/null
 
 echo "[mx8] running minimal Pillow vision train"
 MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
