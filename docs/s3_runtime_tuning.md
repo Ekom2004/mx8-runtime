@@ -2,6 +2,8 @@
 
 This page covers practical tuning for throughput, memory caps, and S3 throttling behavior.
 
+See also: `docs/memory_contract.md` for the explicit v0/v1 memory guarantee model.
+
 ## What MX8 already does
 
 - Hard memory/backpressure caps via:

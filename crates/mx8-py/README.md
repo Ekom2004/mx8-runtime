@@ -9,6 +9,7 @@ Further docs:
 - Python API: `../../docs/python_api.md`
 - Vision labels/layout: `../../docs/vision_labels.md`
 - S3/runtime tuning: `../../docs/s3_runtime_tuning.md`
+- Memory contract: `../../docs/memory_contract.md`
 - Troubleshooting: `../../docs/troubleshooting.md`
 
 ## Install (from wheel)

@@ -11,6 +11,7 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 - Python API: `docs/python_api.md`
 - Vision labels/layouts: `docs/vision_labels.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
+- Memory contract: `docs/memory_contract.md`
 - Troubleshooting: `docs/troubleshooting.md`
 
 ## Bounded memory (v0)
