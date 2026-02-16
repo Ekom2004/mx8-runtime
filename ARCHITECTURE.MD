@@ -65,7 +65,7 @@ Vision v0 convention (optional):
 - When packing many small objects into `_mx8/manifest.tsv`, also write `_mx8/labels.tsv` once per dataset
   (`label_id<TAB>label`, percent-encoded) so users can map IDs back to strings.
 
-v0 manifest format: **Parquet**, with a **canonical hashing rule** for `manifest_hash` (hash the canonical record stream + schema version; do not rely on raw file bytes).
+v0 manifest format: **canonical TSV** (`_mx8/manifest.tsv` for packed datasets), with a **canonical hashing rule** for `manifest_hash` (hash the canonical record stream + schema version; do not rely on raw file bytes).
 
 ### WorkRange (unit of assignment)
 Contiguous physical ID interval in pinned sample-ID space:
@@ -242,7 +242,7 @@ Date: 2026-02-12
 - Determinism: failure-free determinism is defined for a pinned snapshot and frozen membership.
 
 ### Manifest format
-- v0 manifest format: Parquet.
+- v0 manifest format: canonical TSV (`_mx8/manifest.tsv` for packed datasets).
 - `manifest_hash` must be computed via a canonical hashing rule over records + schema version (not raw file bytes).
 
 ### Auto-index scope

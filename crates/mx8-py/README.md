@@ -4,6 +4,13 @@ MX8 is a bounded-memory data runtime exposed to Python (built with PyO3 + maturi
 
 The v0 focus is “don’t OOM”: MX8 enforces backpressure with hard caps (so prefetch can’t runaway).
 
+Further docs:
+
+- Python API: `../../docs/python_api.md`
+- Vision labels/layout: `../../docs/vision_labels.md`
+- S3/runtime tuning: `../../docs/s3_runtime_tuning.md`
+- Troubleshooting: `../../docs/troubleshooting.md`
+
 ## Install (from wheel)
 
 Once you have a wheel (from CI or local build):
@@ -14,7 +21,8 @@ Once you have a wheel (from CI or local build):
 ## Install (from PyPI)
 
 - `python -m venv .venv && . .venv/bin/activate`
-- `pip install mx8 pillow numpy torch`
+- `pip install mx8`
+- Optional vision/training deps: `pip install pillow numpy torch`
 
 ## Quickstart (local, no S3)
 

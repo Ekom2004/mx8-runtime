@@ -6,9 +6,18 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 
 - `pip install mx8 pillow numpy torch`
 
+## Documentation
+
+- Python API: `docs/python_api.md`
+- Vision labels/layouts: `docs/vision_labels.md`
+- S3/runtime tuning: `docs/s3_runtime_tuning.md`
+- Troubleshooting: `docs/troubleshooting.md`
+
 ## Bounded memory (v0)
 
 MX8 is designed to be *hard-capped* by config (backpressure via inflight permits).
+
+Note: v0 hard cap is loader-path memory (`max_inflight_bytes`). Total process RAM also includes model/framework/user allocations.
 
 ```python
 import mx8
