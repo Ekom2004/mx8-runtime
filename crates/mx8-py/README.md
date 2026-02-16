@@ -10,6 +10,8 @@ Further docs:
 - Vision labels/layout: `../../docs/vision_labels.md`
 - S3/runtime tuning: `../../docs/s3_runtime_tuning.md`
 - Memory contract: `../../docs/memory_contract.md`
+- AI agent guide: `../../docs/ai_agent_guide.md`
+- AI agent context (JSON): `../../docs/ai_agent_context.json`
 - Troubleshooting: `../../docs/troubleshooting.md`
 
 ## Install (from wheel)
