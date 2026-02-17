@@ -13,6 +13,7 @@ bench = false
 
 [dependencies]
 anyhow.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 mx8-core = { path = "../mx8-core" }
 mx8-manifest-store = { path = "../mx8-manifest-store" }
 mx8-proto = { path = "../mx8-proto" }

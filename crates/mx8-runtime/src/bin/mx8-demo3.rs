@@ -342,6 +342,8 @@ async fn main() -> Result<()> {
         max_queue_batches: args.max_queue_batches,
         batch_size_samples: args.batch_size_samples,
         prefetch_batches: 1,
+        target_batch_bytes: None,
+        max_batch_bytes: None,
     };
 
     let (s1, b1, hw1, ms1) = run_once(&manifest_bytes, base_caps).await?;

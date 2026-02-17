@@ -150,6 +150,8 @@ async fn main() -> Result<()> {
             max_queue_batches: args.max_queue_batches,
             batch_size_samples: args.batch_size_samples,
             prefetch_batches: args.prefetch_batches,
+            target_batch_bytes: None,
+            max_batch_bytes: None,
         };
 
         let pipeline = Pipeline::new(caps);

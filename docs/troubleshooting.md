@@ -52,8 +52,27 @@ Fix:
 - verify published versions: `python -m pip index versions mx8`
 - install an available version (or publish the missing tag)
 
+## Vision decode regression debugging
+
+If you want to compare decode backends or validate Rust decode behavior:
+
+- `MX8_DECODE_BACKEND=rust ...`
+
+Default is Python decode in v0.
+
 ## `Killed: 9` in `demo2_minio.sh` logs
 
 In recovery gates, the script intentionally kills one agent process to verify lease expiry + requeue behavior.
 
 This line is expected when the gate is configured to test recovery.
+
+## `byte-aware batching requires byte_length ...`
+
+Symptom:
+
+- loader fails when `target_batch_bytes` or `max_batch_bytes` is set
+
+Fix:
+
+- ensure manifest rows include both `byte_offset` and `byte_length`
+- if manifest has full-object rows (`None/None`), disable byte-aware batching or repack/index so lengths are explicit

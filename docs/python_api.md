@@ -1,4 +1,4 @@
-# MX8 Python API (v0)
+i mean# MX8 Python API (v0)
 
 This page documents the API that ships today in `mx8==0.x`.
 
@@ -85,6 +85,11 @@ print(loader.classes)  # ["cat", "dog", ...] or None
 for images, labels in loader:
     pass
 ```
+
+Decode backend behavior:
+
+- default: Python/Pillow decode path
+- optional Rust path for benchmarking/optimization: set `MX8_DECODE_BACKEND=rust`
 
 ## Distributed loader (DDP/local multi-rank)
 

@@ -41,6 +41,8 @@ async fn slow_sink_enforces_inflight_ram_cap() {
         max_queue_batches: 8,
         batch_size_samples: 16,
         prefetch_batches: 1,
+        target_batch_bytes: None,
+        max_batch_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();

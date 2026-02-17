@@ -229,6 +229,8 @@ async fn prefetch_preserves_delivery_order() -> Result<()> {
         max_queue_batches: 16,
         batch_size_samples,
         prefetch_batches: 8,
+        target_batch_bytes: None,
+        max_batch_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();

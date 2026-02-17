@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,6 +22,22 @@ impl SlowSink {
             delivered_samples: AtomicU64::new(0),
             delivered_bytes: AtomicU64::new(0),
         }
+    }
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    batch_bytes: Mutex<Vec<usize>>,
+    delivered_samples: AtomicU64,
+}
+
+impl Sink for RecordingSink {
+    fn deliver(&self, batch: Batch) -> Result<()> {
+        self.delivered_samples
+            .fetch_add(batch.sample_count() as u64, Ordering::Relaxed);
+        let mut guard = self.batch_bytes.lock().expect("batch_bytes mutex poisoned");
+        guard.push(batch.payload_len());
+        Ok(())
     }
 }
 
@@ -69,6 +86,8 @@ async fn manifest_pipeline_reads_files_and_is_bounded() -> Result<()> {
         max_queue_batches: 8,
         batch_size_samples: 2,
         prefetch_batches: 1,
+        target_batch_bytes: None,
+        max_batch_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();
@@ -118,6 +137,8 @@ async fn manifest_pipeline_can_run_subset_range() -> Result<()> {
         max_queue_batches: 4,
         batch_size_samples: 8,
         prefetch_batches: 1,
+        target_batch_bytes: None,
+        max_batch_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
 
@@ -128,5 +149,75 @@ async fn manifest_pipeline_can_run_subset_range() -> Result<()> {
 
     assert_eq!(sink.delivered_samples.load(Ordering::Relaxed), 2);
     assert_eq!(sink.delivered_bytes.load(Ordering::Relaxed), 200 + 300);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_pipeline_bytes_aware_batches_are_bounded() -> Result<()> {
+    let root = temp_dir("manifest-pipeline-bytes-aware")?;
+    let f0 = root.join("data.bin");
+    std::fs::write(&f0, vec![7u8; 1400])?;
+
+    let manifest = format!(
+        "schema_version=0\n\
+0\t{}\t0\t600\tx\n\
+1\t{}\t600\t600\tx\n\
+2\t{}\t1200\t200\tx\n",
+        f0.display(),
+        f0.display(),
+        f0.display()
+    );
+
+    let caps = RuntimeCaps {
+        max_inflight_bytes: 8 * 1024,
+        max_queue_batches: 8,
+        batch_size_samples: 32,
+        prefetch_batches: 1,
+        target_batch_bytes: Some(700),
+        max_batch_bytes: Some(1024),
+    };
+    let pipeline = Pipeline::new(caps);
+    let sink = Arc::new(RecordingSink::default());
+    pipeline
+        .run_manifest_bytes(sink.clone(), manifest.as_bytes())
+        .await?;
+
+    assert_eq!(sink.delivered_samples.load(Ordering::Relaxed), 3);
+    let got = sink.batch_bytes.lock().expect("batch_bytes mutex poisoned");
+    assert_eq!(&*got, &[600usize, 800usize]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_pipeline_bytes_aware_requires_byte_lengths() -> Result<()> {
+    let root = temp_dir("manifest-pipeline-bytes-aware-missing-size")?;
+    let f0 = root.join("data.bin");
+    std::fs::write(&f0, vec![1u8; 512])?;
+    let manifest = format!(
+        "schema_version=0\n\
+0\t{}\t\t\t\n",
+        f0.display()
+    );
+
+    let caps = RuntimeCaps {
+        max_inflight_bytes: 8 * 1024,
+        max_queue_batches: 8,
+        batch_size_samples: 32,
+        prefetch_batches: 1,
+        target_batch_bytes: Some(256),
+        max_batch_bytes: Some(1024),
+    };
+    let pipeline = Pipeline::new(caps);
+    let sink = Arc::new(SlowSink::new(Duration::from_millis(1)));
+    let err = pipeline
+        .run_manifest_bytes(sink, manifest.as_bytes())
+        .await
+        .expect_err("expected byte-aware mode to require explicit byte_length");
+
+    assert!(
+        err.to_string()
+            .contains("byte-aware batching requires byte_length"),
+        "unexpected error: {err}"
+    );
     Ok(())
 }

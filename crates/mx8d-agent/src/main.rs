@@ -71,6 +71,12 @@ struct Args {
     #[arg(long, env = "MX8_MAX_INFLIGHT_BYTES", default_value_t = 128 * 1024 * 1024)]
     max_inflight_bytes: u64,
 
+    #[arg(long, env = "MX8_TARGET_BATCH_BYTES")]
+    target_batch_bytes: Option<u64>,
+
+    #[arg(long, env = "MX8_MAX_BATCH_BYTES")]
+    max_batch_bytes: Option<u64>,
+
     /// Artificially slow down delivery to prove backpressure + cursor semantics.
     #[arg(long, env = "MX8_SINK_SLEEP_MS", default_value_t = 0)]
     sink_sleep_ms: u64,
@@ -547,6 +553,8 @@ async fn main() -> Result<()> {
                     max_queue_batches: args_clone.max_queue_batches,
                     batch_size_samples: args_clone.batch_size_samples,
                     prefetch_batches: args_clone.prefetch_batches,
+                    target_batch_bytes: args_clone.target_batch_bytes,
+                    max_batch_bytes: args_clone.max_batch_bytes,
                 };
                 let pipeline = Arc::new(Pipeline::new(caps));
 

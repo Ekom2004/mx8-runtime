@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use image::imageops::FilterType;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyTuple};
@@ -39,11 +40,18 @@ type TorchBatch4<'py> = (
     Bound<'py, PyAny>,
 );
 
+#[derive(Debug, Clone, Copy)]
+enum DecodeBackend {
+    Rust,
+    Python,
+}
+
 #[pyclass]
 struct ImageFolderLoader {
     loader: DataLoader,
     resize_hw: Option<(u32, u32)>,
     to_float: bool,
+    decode_backend: DecodeBackend,
     classes: Option<Vec<String>>,
 }
 
@@ -75,6 +83,121 @@ fn metrics_to_dict<'py>(py: Python<'py>, metrics: &RuntimeMetrics) -> PyResult<B
     Ok(out)
 }
 
+fn decode_backend_from_env() -> PyResult<DecodeBackend> {
+    let raw = std::env::var("MX8_DECODE_BACKEND").unwrap_or_else(|_| "python".to_string());
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "python" => Ok(DecodeBackend::Python),
+        "rust" => Ok(DecodeBackend::Rust),
+        _ => Err(PyValueError::new_err(format!(
+            "invalid MX8_DECODE_BACKEND={raw:?} (expected: python|rust)"
+        ))),
+    }
+}
+
+fn labels_to_torch_i64<'py>(py: Python<'py>, labels: &[u64]) -> PyResult<Bound<'py, PyAny>> {
+    let torch = py.import_bound("torch").map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "failed to import torch (install PyTorch to use ImageFolderLoader): {e}"
+        ))
+    })?;
+    let torch_int64 = torch.getattr("int64")?;
+    let mut labels_i64 = Vec::with_capacity(labels.len());
+    for &lab in labels {
+        labels_i64.push(i64::try_from(lab).map_err(|_| {
+            PyValueError::new_err(format!(
+                "label_id overflow converting u64 -> i64 (label_id={lab})"
+            ))
+        })?);
+    }
+    let labels_list = PyList::new_bound(py, labels_i64);
+    let kwargs = PyDict::new_bound(py);
+    kwargs.set_item("dtype", &torch_int64)?;
+    torch.call_method("tensor", (labels_list,), Some(&kwargs))
+}
+
+fn decode_images_nchw_u8(
+    lease: &BatchLease,
+    resize_hw: Option<(u32, u32)>,
+) -> PyResult<(Vec<u8>, usize, usize)> {
+    let mut first_h: Option<usize> = None;
+    let mut first_w: Option<usize> = None;
+    let mut out = Vec::<u8>::new();
+
+    for i in 0..lease.batch.sample_count() {
+        let start = lease.batch.offsets[i] as usize;
+        let end = lease.batch.offsets[i + 1] as usize;
+        if end < start || end > lease.batch.payload.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "bad offsets for sample_id {} (start={} end={} payload_len={})",
+                lease.batch.sample_ids[i],
+                start,
+                end,
+                lease.batch.payload.len()
+            )));
+        }
+
+        let bytes = &lease.batch.payload[start..end];
+        let decoded = image::load_from_memory(bytes).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "decode failed for sample_id {}: {e}",
+                lease.batch.sample_ids[i]
+            ))
+        })?;
+        let rgb = decoded.to_rgb8();
+        let rgb = if let Some((h, w)) = resize_hw {
+            image::imageops::resize(&rgb, w, h, FilterType::Triangle)
+        } else {
+            rgb
+        };
+
+        let h = usize::try_from(rgb.height())
+            .map_err(|_| PyRuntimeError::new_err("image height does not fit usize"))?;
+        let w = usize::try_from(rgb.width())
+            .map_err(|_| PyRuntimeError::new_err("image width does not fit usize"))?;
+
+        match (first_h, first_w) {
+            (None, None) => {
+                first_h = Some(h);
+                first_w = Some(w);
+                let b = lease.batch.sample_count();
+                let cap = b
+                    .checked_mul(3)
+                    .and_then(|v| v.checked_mul(h))
+                    .and_then(|v| v.checked_mul(w))
+                    .ok_or_else(|| PyRuntimeError::new_err("decoded batch size overflow"))?;
+                out.reserve(cap);
+            }
+            (Some(h0), Some(w0)) if h0 == h && w0 == w => {}
+            (Some(h0), Some(w0)) => {
+                return Err(PyValueError::new_err(format!(
+                    "decoded image shape mismatch in batch (sample_id={} got={}x{}, expected={}x{}); set resize_hw for variable-size inputs",
+                    lease.batch.sample_ids[i], h, w, h0, w0
+                )));
+            }
+            _ => {}
+        }
+
+        let raw = rgb.into_raw();
+        let pixel_count = h
+            .checked_mul(w)
+            .ok_or_else(|| PyRuntimeError::new_err("pixel count overflow"))?;
+        for c in 0..3usize {
+            for p in 0..pixel_count {
+                let idx = p
+                    .checked_mul(3)
+                    .and_then(|v| v.checked_add(c))
+                    .ok_or_else(|| PyRuntimeError::new_err("decoded buffer index overflow"))?;
+                out.push(raw[idx]);
+            }
+        }
+    }
+
+    let h = first_h.ok_or_else(|| PyRuntimeError::new_err("empty image batch"))?;
+    let w = first_w.ok_or_else(|| PyRuntimeError::new_err("empty image batch"))?;
+    Ok((out, h, w))
+}
+
 #[pymethods]
 impl DataLoader {
     #[new]
@@ -87,6 +210,8 @@ impl DataLoader {
         max_inflight_bytes=128*1024*1024,
         max_queue_batches=64,
         prefetch_batches=1,
+        target_batch_bytes=None,
+        max_batch_bytes=None,
         start_id=None,
         end_id=None,
         node_id=None,
@@ -100,6 +225,8 @@ impl DataLoader {
         max_inflight_bytes: u64,
         max_queue_batches: usize,
         prefetch_batches: usize,
+        target_batch_bytes: Option<u64>,
+        max_batch_bytes: Option<u64>,
         start_id: Option<u64>,
         end_id: Option<u64>,
         node_id: Option<String>,
@@ -146,6 +273,8 @@ impl DataLoader {
             max_queue_batches,
             batch_size_samples,
             prefetch_batches,
+            target_batch_bytes,
+            max_batch_bytes,
         };
         let pipeline = Pipeline::new(caps);
         let metrics = pipeline.metrics();
@@ -215,101 +344,12 @@ impl DataLoader {
     }
 }
 
-#[pymethods]
 impl ImageFolderLoader {
-    #[new]
-    #[pyo3(signature = (
-        dataset_link,
-        *,
-        manifest_store_root=None,
-        dev_manifest_path=None,
-        batch_size_samples=32,
-        max_inflight_bytes=128*1024*1024,
-        max_queue_batches=64,
-        prefetch_batches=1,
-        start_id=None,
-        end_id=None,
-        node_id=None,
-        resize_hw=None,
-        to_float=true,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        dataset_link: String,
-        manifest_store_root: Option<PathBuf>,
-        dev_manifest_path: Option<PathBuf>,
-        batch_size_samples: usize,
-        max_inflight_bytes: u64,
-        max_queue_batches: usize,
-        prefetch_batches: usize,
-        start_id: Option<u64>,
-        end_id: Option<u64>,
-        node_id: Option<String>,
-        resize_hw: Option<(u32, u32)>,
-        to_float: bool,
-    ) -> PyResult<Self> {
-        let loader = DataLoader::new(
-            dataset_link,
-            manifest_store_root,
-            dev_manifest_path,
-            batch_size_samples,
-            max_inflight_bytes,
-            max_queue_batches,
-            prefetch_batches,
-            start_id,
-            end_id,
-            node_id,
-        )?;
-        let base = loader.dataset_base.clone();
-        let classes = loader
-            .rt
-            .block_on(async { load_labels_for_base(&base).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
-        Ok(Self {
-            loader,
-            resize_hw,
-            to_float,
-            classes,
-        })
-    }
-
-    #[getter]
-    fn classes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        match &self.classes {
-            Some(v) => Ok(PyList::new_bound(py, v).into_any()),
-            None => Ok(py.None().into_bound(py).into_any()),
-        }
-    }
-
-    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.loader.stats(py)
-    }
-
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let lease = py.allow_threads(|| {
-            self.loader
-                .rt
-                .block_on(async { self.loader.rx.recv().await })
-        });
-
-        let Some(lease) = lease else {
-            let Some(task) = self.loader.task.take() else {
-                return Err(PyStopIteration::new_err(()));
-            };
-            let out = py.allow_threads(|| self.loader.rt.block_on(task));
-            return match out {
-                Ok(Ok(())) => Err(PyStopIteration::new_err(())),
-                Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
-                Err(err) => Err(PyRuntimeError::new_err(format!(
-                    "producer task failed: {err}"
-                ))),
-            };
-        };
-
+    fn next_python_decode<'py>(
+        &self,
+        py: Python<'py>,
+        lease: BatchLease,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let labels = lease.batch.label_ids.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "batch has no label_ids (expected mx8:vision:imagefolder label hints in manifest)",
@@ -358,7 +398,6 @@ impl ImageFolderLoader {
                 .call1((bio,))?
                 .call_method1("convert", ("RGB",))?;
             if let Some((h, w)) = self.resize_hw {
-                // PIL expects size=(width,height)
                 img = img.call_method1("resize", ((w, h),))?;
             }
 
@@ -381,23 +420,167 @@ impl ImageFolderLoader {
 
         let xs_list = PyList::new_bound(py, xs);
         let images = torch.getattr("stack")?.call1((xs_list, 0i64))?;
-
-        let torch_int64 = torch.getattr("int64")?;
-        let mut labels_i64 = Vec::with_capacity(labels.len());
-        for &lab in labels.iter() {
-            labels_i64.push(i64::try_from(lab).map_err(|_| {
-                PyValueError::new_err(format!(
-                    "label_id overflow converting u64 -> i64 (label_id={lab})"
-                ))
-            })?);
-        }
-        let labels_list = PyList::new_bound(py, labels_i64);
-        let kwargs = PyDict::new_bound(py);
-        kwargs.set_item("dtype", &torch_int64)?;
-        let labels = torch.call_method("tensor", (labels_list,), Some(&kwargs))?;
-
+        let labels = labels_to_torch_i64(py, labels)?;
         let out = PyTuple::new_bound(py, [images.to_object(py), labels.to_object(py)]);
         Ok(out.into_any())
+    }
+
+    fn next_rust_decode<'py>(
+        &self,
+        py: Python<'py>,
+        lease: BatchLease,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let labels = lease.batch.label_ids.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "batch has no label_ids (expected mx8:vision:imagefolder label hints in manifest)",
+            )
+        })?;
+
+        let (decoded_nchw_u8, h, w) =
+            py.allow_threads(|| decode_images_nchw_u8(&lease, self.resize_hw))?;
+
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use ImageFolderLoader): {e}"
+            ))
+        })?;
+        let torch_uint8 = torch.getattr("uint8")?;
+
+        let payload = PyByteArray::new_bound(py, &decoded_nchw_u8);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_uint8)?;
+        let images = torch.call_method("frombuffer", (payload,), Some(&kwargs))?;
+
+        let b_i64 = i64::try_from(lease.batch.sample_count())
+            .map_err(|_| PyValueError::new_err("batch size does not fit i64"))?;
+        let h_i64 =
+            i64::try_from(h).map_err(|_| PyValueError::new_err("height does not fit i64"))?;
+        let w_i64 =
+            i64::try_from(w).map_err(|_| PyValueError::new_err("width does not fit i64"))?;
+
+        let images = images
+            .call_method1("view", (b_i64, 3i64, h_i64, w_i64))?
+            .call_method0("contiguous")?;
+        let images = if self.to_float {
+            images
+                .call_method0("float")?
+                .call_method1("div", (255.0f32,))?
+        } else {
+            images
+        };
+
+        let labels = labels_to_torch_i64(py, labels)?;
+        let out = PyTuple::new_bound(py, [images.to_object(py), labels.to_object(py)]);
+        Ok(out.into_any())
+    }
+}
+
+#[pymethods]
+impl ImageFolderLoader {
+    #[new]
+    #[pyo3(signature = (
+        dataset_link,
+        *,
+        manifest_store_root=None,
+        dev_manifest_path=None,
+        batch_size_samples=32,
+        max_inflight_bytes=128*1024*1024,
+        max_queue_batches=64,
+        prefetch_batches=1,
+        target_batch_bytes=None,
+        max_batch_bytes=None,
+        start_id=None,
+        end_id=None,
+        node_id=None,
+        resize_hw=None,
+        to_float=true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        dataset_link: String,
+        manifest_store_root: Option<PathBuf>,
+        dev_manifest_path: Option<PathBuf>,
+        batch_size_samples: usize,
+        max_inflight_bytes: u64,
+        max_queue_batches: usize,
+        prefetch_batches: usize,
+        target_batch_bytes: Option<u64>,
+        max_batch_bytes: Option<u64>,
+        start_id: Option<u64>,
+        end_id: Option<u64>,
+        node_id: Option<String>,
+        resize_hw: Option<(u32, u32)>,
+        to_float: bool,
+    ) -> PyResult<Self> {
+        let loader = DataLoader::new(
+            dataset_link,
+            manifest_store_root,
+            dev_manifest_path,
+            batch_size_samples,
+            max_inflight_bytes,
+            max_queue_batches,
+            prefetch_batches,
+            target_batch_bytes,
+            max_batch_bytes,
+            start_id,
+            end_id,
+            node_id,
+        )?;
+        let base = loader.dataset_base.clone();
+        let classes = loader
+            .rt
+            .block_on(async { load_labels_for_base(&base).await })
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        Ok(Self {
+            loader,
+            resize_hw,
+            to_float,
+            decode_backend: decode_backend_from_env()?,
+            classes,
+        })
+    }
+
+    #[getter]
+    fn classes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.classes {
+            Some(v) => Ok(PyList::new_bound(py, v).into_any()),
+            None => Ok(py.None().into_bound(py).into_any()),
+        }
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.loader.stats(py)
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let lease = py.allow_threads(|| {
+            self.loader
+                .rt
+                .block_on(async { self.loader.rx.recv().await })
+        });
+
+        let Some(lease) = lease else {
+            let Some(task) = self.loader.task.take() else {
+                return Err(PyStopIteration::new_err(()));
+            };
+            let out = py.allow_threads(|| self.loader.rt.block_on(task));
+            return match out {
+                Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                Err(err) => Err(PyRuntimeError::new_err(format!(
+                    "producer task failed: {err}"
+                ))),
+            };
+        };
+
+        match self.decode_backend {
+            DecodeBackend::Rust => self.next_rust_decode(py, lease),
+            DecodeBackend::Python => self.next_python_decode(py, lease),
+        }
     }
 }
 
@@ -650,6 +833,8 @@ fn pack_dir<'py>(
     max_inflight_bytes=128*1024*1024,
     max_queue_batches=64,
     prefetch_batches=1,
+    target_batch_bytes=None,
+    max_batch_bytes=None,
     start_id=None,
     end_id=None,
     node_id=None,
@@ -664,6 +849,8 @@ fn load(
     max_inflight_bytes: u64,
     max_queue_batches: usize,
     prefetch_batches: usize,
+    target_batch_bytes: Option<u64>,
+    max_batch_bytes: Option<u64>,
     start_id: Option<u64>,
     end_id: Option<u64>,
     node_id: Option<String>,
@@ -676,6 +863,8 @@ fn load(
         max_inflight_bytes,
         max_queue_batches,
         prefetch_batches,
+        target_batch_bytes,
+        max_batch_bytes,
         start_id,
         end_id,
         node_id,
@@ -1004,6 +1193,8 @@ impl DistributedDataLoader {
         max_inflight_bytes=128*1024*1024,
         max_queue_batches=64,
         prefetch_batches=1,
+        target_batch_bytes=None,
+        max_batch_bytes=None,
         want=1,
         progress_interval_ms=500,
         grpc_max_message_bytes=DEFAULT_GRPC_MAX_MESSAGE_BYTES,
@@ -1017,6 +1208,8 @@ impl DistributedDataLoader {
         max_inflight_bytes: u64,
         max_queue_batches: usize,
         prefetch_batches: usize,
+        target_batch_bytes: Option<u64>,
+        max_batch_bytes: Option<u64>,
         want: u32,
         progress_interval_ms: u64,
         grpc_max_message_bytes: usize,
@@ -1085,6 +1278,8 @@ impl DistributedDataLoader {
             max_queue_batches,
             batch_size_samples,
             prefetch_batches,
+            target_batch_bytes,
+            max_batch_bytes,
         };
         let pipeline = Arc::new(Pipeline::new(caps));
         let metrics = pipeline.metrics();

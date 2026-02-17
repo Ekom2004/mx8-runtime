@@ -31,6 +31,8 @@ pub struct RuntimeCaps {
     pub max_queue_batches: usize,
     pub batch_size_samples: usize,
     pub prefetch_batches: usize,
+    pub target_batch_bytes: Option<u64>,
+    pub max_batch_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -436,38 +438,37 @@ impl Pipeline {
         s3_client: Option<S3Client>,
         http_client: Option<HttpClient>,
     ) -> Result<()> {
+        let ranges = build_manifest_batch_ranges(&records, self.caps)?;
         let prefetch = std::cmp::max(1, self.caps.prefetch_batches);
         if prefetch <= 1 {
             let sender = tx;
-            let mut start = 0usize;
-            while start < records.len() {
-                let end = (start + self.caps.batch_size_samples).min(records.len());
+            for range in ranges {
                 let inflight = build_manifest_inflight_batch(
                     self.caps,
                     self.metrics.clone(),
                     self.inflight_sem.clone(),
-                    &records[start..end],
+                    &records[range.start..range.end],
                     s3_client.as_ref(),
                     http_client.as_ref(),
                 )
                 .await?;
                 sender.send(inflight).await?;
-                start = end;
             }
             return Ok(());
         }
 
         let records = Arc::new(records);
+        let ranges = Arc::new(ranges);
         let mut joinset = tokio::task::JoinSet::new();
         let mut buffer: std::collections::BTreeMap<usize, BatchLease> =
             std::collections::BTreeMap::new();
         let mut next_to_send: usize = 0;
         let mut next_batch_id: usize = 0;
-        let mut start = 0usize;
+        let mut next_range_id: usize = 0;
 
-        while start < records.len() || !joinset.is_empty() {
-            while start < records.len() && joinset.len() < prefetch {
-                let end = (start + self.caps.batch_size_samples).min(records.len());
+        while next_range_id < ranges.len() || !joinset.is_empty() {
+            while next_range_id < ranges.len() && joinset.len() < prefetch {
+                let range_id = next_range_id;
                 let batch_id = next_batch_id;
                 next_batch_id = next_batch_id.saturating_add(1);
 
@@ -475,15 +476,17 @@ impl Pipeline {
                 let metrics = self.metrics.clone();
                 let sem = self.inflight_sem.clone();
                 let records = records.clone();
+                let ranges = ranges.clone();
                 let s3_client = s3_client.clone();
                 let http_client = http_client.clone();
 
                 joinset.spawn(async move {
+                    let range = ranges[range_id];
                     let inflight = build_manifest_inflight_batch(
                         caps,
                         metrics,
                         sem,
-                        &records[start..end],
+                        &records[range.start..range.end],
                         s3_client.as_ref(),
                         http_client.as_ref(),
                     )
@@ -491,7 +494,7 @@ impl Pipeline {
                     (batch_id, inflight)
                 });
 
-                start = end;
+                next_range_id = next_range_id.saturating_add(1);
             }
 
             let Some(res) = joinset.join_next().await else {
@@ -583,6 +586,97 @@ impl Pipeline {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchRange {
+    start: usize,
+    end: usize,
+}
+
+fn sample_count_batch_ranges(total_samples: usize, batch_size_samples: usize) -> Vec<BatchRange> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let sample_cap = std::cmp::max(1, batch_size_samples);
+    while start < total_samples {
+        let end = (start + sample_cap).min(total_samples);
+        ranges.push(BatchRange { start, end });
+        start = end;
+    }
+    ranges
+}
+
+fn build_manifest_batch_ranges(
+    records: &[mx8_core::types::ManifestRecord],
+    caps: RuntimeCaps,
+) -> Result<Vec<BatchRange>> {
+    let sample_cap = std::cmp::max(1, caps.batch_size_samples);
+    let byte_mode_enabled = caps.target_batch_bytes.is_some() || caps.max_batch_bytes.is_some();
+    if !byte_mode_enabled || records.is_empty() {
+        return Ok(sample_count_batch_ranges(records.len(), sample_cap));
+    }
+
+    let max_batch_bytes = caps.max_batch_bytes.unwrap_or(caps.max_inflight_bytes);
+    anyhow::ensure!(max_batch_bytes > 0, "max_batch_bytes must be > 0");
+    anyhow::ensure!(
+        max_batch_bytes <= caps.max_inflight_bytes,
+        "max_batch_bytes {} exceeds max_inflight_bytes {}",
+        max_batch_bytes,
+        caps.max_inflight_bytes
+    );
+
+    let target_batch_bytes = caps
+        .target_batch_bytes
+        .unwrap_or(max_batch_bytes)
+        .min(max_batch_bytes)
+        .max(1);
+
+    let mut ranges: Vec<BatchRange> = Vec::new();
+    let mut start = 0usize;
+    let mut batch_bytes: u64 = 0;
+    let mut batch_samples: usize = 0;
+
+    for (idx, record) in records.iter().enumerate() {
+        let sample_bytes = record.byte_length.ok_or_else(|| {
+            anyhow::anyhow!(
+                "byte-aware batching requires byte_length for every sample (missing sample_id={})",
+                record.sample_id
+            )
+        })?;
+        anyhow::ensure!(
+            sample_bytes <= max_batch_bytes,
+            "sample {} has byte_length {} > max_batch_bytes {}",
+            record.sample_id,
+            sample_bytes,
+            max_batch_bytes
+        );
+
+        let would_exceed_max = batch_samples > 0
+            && batch_bytes
+                .checked_add(sample_bytes)
+                .map(|v| v > max_batch_bytes)
+                .unwrap_or(true);
+        if batch_samples >= sample_cap || batch_bytes >= target_batch_bytes || would_exceed_max {
+            ranges.push(BatchRange { start, end: idx });
+            start = idx;
+            batch_bytes = 0;
+            batch_samples = 0;
+        }
+
+        batch_bytes = batch_bytes
+            .checked_add(sample_bytes)
+            .ok_or_else(|| anyhow::anyhow!("batch byte accounting overflow"))?;
+        batch_samples = batch_samples.saturating_add(1);
+    }
+
+    if start < records.len() {
+        ranges.push(BatchRange {
+            start,
+            end: records.len(),
+        });
+    }
+
+    Ok(ranges)
 }
 
 #[derive(Debug, Clone)]

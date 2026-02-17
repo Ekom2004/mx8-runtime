@@ -54,6 +54,7 @@ for step, (images, labels) in enumerate(loader):
   - `MX8_SMOKE_DEMO2_MINIO_SCALE=1 MX8_SMOKE_MINIO_MANIFEST_STORE=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_MINIO_PACK=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_PY_VISION_PILLOW=1 ./scripts/smoke.sh` (heavier; installs torch+pillow in a temp venv)
+  - `MX8_SMOKE_PY_VISION_DECODE_BENCH=1 ./scripts/smoke.sh` (local rust-vs-python decode backend perf compare)
 - PyTorch DDP gates (local multi-process):
   - `MX8_SMOKE_TORCH_DDP=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_TORCH_DDP_NODUPES=1 ./scripts/smoke.sh`
