@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -33,6 +34,7 @@ pub struct RuntimeCaps {
     pub prefetch_batches: usize,
     pub target_batch_bytes: Option<u64>,
     pub max_batch_bytes: Option<u64>,
+    pub max_process_rss_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -41,16 +43,24 @@ pub struct RuntimeMetrics {
     pub delivered_samples_total: Counter,
     pub inflight_bytes: Gauge,
     pub inflight_bytes_high_water: Gauge,
+    pub process_rss_bytes: Gauge,
+    pub ram_high_water_bytes: Gauge,
 }
 
 impl RuntimeMetrics {
     fn on_inflight_add(&self, delta: u64) {
         let now = self.inflight_bytes.add(delta);
         self.inflight_bytes_high_water.max(now);
+        self.ram_high_water_bytes.max(now);
     }
 
     fn on_inflight_sub(&self, delta: u64) {
         self.inflight_bytes.sub(delta);
+    }
+
+    fn on_process_rss_sample(&self, rss: u64) {
+        self.process_rss_bytes.set(rss);
+        self.ram_high_water_bytes.max(rss);
     }
 }
 
@@ -72,6 +82,7 @@ pub struct Pipeline {
     caps: RuntimeCaps,
     metrics: Arc<RuntimeMetrics>,
     inflight_sem: Arc<Semaphore>,
+    rss_check_counter: Arc<AtomicU64>,
 }
 
 impl Pipeline {
@@ -82,6 +93,7 @@ impl Pipeline {
             caps,
             metrics: Arc::new(RuntimeMetrics::default()),
             inflight_sem: Arc::new(Semaphore::new(max)),
+            rss_check_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -447,6 +459,7 @@ impl Pipeline {
                     self.caps,
                     self.metrics.clone(),
                     self.inflight_sem.clone(),
+                    self.rss_check_counter.clone(),
                     &records[range.start..range.end],
                     s3_client.as_ref(),
                     http_client.as_ref(),
@@ -475,6 +488,7 @@ impl Pipeline {
                 let caps = self.caps;
                 let metrics = self.metrics.clone();
                 let sem = self.inflight_sem.clone();
+                let rss_check_counter = self.rss_check_counter.clone();
                 let records = records.clone();
                 let ranges = ranges.clone();
                 let s3_client = s3_client.clone();
@@ -486,6 +500,7 @@ impl Pipeline {
                         caps,
                         metrics,
                         sem,
+                        rss_check_counter,
                         &records[range.start..range.end],
                         s3_client.as_ref(),
                         http_client.as_ref(),
@@ -520,6 +535,7 @@ impl Pipeline {
         offsets: &mut Vec<u64>,
         payload: &mut Vec<u8>,
     ) -> Result<()> {
+        enforce_process_rss_cap(self.caps, self.metrics.as_ref(), &self.rss_check_counter)?;
         let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         anyhow::ensure!(
             bytes <= self.caps.max_inflight_bytes,
@@ -1152,10 +1168,12 @@ async fn build_manifest_inflight_batch(
     caps: RuntimeCaps,
     metrics: Arc<RuntimeMetrics>,
     inflight_sem: Arc<Semaphore>,
+    rss_check_counter: Arc<AtomicU64>,
     records: &[mx8_core::types::ManifestRecord],
     s3_client: Option<&S3Client>,
     http_client: Option<&HttpClient>,
 ) -> Result<BatchLease> {
+    enforce_process_rss_cap(caps, metrics.as_ref(), &rss_check_counter)?;
     let plan = build_batch_plan(records, s3_client, http_client).await?;
     let bytes = plan.total_bytes;
     anyhow::ensure!(
@@ -1226,6 +1244,52 @@ async fn build_manifest_inflight_batch(
         metrics,
         _permit: permit,
     })
+}
+
+const RSS_CHECK_EVERY_BATCHES: u64 = 16;
+
+fn enforce_process_rss_cap(
+    caps: RuntimeCaps,
+    metrics: &RuntimeMetrics,
+    counter: &Arc<AtomicU64>,
+) -> Result<()> {
+    let Some(max_process_rss_bytes) = caps.max_process_rss_bytes else {
+        return Ok(());
+    };
+
+    let checks = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if checks > 1 && !checks.is_multiple_of(RSS_CHECK_EVERY_BATCHES) {
+        return Ok(());
+    }
+
+    let rss_bytes = sample_process_rss_bytes().ok_or_else(|| {
+        anyhow::anyhow!("max_process_rss_bytes is set but process RSS sampling is unavailable")
+    })?;
+    metrics.on_process_rss_sample(rss_bytes);
+    anyhow::ensure!(
+        rss_bytes <= max_process_rss_bytes,
+        "process rss {} exceeds max_process_rss_bytes {}",
+        rss_bytes,
+        max_process_rss_bytes
+    );
+    Ok(())
+}
+
+fn sample_process_rss_bytes() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", pid.as_str()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = String::from_utf8(out.stdout).ok()?;
+    let rss_kib = txt
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())?;
+    rss_kib.checked_mul(1024)
 }
 
 #[cfg(feature = "s3")]

@@ -344,6 +344,7 @@ async fn main() -> Result<()> {
         prefetch_batches: 1,
         target_batch_bytes: None,
         max_batch_bytes: None,
+        max_process_rss_bytes: None,
     };
 
     let (s1, b1, hw1, ms1) = run_once(&manifest_bytes, base_caps).await?;

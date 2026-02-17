@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
         prefetch_batches: args.prefetch_batches,
         target_batch_bytes: None,
         max_batch_bytes: None,
+        max_process_rss_bytes: None,
     });
     let metrics = pipeline.metrics();
 

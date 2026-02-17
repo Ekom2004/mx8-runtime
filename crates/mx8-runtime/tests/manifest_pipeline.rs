@@ -88,6 +88,7 @@ async fn manifest_pipeline_reads_files_and_is_bounded() -> Result<()> {
         prefetch_batches: 1,
         target_batch_bytes: None,
         max_batch_bytes: None,
+        max_process_rss_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();
@@ -139,6 +140,7 @@ async fn manifest_pipeline_can_run_subset_range() -> Result<()> {
         prefetch_batches: 1,
         target_batch_bytes: None,
         max_batch_bytes: None,
+        max_process_rss_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
 
@@ -175,6 +177,7 @@ async fn manifest_pipeline_bytes_aware_batches_are_bounded() -> Result<()> {
         prefetch_batches: 1,
         target_batch_bytes: Some(700),
         max_batch_bytes: Some(1024),
+        max_process_rss_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let sink = Arc::new(RecordingSink::default());
@@ -206,6 +209,7 @@ async fn manifest_pipeline_bytes_aware_requires_byte_lengths() -> Result<()> {
         prefetch_batches: 1,
         target_batch_bytes: Some(256),
         max_batch_bytes: Some(1024),
+        max_process_rss_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let sink = Arc::new(SlowSink::new(Duration::from_millis(1)));

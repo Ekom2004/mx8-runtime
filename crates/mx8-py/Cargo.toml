@@ -13,6 +13,7 @@ bench = false
 
 [dependencies]
 anyhow.workspace = true
+fast_image_resize = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 mx8-core = { path = "../mx8-core" }
 mx8-manifest-store = { path = "../mx8-manifest-store" }
@@ -21,5 +22,9 @@ mx8-runtime = { path = "../mx8-runtime", features = ["s3"] }
 mx8-snapshot = { path = "../mx8-snapshot", features = ["s3"] }
 mx8-wire = { path = "../mx8-wire" }
 pyo3 = { workspace = true, features = ["extension-module"] }
+rayon = "1"
 tokio.workspace = true
 tonic.workspace = true
+turbojpeg = "1.4"
+tracing.workspace = true
+zune-jpeg = "0.5"

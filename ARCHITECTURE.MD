@@ -270,4 +270,5 @@ Date: 2026-02-12
 
 ### Concurrency caps
 - Enforce per-node caps via agent (fetch streams, inflight bytes/memory).
+- Optional process-level watchdog (`max_process_rss_bytes`) enforces a hard RSS ceiling; MX8 fails fast with an explicit error before OS OOM kill.
 - Cluster-wide caps are applied indirectly via coordinator lease issuance (one job at a time in v0; no multi-job QoS).

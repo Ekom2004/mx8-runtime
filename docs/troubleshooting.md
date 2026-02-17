@@ -56,7 +56,8 @@ Fix:
 
 If you want to compare decode backends or validate Rust decode behavior:
 
-- `MX8_DECODE_BACKEND=rust ...`
+- baseline Rust compare: `MX8_DECODE_BACKEND=rust MX8_DECODE_THREADS=4 MX8_RUST_JPEG_CODEC=turbo MX8_RUST_RESIZE_BACKEND=fast ...`
+- full decode env surface is documented in `docs/python_api.md`
 
 Default is Python decode in v0.
 
@@ -76,3 +77,11 @@ Fix:
 
 - ensure manifest rows include both `byte_offset` and `byte_length`
 - if manifest has full-object rows (`None/None`), disable byte-aware batching or repack/index so lengths are explicit
+
+## Process OOM protection
+
+If you want deterministic failure before OS OOM kill, set:
+
+- `MX8_MAX_PROCESS_RSS_BYTES=<bytes>`
+
+When process RSS exceeds this cap, MX8 fails fast with a clear `process rss ... exceeds max_process_rss_bytes ...` error.

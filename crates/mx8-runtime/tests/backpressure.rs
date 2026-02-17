@@ -43,6 +43,7 @@ async fn slow_sink_enforces_inflight_ram_cap() {
         prefetch_batches: 1,
         target_batch_bytes: None,
         max_batch_bytes: None,
+        max_process_rss_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();
@@ -62,5 +63,30 @@ async fn slow_sink_enforces_inflight_ram_cap() {
         "inflight high-water {} > cap {}",
         high_water,
         caps.max_inflight_bytes
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_rss_cap_fails_fast_when_too_small() {
+    let caps = RuntimeCaps {
+        max_inflight_bytes: 32 * 1024,
+        max_queue_batches: 8,
+        batch_size_samples: 16,
+        prefetch_batches: 1,
+        target_batch_bytes: None,
+        max_batch_bytes: None,
+        max_process_rss_bytes: Some(1),
+    };
+    let pipeline = Pipeline::new(caps);
+    let sink = Arc::new(SlowSink::new(Duration::from_millis(1)));
+
+    let err = pipeline
+        .run_synthetic(sink, 64, 128)
+        .await
+        .expect_err("expected process RSS cap enforcement to fail");
+    assert!(
+        err.to_string().contains("process rss")
+            || err.to_string().contains("RSS sampling is unavailable"),
+        "unexpected error: {err}"
     );
 }

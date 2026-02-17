@@ -1,4 +1,4 @@
-i mean# MX8 Python API (v0)
+# MX8 Python API (v0)
 
 This page documents the API that ships today in `mx8==0.x`.
 
@@ -65,7 +65,10 @@ for batch in loader:
   - `delivered_batches_total`
   - `delivered_samples_total`
   - `inflight_bytes`
+  - `process_rss_bytes`
   - `ram_high_water_bytes`
+
+Hidden operator guard (env-only): set `MX8_MAX_PROCESS_RSS_BYTES` to enforce a process RSS hard limit (fail-fast instead of OS OOM kill).
 
 ## Vision loader
 
@@ -88,8 +91,11 @@ for images, labels in loader:
 
 Decode backend behavior:
 
-- default: Python/Pillow decode path
+- default/recommended in v0: Python/Pillow decode path
 - optional Rust path for benchmarking/optimization: set `MX8_DECODE_BACKEND=rust`
+- optional Rust decode worker count: set `MX8_DECODE_THREADS=<n>` (used when `MX8_DECODE_BACKEND=rust`)
+- optional Rust JPEG codec: set `MX8_RUST_JPEG_CODEC=zune|image|turbo` (default: `zune`)
+- optional Rust resize backend: set `MX8_RUST_RESIZE_BACKEND=fast|image` (default: `fast`)
 
 ## Distributed loader (DDP/local multi-rank)
 
@@ -122,28 +128,11 @@ v0 training note: distributed data delivery is supported, but v0 is non-elastic 
 
 v0 exposes explicit tuning knobs in constructor args (`max_inflight_bytes`, `max_queue_batches`, `prefetch_batches`, `want`, ...).
 
-v1 direction is a two-layer API:
+Planned v1 introduces a two-layer API:
 
-- simple path (few args, profile/autotune defaults),
-- advanced path (`RuntimeConfig`) for power users who need hard pinning.
+- simple path (`profile` + `autotune`)
+- advanced path (`constraints` + `RuntimeConfig`)
 
-This keeps onboarding friction low while preserving expert control.
+Formal contract (single source of truth):
 
-Illustrative v1 shape:
-
-```python
-# simple path
-loader = mx8.load("s3://bucket/train@refresh", profile="balanced")
-
-# advanced path
-loader = mx8.load(
-    "s3://bucket/train@refresh",
-    config=mx8.RuntimeConfig(
-        max_inflight_bytes=512 * 1024 * 1024,
-        max_batch_tokens=8192,
-        max_process_rss_bytes=24 * 1024 * 1024 * 1024,
-    ),
-)
-```
-
-The snippet above is roadmap intent, not shipped v0 API.
+- `docs/v1_autotune_api_contract.md`

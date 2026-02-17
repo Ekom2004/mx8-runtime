@@ -239,6 +239,7 @@ async fn http_manifest_prefetch_completes_and_respects_caps() -> Result<()> {
         prefetch_batches: 4,
         target_batch_bytes: None,
         max_batch_bytes: None,
+        max_process_rss_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();
@@ -291,6 +292,7 @@ async fn http_manifest_retries_transient_503() -> Result<()> {
         prefetch_batches: 4,
         target_batch_bytes: None,
         max_batch_bytes: None,
+        max_process_rss_bytes: None,
     };
     let pipeline = Pipeline::new(caps);
     let metrics = pipeline.metrics();

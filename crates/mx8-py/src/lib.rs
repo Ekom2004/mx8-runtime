@@ -4,13 +4,22 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use image::imageops::FilterType;
+use fast_image_resize::images::Image as FirImage;
+use fast_image_resize::{
+    FilterType as FirFilterType, PixelType as FirPixelType, ResizeAlg as FirResizeAlg,
+    ResizeOptions as FirResizeOptions, Resizer as FirResizer,
+};
+use image::imageops::FilterType as ImageFilterType;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyTuple};
+use rayon::prelude::*;
+use turbojpeg::PixelFormat as TurboPixelFormat;
+use zune_jpeg::zune_core::bytestream::ZCursor;
+use zune_jpeg::JpegDecoder;
 
 use mx8_manifest_store::fs::FsManifestStore;
 use mx8_manifest_store::LockOwner;
@@ -46,12 +55,39 @@ enum DecodeBackend {
     Python,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RustJpegCodec {
+    Zune,
+    Image,
+    Turbo,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RustResizeBackend {
+    FastImageResize,
+    Image,
+}
+
+#[derive(Debug)]
+struct DecodeBatchResult {
+    nchw_u8: Vec<u8>,
+    h: usize,
+    w: usize,
+    decode_ms: u64,
+    resize_ms: u64,
+    pack_ms: u64,
+}
+
 #[pyclass]
 struct ImageFolderLoader {
     loader: DataLoader,
     resize_hw: Option<(u32, u32)>,
     to_float: bool,
     decode_backend: DecodeBackend,
+    rust_jpeg_codec: RustJpegCodec,
+    rust_resize_backend: RustResizeBackend,
+    decode_threads: usize,
+    decode_pool: Option<Arc<rayon::ThreadPool>>,
     classes: Option<Vec<String>>,
 }
 
@@ -76,10 +112,8 @@ fn metrics_to_dict<'py>(py: Python<'py>, metrics: &RuntimeMetrics) -> PyResult<B
         metrics.delivered_samples_total.get(),
     )?;
     out.set_item("inflight_bytes", metrics.inflight_bytes.get())?;
-    out.set_item(
-        "ram_high_water_bytes",
-        metrics.inflight_bytes_high_water.get(),
-    )?;
+    out.set_item("process_rss_bytes", metrics.process_rss_bytes.get())?;
+    out.set_item("ram_high_water_bytes", metrics.ram_high_water_bytes.get())?;
     Ok(out)
 }
 
@@ -93,6 +127,73 @@ fn decode_backend_from_env() -> PyResult<DecodeBackend> {
             "invalid MX8_DECODE_BACKEND={raw:?} (expected: python|rust)"
         ))),
     }
+}
+
+fn decode_backend_name(backend: DecodeBackend) -> &'static str {
+    match backend {
+        DecodeBackend::Rust => "rust",
+        DecodeBackend::Python => "python",
+    }
+}
+
+fn rust_jpeg_codec_from_env() -> PyResult<RustJpegCodec> {
+    let raw = std::env::var("MX8_RUST_JPEG_CODEC").unwrap_or_else(|_| "zune".to_string());
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "zune" => Ok(RustJpegCodec::Zune),
+        "image" => Ok(RustJpegCodec::Image),
+        "turbo" | "turbojpeg" => Ok(RustJpegCodec::Turbo),
+        _ => Err(PyValueError::new_err(format!(
+            "invalid MX8_RUST_JPEG_CODEC={raw:?} (expected: zune|image|turbo)"
+        ))),
+    }
+}
+
+fn rust_jpeg_codec_name(codec: RustJpegCodec) -> &'static str {
+    match codec {
+        RustJpegCodec::Zune => "zune",
+        RustJpegCodec::Image => "image",
+        RustJpegCodec::Turbo => "turbo",
+    }
+}
+
+fn rust_resize_backend_from_env() -> PyResult<RustResizeBackend> {
+    let raw = std::env::var("MX8_RUST_RESIZE_BACKEND").unwrap_or_else(|_| "fast".to_string());
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "fast" | "fir" | "fast_image_resize" => Ok(RustResizeBackend::FastImageResize),
+        "image" => Ok(RustResizeBackend::Image),
+        _ => Err(PyValueError::new_err(format!(
+            "invalid MX8_RUST_RESIZE_BACKEND={raw:?} (expected: fast|image)"
+        ))),
+    }
+}
+
+fn rust_resize_backend_name(backend: RustResizeBackend) -> &'static str {
+    match backend {
+        RustResizeBackend::FastImageResize => "fast",
+        RustResizeBackend::Image => "image",
+    }
+}
+
+fn decode_threads_from_env() -> PyResult<usize> {
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let Some(raw) = std::env::var("MX8_DECODE_THREADS").ok() else {
+        return Ok(default_threads);
+    };
+    let parsed = raw.trim().parse::<usize>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "invalid MX8_DECODE_THREADS={raw:?} (expected positive integer)"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(PyValueError::new_err(
+            "invalid MX8_DECODE_THREADS=0 (expected >= 1)",
+        ));
+    }
+    Ok(parsed)
 }
 
 fn labels_to_torch_i64<'py>(py: Python<'py>, labels: &[u64]) -> PyResult<Bound<'py, PyAny>> {
@@ -119,83 +220,325 @@ fn labels_to_torch_i64<'py>(py: Python<'py>, labels: &[u64]) -> PyResult<Bound<'
 fn decode_images_nchw_u8(
     lease: &BatchLease,
     resize_hw: Option<(u32, u32)>,
-) -> PyResult<(Vec<u8>, usize, usize)> {
-    let mut first_h: Option<usize> = None;
-    let mut first_w: Option<usize> = None;
-    let mut out = Vec::<u8>::new();
+    rust_jpeg_codec: RustJpegCodec,
+    rust_resize_backend: RustResizeBackend,
+    decode_threads: usize,
+    decode_pool: Option<&rayon::ThreadPool>,
+) -> PyResult<DecodeBatchResult> {
+    struct DecodedRgb {
+        sample_id: u64,
+        h: usize,
+        w: usize,
+        rgb_u8: Vec<u8>,
+    }
 
-    for i in 0..lease.batch.sample_count() {
-        let start = lease.batch.offsets[i] as usize;
-        let end = lease.batch.offsets[i + 1] as usize;
-        if end < start || end > lease.batch.payload.len() {
-            return Err(PyRuntimeError::new_err(format!(
-                "bad offsets for sample_id {} (start={} end={} payload_len={})",
-                lease.batch.sample_ids[i],
-                start,
-                end,
-                lease.batch.payload.len()
-            )));
+    struct DecodeOneResult {
+        image: DecodedRgb,
+        decode_us: u64,
+        resize_us: u64,
+    }
+
+    fn elapsed_us_u64(started: Instant) -> u64 {
+        let micros = started.elapsed().as_micros();
+        if micros > u128::from(u64::MAX) {
+            u64::MAX
+        } else {
+            micros as u64
+        }
+    }
+
+    fn decode_one_image(
+        sample_id: u64,
+        bytes: &[u8],
+        resize_hw: Option<(u32, u32)>,
+        rust_jpeg_codec: RustJpegCodec,
+        rust_resize_backend: RustResizeBackend,
+    ) -> Result<DecodeOneResult, String> {
+        fn looks_like_jpeg(bytes: &[u8]) -> bool {
+            bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8
         }
 
-        let bytes = &lease.batch.payload[start..end];
-        let decoded = image::load_from_memory(bytes).map_err(|e| {
-            PyRuntimeError::new_err(format!(
-                "decode failed for sample_id {}: {e}",
-                lease.batch.sample_ids[i]
-            ))
-        })?;
-        let rgb = decoded.to_rgb8();
-        let rgb = if let Some((h, w)) = resize_hw {
-            image::imageops::resize(&rgb, w, h, FilterType::Triangle)
+        fn decode_rgb_with_image(
+            bytes: &[u8],
+            sample_id: u64,
+        ) -> Result<(Vec<u8>, u32, u32), String> {
+            let decoded = image::load_from_memory(bytes)
+                .map_err(|e| format!("decode failed for sample_id {sample_id}: {e}"))?;
+            let rgb = decoded.to_rgb8();
+            let width = rgb.width();
+            let height = rgb.height();
+            Ok((rgb.into_raw(), width, height))
+        }
+
+        fn decode_jpeg_rgb_with_zune(
+            bytes: &[u8],
+            sample_id: u64,
+        ) -> Result<(Vec<u8>, u32, u32), String> {
+            let cursor = ZCursor::new(bytes);
+            let mut decoder = JpegDecoder::new(cursor);
+            let pixels = decoder
+                .decode()
+                .map_err(|e| format!("zune decode failed for sample_id {sample_id}: {e}"))?;
+            let info = decoder.info().ok_or_else(|| {
+                format!("zune decode missing image info for sample_id {sample_id}")
+            })?;
+            let width = u32::from(info.width);
+            let height = u32::from(info.height);
+            let expected_len = usize::try_from(width)
+                .ok()
+                .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+                .and_then(|px| px.checked_mul(3))
+                .ok_or_else(|| format!("zune decoded shape overflow for sample_id {sample_id}"))?;
+            if pixels.len() != expected_len {
+                return Err(format!(
+                    "zune decoded unexpected channel count for sample_id {sample_id} (len={}, expected_rgb_len={expected_len})",
+                    pixels.len()
+                ));
+            }
+            Ok((pixels, width, height))
+        }
+
+        fn decode_jpeg_rgb_with_turbo(
+            bytes: &[u8],
+            sample_id: u64,
+        ) -> Result<(Vec<u8>, u32, u32), String> {
+            let decoded = turbojpeg::decompress(bytes, TurboPixelFormat::RGB)
+                .map_err(|e| format!("turbojpeg decode failed for sample_id {sample_id}: {e}"))?;
+            let width_u32 = u32::try_from(decoded.width)
+                .map_err(|_| format!("turbojpeg width overflow for sample_id {sample_id}"))?;
+            let height_u32 = u32::try_from(decoded.height)
+                .map_err(|_| format!("turbojpeg height overflow for sample_id {sample_id}"))?;
+            let row_bytes = decoded
+                .width
+                .checked_mul(3)
+                .ok_or_else(|| format!("turbojpeg row size overflow for sample_id {sample_id}"))?;
+            let expected_len = decoded
+                .width
+                .checked_mul(decoded.height)
+                .and_then(|pixels| pixels.checked_mul(3))
+                .ok_or_else(|| {
+                    format!("turbojpeg decoded shape overflow for sample_id {sample_id}")
+                })?;
+
+            if decoded.pitch == row_bytes && decoded.pixels.len() == expected_len {
+                return Ok((decoded.pixels, width_u32, height_u32));
+            }
+
+            if decoded.pitch < row_bytes {
+                return Err(format!(
+                    "turbojpeg invalid pitch for sample_id {sample_id} (pitch={} row_bytes={row_bytes})",
+                    decoded.pitch
+                ));
+            }
+            let required_len = decoded.height.checked_mul(decoded.pitch).ok_or_else(|| {
+                format!("turbojpeg pitch buffer overflow for sample_id {sample_id}")
+            })?;
+            if decoded.pixels.len() < required_len {
+                return Err(format!(
+                    "turbojpeg decoded buffer too small for sample_id {sample_id} (len={}, required={required_len})",
+                    decoded.pixels.len()
+                ));
+            }
+
+            let mut compact = vec![0u8; expected_len];
+            for y in 0..decoded.height {
+                let src_start = y.checked_mul(decoded.pitch).ok_or_else(|| {
+                    format!("turbojpeg src offset overflow for sample_id {sample_id}")
+                })?;
+                let src_end = src_start.checked_add(row_bytes).ok_or_else(|| {
+                    format!("turbojpeg src end overflow for sample_id {sample_id}")
+                })?;
+                let dst_start = y.checked_mul(row_bytes).ok_or_else(|| {
+                    format!("turbojpeg dst offset overflow for sample_id {sample_id}")
+                })?;
+                let dst_end = dst_start.checked_add(row_bytes).ok_or_else(|| {
+                    format!("turbojpeg dst end overflow for sample_id {sample_id}")
+                })?;
+                compact[dst_start..dst_end].copy_from_slice(&decoded.pixels[src_start..src_end]);
+            }
+            Ok((compact, width_u32, height_u32))
+        }
+
+        let decode_started = Instant::now();
+        let (raw_rgb, width, height) = match rust_jpeg_codec {
+            RustJpegCodec::Zune if looks_like_jpeg(bytes) => {
+                decode_jpeg_rgb_with_zune(bytes, sample_id)?
+            }
+            RustJpegCodec::Turbo if looks_like_jpeg(bytes) => {
+                decode_jpeg_rgb_with_turbo(bytes, sample_id)?
+            }
+            _ => decode_rgb_with_image(bytes, sample_id)?,
+        };
+        let decode_us = elapsed_us_u64(decode_started);
+
+        let (raw_rgb, width, height, resize_us) = if let Some((h, w)) = resize_hw {
+            let resize_started = Instant::now();
+            let resized = match rust_resize_backend {
+                RustResizeBackend::FastImageResize => {
+                    let src_image =
+                        FirImage::from_vec_u8(width, height, raw_rgb, FirPixelType::U8x3).map_err(
+                            |e| {
+                                format!(
+                                    "fast resize source init failed for sample_id {sample_id}: {e}"
+                                )
+                            },
+                        )?;
+                    let mut dst_image = FirImage::new(w, h, FirPixelType::U8x3);
+                    let mut resizer = FirResizer::new();
+                    let resize_options = FirResizeOptions::new()
+                        .resize_alg(FirResizeAlg::Convolution(FirFilterType::Bilinear));
+                    resizer
+                        .resize(&src_image, &mut dst_image, &resize_options)
+                        .map_err(|e| {
+                            format!("fast resize failed for sample_id {sample_id}: {e}")
+                        })?;
+                    dst_image.into_vec()
+                }
+                RustResizeBackend::Image => {
+                    let rgb =
+                        image::RgbImage::from_raw(width, height, raw_rgb).ok_or_else(|| {
+                            format!("decoded rgb buffer shape mismatch for sample_id {sample_id}")
+                        })?;
+                    let resized = image::imageops::resize(&rgb, w, h, ImageFilterType::Triangle);
+                    resized.into_raw()
+                }
+            };
+            (resized, w, h, elapsed_us_u64(resize_started))
         } else {
-            rgb
+            (raw_rgb, width, height, 0)
         };
 
-        let h = usize::try_from(rgb.height())
-            .map_err(|_| PyRuntimeError::new_err("image height does not fit usize"))?;
-        let w = usize::try_from(rgb.width())
-            .map_err(|_| PyRuntimeError::new_err("image width does not fit usize"))?;
+        let h =
+            usize::try_from(height).map_err(|_| "image height does not fit usize".to_string())?;
+        let w = usize::try_from(width).map_err(|_| "image width does not fit usize".to_string())?;
+        let rgb_len = h
+            .checked_mul(w)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| "decoded rgb size overflow".to_string())?;
+        if raw_rgb.len() != rgb_len {
+            return Err(format!(
+                "decoded rgb length mismatch for sample_id {sample_id} (len={}, expected={rgb_len})",
+                raw_rgb.len()
+            ));
+        }
+        Ok(DecodeOneResult {
+            image: DecodedRgb {
+                sample_id,
+                h,
+                w,
+                rgb_u8: raw_rgb,
+            },
+            decode_us,
+            resize_us,
+        })
+    }
+
+    let sample_ids = lease.batch.sample_ids.clone();
+    let offsets = lease.batch.offsets.clone();
+    let payload = lease.batch.payload.clone();
+    let sample_count = sample_ids.len();
+    if sample_count == 0 {
+        return Err(PyRuntimeError::new_err("empty image batch"));
+    }
+
+    let decode_us_total = Arc::new(AtomicU64::new(0));
+    let resize_us_total = Arc::new(AtomicU64::new(0));
+
+    let decode_at = |i: usize| -> Result<DecodedRgb, String> {
+        let start = offsets[i] as usize;
+        let end = offsets[i + 1] as usize;
+        if end < start || end > payload.len() {
+            return Err(format!(
+                "bad offsets for sample_id {} (start={} end={} payload_len={})",
+                sample_ids[i],
+                start,
+                end,
+                payload.len()
+            ));
+        }
+        let one = decode_one_image(
+            sample_ids[i],
+            &payload[start..end],
+            resize_hw,
+            rust_jpeg_codec,
+            rust_resize_backend,
+        )?;
+        decode_us_total.fetch_add(one.decode_us, Ordering::Relaxed);
+        resize_us_total.fetch_add(one.resize_us, Ordering::Relaxed);
+        Ok(one.image)
+    };
+
+    let decoded: Vec<Result<DecodedRgb, String>> =
+        if decode_threads > 1 && sample_count > 1 && decode_pool.is_some() {
+            decode_pool
+                .ok_or_else(|| PyRuntimeError::new_err("decode thread pool unavailable"))?
+                .install(|| (0..sample_count).into_par_iter().map(decode_at).collect())
+        } else {
+            (0..sample_count).map(decode_at).collect()
+        };
+
+    let mut images = Vec::with_capacity(sample_count);
+    let mut first_h: Option<usize> = None;
+    let mut first_w: Option<usize> = None;
+    for maybe_image in decoded {
+        let image = maybe_image.map_err(PyRuntimeError::new_err)?;
 
         match (first_h, first_w) {
             (None, None) => {
-                first_h = Some(h);
-                first_w = Some(w);
-                let b = lease.batch.sample_count();
-                let cap = b
-                    .checked_mul(3)
-                    .and_then(|v| v.checked_mul(h))
-                    .and_then(|v| v.checked_mul(w))
-                    .ok_or_else(|| PyRuntimeError::new_err("decoded batch size overflow"))?;
-                out.reserve(cap);
+                first_h = Some(image.h);
+                first_w = Some(image.w);
             }
-            (Some(h0), Some(w0)) if h0 == h && w0 == w => {}
+            (Some(h0), Some(w0)) if h0 == image.h && w0 == image.w => {}
             (Some(h0), Some(w0)) => {
                 return Err(PyValueError::new_err(format!(
                     "decoded image shape mismatch in batch (sample_id={} got={}x{}, expected={}x{}); set resize_hw for variable-size inputs",
-                    lease.batch.sample_ids[i], h, w, h0, w0
+                    image.sample_id, image.h, image.w, h0, w0
                 )));
             }
             _ => {}
         }
-
-        let raw = rgb.into_raw();
-        let pixel_count = h
-            .checked_mul(w)
-            .ok_or_else(|| PyRuntimeError::new_err("pixel count overflow"))?;
-        for c in 0..3usize {
-            for p in 0..pixel_count {
-                let idx = p
-                    .checked_mul(3)
-                    .and_then(|v| v.checked_add(c))
-                    .ok_or_else(|| PyRuntimeError::new_err("decoded buffer index overflow"))?;
-                out.push(raw[idx]);
-            }
-        }
+        images.push(image);
     }
 
     let h = first_h.ok_or_else(|| PyRuntimeError::new_err("empty image batch"))?;
     let w = first_w.ok_or_else(|| PyRuntimeError::new_err("empty image batch"))?;
-    Ok((out, h, w))
+    let pixels_per_image = h
+        .checked_mul(w)
+        .ok_or_else(|| PyRuntimeError::new_err("pixels_per_image overflow"))?;
+    let bytes_per_image = pixels_per_image
+        .checked_mul(3)
+        .ok_or_else(|| PyRuntimeError::new_err("bytes_per_image overflow"))?;
+    let total_bytes = sample_count
+        .checked_mul(bytes_per_image)
+        .ok_or_else(|| PyRuntimeError::new_err("decoded batch byte size overflow"))?;
+    let mut out = vec![0u8; total_bytes];
+
+    let pack_started = Instant::now();
+    for (image_index, image) in images.iter().enumerate() {
+        let image_base = image_index
+            .checked_mul(bytes_per_image)
+            .ok_or_else(|| PyRuntimeError::new_err("decoded batch index overflow"))?;
+        let (c0, tail) =
+            out[image_base..image_base + bytes_per_image].split_at_mut(pixels_per_image);
+        let (c1, c2) = tail.split_at_mut(pixels_per_image);
+        for pixel_idx in 0..pixels_per_image {
+            let src = pixel_idx
+                .checked_mul(3)
+                .ok_or_else(|| PyRuntimeError::new_err("decoded pixel index overflow"))?;
+            c0[pixel_idx] = image.rgb_u8[src];
+            c1[pixel_idx] = image.rgb_u8[src + 1];
+            c2[pixel_idx] = image.rgb_u8[src + 2];
+        }
+    }
+
+    Ok(DecodeBatchResult {
+        nchw_u8: out,
+        h,
+        w,
+        decode_ms: decode_us_total.load(Ordering::Relaxed) / 1000,
+        resize_ms: resize_us_total.load(Ordering::Relaxed) / 1000,
+        pack_ms: elapsed_us_u64(pack_started) / 1000,
+    })
 }
 
 #[pymethods]
@@ -275,6 +618,7 @@ impl DataLoader {
             prefetch_batches,
             target_batch_bytes,
             max_batch_bytes,
+            max_process_rss_bytes: env_u64("MX8_MAX_PROCESS_RSS_BYTES"),
         };
         let pipeline = Pipeline::new(caps);
         let metrics = pipeline.metrics();
@@ -350,6 +694,8 @@ impl ImageFolderLoader {
         py: Python<'py>,
         lease: BatchLease,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let sample_count = lease.batch.sample_count();
+        let started = std::time::Instant::now();
         let labels = lease.batch.label_ids.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "batch has no label_ids (expected mx8:vision:imagefolder label hints in manifest)",
@@ -422,6 +768,15 @@ impl ImageFolderLoader {
         let images = torch.getattr("stack")?.call1((xs_list, 0i64))?;
         let labels = labels_to_torch_i64(py, labels)?;
         let out = PyTuple::new_bound(py, [images.to_object(py), labels.to_object(py)]);
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        tracing::debug!(
+            target: "mx8_proof",
+            event = "vision_decode_batch",
+            backend = "python",
+            samples = sample_count as u64,
+            elapsed_ms = elapsed_ms,
+            "vision decode batch"
+        );
         Ok(out.into_any())
     }
 
@@ -430,14 +785,24 @@ impl ImageFolderLoader {
         py: Python<'py>,
         lease: BatchLease,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let sample_count = lease.batch.sample_count();
+        let started = std::time::Instant::now();
         let labels = lease.batch.label_ids.as_ref().ok_or_else(|| {
             PyValueError::new_err(
                 "batch has no label_ids (expected mx8:vision:imagefolder label hints in manifest)",
             )
         })?;
 
-        let (decoded_nchw_u8, h, w) =
-            py.allow_threads(|| decode_images_nchw_u8(&lease, self.resize_hw))?;
+        let decode_result = py.allow_threads(|| {
+            decode_images_nchw_u8(
+                &lease,
+                self.resize_hw,
+                self.rust_jpeg_codec,
+                self.rust_resize_backend,
+                self.decode_threads,
+                self.decode_pool.as_deref(),
+            )
+        })?;
 
         let torch = py.import_bound("torch").map_err(|e| {
             PyRuntimeError::new_err(format!(
@@ -446,17 +811,17 @@ impl ImageFolderLoader {
         })?;
         let torch_uint8 = torch.getattr("uint8")?;
 
-        let payload = PyByteArray::new_bound(py, &decoded_nchw_u8);
+        let payload = PyByteArray::new_bound(py, &decode_result.nchw_u8);
         let kwargs = PyDict::new_bound(py);
         kwargs.set_item("dtype", &torch_uint8)?;
         let images = torch.call_method("frombuffer", (payload,), Some(&kwargs))?;
 
         let b_i64 = i64::try_from(lease.batch.sample_count())
             .map_err(|_| PyValueError::new_err("batch size does not fit i64"))?;
-        let h_i64 =
-            i64::try_from(h).map_err(|_| PyValueError::new_err("height does not fit i64"))?;
-        let w_i64 =
-            i64::try_from(w).map_err(|_| PyValueError::new_err("width does not fit i64"))?;
+        let h_i64 = i64::try_from(decode_result.h)
+            .map_err(|_| PyValueError::new_err("height does not fit i64"))?;
+        let w_i64 = i64::try_from(decode_result.w)
+            .map_err(|_| PyValueError::new_err("width does not fit i64"))?;
 
         let images = images
             .call_method1("view", (b_i64, 3i64, h_i64, w_i64))?
@@ -471,6 +836,21 @@ impl ImageFolderLoader {
 
         let labels = labels_to_torch_i64(py, labels)?;
         let out = PyTuple::new_bound(py, [images.to_object(py), labels.to_object(py)]);
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        tracing::debug!(
+            target: "mx8_proof",
+            event = "vision_decode_batch",
+            backend = "rust",
+            samples = sample_count as u64,
+            elapsed_ms = elapsed_ms,
+            decode_ms = decode_result.decode_ms,
+            resize_ms = decode_result.resize_ms,
+            pack_ms = decode_result.pack_ms,
+            decode_threads = self.decode_threads as u64,
+            rust_jpeg_codec = rust_jpeg_codec_name(self.rust_jpeg_codec),
+            rust_resize_backend = rust_resize_backend_name(self.rust_resize_backend),
+            "vision decode batch"
+        );
         Ok(out.into_any())
     }
 }
@@ -531,11 +911,42 @@ impl ImageFolderLoader {
             .rt
             .block_on(async { load_labels_for_base(&base).await })
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        let decode_backend = decode_backend_from_env()?;
+        let rust_jpeg_codec = rust_jpeg_codec_from_env()?;
+        let rust_resize_backend = rust_resize_backend_from_env()?;
+        let decode_threads = decode_threads_from_env()?;
+        let decode_pool = if matches!(decode_backend, DecodeBackend::Rust) && decode_threads > 1 {
+            Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(decode_threads)
+                    .build()
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "failed to build rust decode thread pool: {e}"
+                        ))
+                    })?,
+            ))
+        } else {
+            None
+        };
+        tracing::info!(
+            target: "mx8_proof",
+            event = "vision_decode_backend_selected",
+            backend = decode_backend_name(decode_backend),
+            decode_threads = decode_threads,
+            rust_jpeg_codec = rust_jpeg_codec_name(rust_jpeg_codec),
+            rust_resize_backend = rust_resize_backend_name(rust_resize_backend),
+            "vision decode backend selected"
+        );
         Ok(Self {
             loader,
             resize_hw,
             to_float,
-            decode_backend: decode_backend_from_env()?,
+            decode_backend,
+            rust_jpeg_codec,
+            rust_resize_backend,
+            decode_threads,
+            decode_pool,
             classes,
         })
     }
@@ -917,6 +1328,10 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.trim().parse::<u64>().ok()
+}
+
 const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 fn unix_time_ms() -> u64 {
@@ -1053,7 +1468,7 @@ async fn heartbeat_loop(
         let metrics = pipeline.metrics();
         let stats = NodeStats {
             inflight_bytes: metrics.inflight_bytes.get(),
-            ram_high_water_bytes: metrics.inflight_bytes_high_water.get(),
+            ram_high_water_bytes: metrics.ram_high_water_bytes.get(),
             fetch_queue_depth: 0,
             decode_queue_depth: 0,
             pack_queue_depth: 0,
@@ -1280,6 +1695,7 @@ impl DistributedDataLoader {
             prefetch_batches,
             target_batch_bytes,
             max_batch_bytes,
+            max_process_rss_bytes: env_u64("MX8_MAX_PROCESS_RSS_BYTES"),
         };
         let pipeline = Arc::new(Pipeline::new(caps));
         let metrics = pipeline.metrics();
