@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,14 +40,6 @@ struct Args {
 
     #[arg(long, env = "MX8_NODE_ID", default_value = "local-node")]
     node_id: String,
-
-    /// Where to cache `GetManifest` bytes locally (control-plane only).
-    #[arg(
-        long,
-        env = "MX8_MANIFEST_CACHE_DIR",
-        default_value = "/tmp/mx8/manifests"
-    )]
-    manifest_cache_dir: PathBuf,
 
     /// Optional: periodically emit a metrics snapshot to logs.
     #[arg(long, env = "MX8_METRICS_SNAPSHOT_INTERVAL_MS", default_value_t = 0)]
@@ -110,6 +101,10 @@ struct AgentMetrics {
     leases_completed_total: Counter,
     delivered_samples_total: Counter,
     delivered_bytes_total: Counter,
+    manifest_direct_stream_used_total: Counter,
+    manifest_direct_stream_fallback_total: Counter,
+    manifest_stream_truncated_total: Counter,
+    manifest_schema_mismatch_total: Counter,
 }
 
 impl AgentMetrics {
@@ -130,6 +125,10 @@ impl AgentMetrics {
             leases_completed_total = self.leases_completed_total.get(),
             delivered_samples_total = self.delivered_samples_total.get(),
             delivered_bytes_total = self.delivered_bytes_total.get(),
+            manifest_direct_stream_used_total = self.manifest_direct_stream_used_total.get(),
+            manifest_direct_stream_fallback_total = self.manifest_direct_stream_fallback_total.get(),
+            manifest_stream_truncated_total = self.manifest_stream_truncated_total.get(),
+            manifest_schema_mismatch_total = self.manifest_schema_mismatch_total.get(),
             "metrics"
         );
     }
@@ -143,37 +142,6 @@ fn atomic_fetch_max_u64(dst: &AtomicU64, value: u64) {
             Err(next) => cur = next,
         }
     }
-}
-
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-
-    let parent = path.parent().unwrap_or(path);
-    std::fs::create_dir_all(parent)?;
-
-    let mut tmp = path.to_path_buf();
-    let suffix = format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        mx8_observe::time::unix_time_ms()
-    );
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("manifest");
-    tmp.set_file_name(format!("{file_name}.{suffix}"));
-
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-
-    std::fs::rename(tmp, path)?;
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -304,18 +272,7 @@ struct ProgressLoopCtx {
 
 #[derive(Debug, Clone)]
 enum ManifestSource {
-    CachedPath(Arc<PathBuf>),
     DirectStream,
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(raw) => matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => default,
-    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -331,6 +288,7 @@ async fn fetch_manifest_records_for_range(
     manifest_hash: &str,
     start_id: u64,
     end_id: u64,
+    metrics: &Arc<AgentMetrics>,
 ) -> Result<Vec<mx8_core::types::ManifestRecord>> {
     let max_line_bytes = env_usize("MX8_AGENT_MANIFEST_STREAM_MAX_LINE_BYTES", 8 * 1024 * 1024);
     let req = GetManifestRequest {
@@ -354,6 +312,7 @@ async fn fetch_manifest_records_for_range(
             while let Some(chunk) = stream.message().await? {
                 if let Some(existing) = stream_schema {
                     if chunk.schema_version != existing {
+                        metrics.manifest_schema_mismatch_total.inc();
                         tracing::error!(
                             target: "mx8_proof",
                             event = "manifest_schema_mismatch",
@@ -378,6 +337,7 @@ async fn fetch_manifest_records_for_range(
             match parser.finish() {
                 Ok(records) => Ok(records),
                 Err(err) => {
+                    metrics.manifest_stream_truncated_total.inc();
                     tracing::error!(
                         target: "mx8_proof",
                         event = "manifest_stream_truncated",
@@ -397,6 +357,18 @@ async fn fetch_manifest_records_for_range(
             if status.code() != tonic::Code::Unimplemented {
                 anyhow::bail!("GetManifestStream failed: {status}");
             }
+            metrics.manifest_direct_stream_fallback_total.inc();
+            tracing::warn!(
+                target: "mx8_proof",
+                event = "manifest_direct_stream_fallback",
+                job_id = %args.job_id,
+                node_id = %args.node_id,
+                manifest_hash = %manifest_hash,
+                start_id = start_id,
+                end_id = end_id,
+                reason = "GetManifestStream unimplemented",
+                "falling back to unary GetManifest for direct-stream path"
+            );
             let resp = client.get_manifest(req).await?.into_inner();
             mx8_runtime::pipeline::load_manifest_records_range_from_read(
                 std::io::Cursor::new(resp.manifest_bytes),
@@ -410,7 +382,7 @@ async fn fetch_manifest_records_for_range(
 async fn run_lease(
     channel: Channel,
     pipeline: Arc<Pipeline>,
-    manifest_source: ManifestSource,
+    _manifest_source: ManifestSource,
     args: &Args,
     manifest_hash: &str,
     metrics: &Arc<AgentMetrics>,
@@ -420,20 +392,16 @@ async fn run_lease(
         anyhow::bail!("lease missing range");
     };
 
-    let direct_records = if matches!(manifest_source, ManifestSource::DirectStream) {
-        Some(
-            fetch_manifest_records_for_range(
-                channel.clone(),
-                args,
-                manifest_hash,
-                range.start_id,
-                range.end_id,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    metrics.manifest_direct_stream_used_total.inc();
+    let records = fetch_manifest_records_for_range(
+        channel.clone(),
+        args,
+        manifest_hash,
+        range.start_id,
+        range.end_id,
+        metrics,
+    )
+    .await?;
 
     metrics.leases_started_total.inc();
     tracing::info!(
@@ -446,10 +414,7 @@ async fn run_lease(
         epoch = range.epoch,
         start_id = range.start_id,
         end_id = range.end_id,
-        source = match manifest_source {
-            ManifestSource::CachedPath(_) => "cached_path",
-            ManifestSource::DirectStream => "direct_stream",
-        },
+        source = "direct_stream",
         "lease started"
     );
 
@@ -474,19 +439,7 @@ async fn run_lease(
         done_rx,
     ));
 
-    match manifest_source {
-        ManifestSource::CachedPath(path) => {
-            pipeline
-                .run_manifest_path_range(sink, path.as_path(), range.start_id, range.end_id)
-                .await?;
-        }
-        ManifestSource::DirectStream => {
-            let records = direct_records.ok_or_else(|| {
-                anyhow::anyhow!("direct stream mode selected but records were not loaded")
-            })?;
-            pipeline.run_manifest_records(sink, records).await?;
-        }
-    }
+    pipeline.run_manifest_records(sink, records).await?;
 
     let _ = done_tx.send(());
     let _ = reporter.await;
@@ -595,38 +548,13 @@ async fn main() -> Result<()> {
             "registered with coordinator"
         );
 
-        let manifest_stream_direct = env_bool("MX8_AGENT_MANIFEST_STREAM_DIRECT", false);
-        let manifest_source = if manifest_stream_direct {
-            info!(
-                target: "mx8_proof",
-                event = "manifest_ingest_mode_selected",
-                mode = "direct_stream",
-                "using direct stream manifest ingest path"
-            );
-            ManifestSource::DirectStream
-        } else {
-            // M3: manifest proxy fallback (control-plane only).
-            // Cache the pinned manifest locally so future runtime stages can load it without
-            // needing to talk to the coordinator.
-            let mut manifest_path: Option<PathBuf> = None;
-            match fetch_and_cache_manifest(&mut client, &args, &manifest_hash).await {
-                Ok(Some(path)) => {
-                    manifest_path = Some(path);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    if args.dev_lease_want > 0 {
-                        return Err(anyhow::anyhow!("{err}"));
-                    }
-                    warn!(error = %err, "GetManifest failed (continuing)");
-                }
-            };
-
-            let manifest_path = manifest_path.ok_or_else(|| {
-                anyhow::anyhow!("manifest unavailable; cannot run leases without GetManifest")
-            })?;
-            ManifestSource::CachedPath(Arc::new(manifest_path))
-        };
+        info!(
+            target: "mx8_proof",
+            event = "manifest_ingest_mode_selected",
+            mode = "direct_stream",
+            "using direct stream manifest ingest path"
+        );
+        let manifest_source = ManifestSource::DirectStream;
 
         if args.metrics_snapshot_interval_ms > 0 {
             let metrics_clone = metrics.clone();
@@ -861,7 +789,6 @@ mod tests {
         ReportProgressResponse, RequestLeaseRequest, RequestLeaseResponse, WorkRange,
     };
     use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
-    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use tokio_stream::wrappers::TcpListenerStream;
@@ -950,12 +877,11 @@ mod tests {
         }
     }
 
-    fn test_args(manifest_cache_dir: PathBuf) -> Args {
+    fn test_args() -> Args {
         Args {
             coord_url: "http://127.0.0.1:0".to_string(),
             job_id: "job".to_string(),
             node_id: "node".to_string(),
-            manifest_cache_dir,
             metrics_snapshot_interval_ms: 0,
             dev_lease_want: 0,
             batch_size_samples: 2,
@@ -1082,7 +1008,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_manifest_stream_parity_with_cached_path() -> anyhow::Result<()> {
+    async fn lease_manifest_stream_matches_expected_progress() -> anyhow::Result<()> {
         let mut root = std::env::temp_dir();
         root.push(format!(
             "mx8-agent-lease-parity-{}-{}",
@@ -1102,9 +1028,6 @@ mod tests {
             manifest.push_str(&format!("{i}\t{}\t\t\t\n", p.display()));
         }
         let manifest_bytes = manifest.into_bytes();
-        let manifest_path = root.join("manifest.tsv");
-        std::fs::write(&manifest_path, &manifest_bytes)?;
-
         let mock = MockCoordinator::new(manifest_bytes.clone());
         let reports = mock.reports.clone();
 
@@ -1121,7 +1044,7 @@ mod tests {
         let channel = Channel::from_shared(format!("http://{}", addr))?
             .connect()
             .await?;
-        let args = test_args(root.clone());
+        let args = test_args();
         let metrics = Arc::new(AgentMetrics::default());
         let pipeline = test_pipeline();
         let range = WorkRange {
@@ -1129,13 +1052,6 @@ mod tests {
             end_id: 4,
             epoch: 1,
             seed: 0,
-        };
-        let cached_lease = Lease {
-            lease_id: "lease-cached".to_string(),
-            node_id: args.node_id.clone(),
-            range: Some(range.clone()),
-            cursor: range.start_id,
-            expires_unix_time_ms: 0,
         };
         let stream_lease = Lease {
             lease_id: "lease-stream".to_string(),
@@ -1145,17 +1061,6 @@ mod tests {
             expires_unix_time_ms: 0,
         };
         let manifest_hash = "manifest-h";
-
-        run_lease(
-            channel.clone(),
-            pipeline.clone(),
-            ManifestSource::CachedPath(Arc::new(manifest_path)),
-            &args,
-            manifest_hash,
-            &metrics,
-            cached_lease,
-        )
-        .await?;
 
         run_lease(
             channel.clone(),
@@ -1172,119 +1077,15 @@ mod tests {
             .lock()
             .map_err(|_| anyhow::anyhow!("report lock poisoned"))?
             .clone();
-        let cached = report_summary(&snapshot, "lease-cached")
-            .ok_or_else(|| anyhow::anyhow!("missing cached-path progress reports"))?;
         let direct = report_summary(&snapshot, "lease-stream")
             .ok_or_else(|| anyhow::anyhow!("missing direct-stream progress reports"))?;
 
-        assert_eq!(cached, direct);
-        assert_eq!(cached.0, range.end_id);
-        assert_eq!(cached.1, range.end_id - range.start_id);
-        assert_eq!(cached.2, 6);
+        assert_eq!(direct.0, range.end_id);
+        assert_eq!(direct.1, range.end_id - range.start_id);
+        assert_eq!(direct.2, 6);
 
         server.abort();
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
-}
-
-async fn fetch_and_cache_manifest(
-    client: &mut CoordinatorClient<Channel>,
-    args: &Args,
-    manifest_hash: &str,
-) -> Result<Option<PathBuf>> {
-    let req = GetManifestRequest {
-        job_id: args.job_id.clone(),
-        manifest_hash: manifest_hash.to_string(),
-    };
-
-    let path = args.manifest_cache_dir.join(manifest_hash);
-    let stream_resp = client.get_manifest_stream(req.clone()).await;
-    let (manifest_bytes, schema_version, manifest_bytes_logged) = match stream_resp {
-        Ok(resp) => {
-            let mut stream = resp.into_inner();
-            let mut schema_version: Option<u32> = None;
-            let mut streamed_bytes: u64 = 0;
-            let parent = path.parent().unwrap_or(path.as_path());
-            std::fs::create_dir_all(parent)?;
-            let mut tmp = path.clone();
-            let suffix = format!(
-                "tmp.{}.{}",
-                std::process::id(),
-                mx8_observe::time::unix_time_ms()
-            );
-            let file_name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("manifest");
-            tmp.set_file_name(format!("{file_name}.{suffix}"));
-            let mut tmp_file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp)?;
-            while let Some(chunk) = stream.message().await? {
-                if let Some(existing) = schema_version {
-                    if chunk.schema_version != existing {
-                        return Err(anyhow::anyhow!(
-                            "GetManifestStream returned inconsistent schema_version"
-                        ));
-                    }
-                } else {
-                    schema_version = Some(chunk.schema_version);
-                }
-                use std::io::Write;
-                tmp_file.write_all(chunk.data.as_slice())?;
-                streamed_bytes = streamed_bytes.saturating_add(chunk.data.len() as u64);
-            }
-            let schema_version = schema_version.ok_or_else(|| {
-                anyhow::anyhow!("GetManifestStream returned no chunks (empty manifest)")
-            })?;
-            use std::io::Write;
-            tmp_file.flush()?;
-            tmp_file.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            (None, schema_version, streamed_bytes)
-        }
-        Err(status) => {
-            if status.code() != tonic::Code::Unimplemented {
-                return Err(anyhow::anyhow!("GetManifestStream failed: {status}"));
-            }
-            let resp = client.get_manifest(req).await?.into_inner();
-            let logged = resp.manifest_bytes.len() as u64;
-            (Some(resp.manifest_bytes), resp.schema_version, logged)
-        }
-    };
-
-    if let Some(bytes) = manifest_bytes {
-        if let Err(err) = write_atomic(&path, bytes.as_slice()) {
-            warn!(error = %err, path = %path.display(), "failed to cache manifest");
-        } else {
-            info!(
-                target: "mx8_proof",
-                event = "manifest_cached",
-                job_id = %args.job_id,
-                node_id = %args.node_id,
-                manifest_hash = %manifest_hash,
-                schema_version = schema_version,
-                manifest_bytes = manifest_bytes_logged,
-                path = %path.display(),
-                source = "unary_fallback",
-                "cached manifest"
-            );
-        }
-    } else {
-        info!(
-            target: "mx8_proof",
-            event = "manifest_cached",
-            job_id = %args.job_id,
-            node_id = %args.node_id,
-            manifest_hash = %manifest_hash,
-            schema_version = schema_version,
-            manifest_bytes = manifest_bytes_logged,
-            path = %path.display(),
-            source = "stream",
-            "cached manifest"
-        );
-    }
-    Ok(Some(path))
 }

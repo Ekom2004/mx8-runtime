@@ -46,7 +46,7 @@ Goal: `mx8.load("s3://bucket/prefix/", recursive=True)` works without manual sna
 - [ ] End-to-end streaming parser contract (partial):
   - [x] define and implement manifest parser on `Read/BufRead` stream (not `Vec<u8>`) in runtime
   - [x] thread parser contract into agent/runtime lease path (manifest path range parsing is reader-based)
-  - [x] direct async stream-to-runtime parser handoff without intermediate cache file (env-gated path in agent)
+  - [x] direct async stream-to-runtime parser handoff without intermediate cache file (default path in agent)
 
 ## Phase 1 — Streaming parser contract (scoped)
 
@@ -120,9 +120,9 @@ Goal: enable direct `GetManifestStream` -> runtime parser handoff (no intermedia
 
 ### TODO checklist
 
-- [x] Add direct stream ingest path in `mx8d-agent` behind a rollout gate:
-  - env gate: `MX8_AGENT_MANIFEST_STREAM_DIRECT=1`
-  - keep current cache-file handoff as fallback path for rollout safety.
+- [x] Add direct stream ingest path in `mx8d-agent` as default:
+  - default mode: direct stream path
+  - cached-path fallback retired after burn-in.
 - [x] Wire direct stream chunks into runtime parser adapter:
   - use reader/chunk contract from `mx8-runtime` parser surface.
   - do not require a full `Vec<u8>` materialization.
@@ -160,4 +160,4 @@ Goal: enable direct `GetManifestStream` -> runtime parser handoff (no intermedia
 
 - `RUSTUP_TOOLCHAIN=stable cargo test -p mx8d-agent manifest_stream`
 - `RUSTUP_TOOLCHAIN=stable cargo test -p mx8-runtime manifest_reader`
-- `MX8_AGENT_MANIFEST_STREAM_DIRECT=1 MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT=1 ./scripts/smoke.sh`
+- `MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT=1 ./scripts/smoke.sh`

@@ -41,6 +41,23 @@ Fix:
 - start Docker Desktop (or Docker daemon)
 - rerun the MinIO gate/script
 
+## `TrustStore configured to enable native roots ...` during MinIO smoke
+
+Symptom:
+
+- panic from `aws-smithy-http-client` in local dev build path:
+  - `TrustStore configured to enable native roots but no valid root certificates parsed!`
+
+Notes:
+
+- This is an environment-specific TLS/native-roots issue in local debug builds.
+- It was observed while running MinIO gates, not as a correctness issue in MX8 manifest logic.
+
+Workaround:
+
+- rerun with dev debug assertions disabled for that environment:
+  - `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT=1 ./scripts/smoke.sh`
+
 ## `pip install mx8==X.Y.Z` cannot find version
 
 Symptom:

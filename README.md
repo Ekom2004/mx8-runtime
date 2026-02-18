@@ -44,6 +44,7 @@ for step, (images, labels) in enumerate(loader):
 
 - Repo smoke (offline + online sub-gates):
   - `./scripts/smoke.sh`
+  - Direct-stream manifest ingest is now default in `mx8d-agent`.
 - Python smoke:
   - `./scripts/py_smoke.sh`
   - `MX8_PY_SMOKE_INSTALL_TORCH=1 ./scripts/py_smoke.sh`
