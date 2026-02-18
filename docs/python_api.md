@@ -121,6 +121,10 @@ Important fields:
 - `want`: max concurrent leases per node.
 - `progress_interval_ms`: progress report interval.
 - `grpc_max_message_bytes`: gRPC message cap for manifest/control-path.
+- experimental distributed autotune (env-gated):
+  - `MX8_AUTOTUNE=1`
+  - `MX8_AUTOTUNE_PROFILE=safe|balanced|throughput` (default `balanced`)
+  - current implementation adjusts `want`, `prefetch_batches`, and `max_queue_batches` inside profile rails.
 
 v0 training note: distributed data delivery is supported, but v0 is non-elastic (DDP rank death terminates training).
 
@@ -135,4 +139,4 @@ Planned v1 introduces a two-layer API:
 
 Formal contract (single source of truth):
 
-- `docs/v1_autotune_api_contract.md`
+- `docs/v1_autotune_api_contract.md` (includes control equations, default gains, rails, and observability fields)

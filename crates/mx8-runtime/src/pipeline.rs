@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -83,6 +83,8 @@ pub struct Pipeline {
     metrics: Arc<RuntimeMetrics>,
     inflight_sem: Arc<Semaphore>,
     rss_check_counter: Arc<AtomicU64>,
+    prefetch_batches: Arc<AtomicUsize>,
+    max_queue_batches: Arc<AtomicUsize>,
 }
 
 impl Pipeline {
@@ -94,11 +96,31 @@ impl Pipeline {
             metrics: Arc::new(RuntimeMetrics::default()),
             inflight_sem: Arc::new(Semaphore::new(max)),
             rss_check_counter: Arc::new(AtomicU64::new(0)),
+            prefetch_batches: Arc::new(AtomicUsize::new(caps.prefetch_batches.max(1))),
+            max_queue_batches: Arc::new(AtomicUsize::new(caps.max_queue_batches.max(1))),
         }
     }
 
     pub fn metrics(&self) -> Arc<RuntimeMetrics> {
         self.metrics.clone()
+    }
+
+    pub fn effective_prefetch_batches(&self) -> usize {
+        self.prefetch_batches.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn effective_max_queue_batches(&self) -> usize {
+        self.max_queue_batches.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn set_prefetch_batches(&self, prefetch_batches: usize) {
+        self.prefetch_batches
+            .store(prefetch_batches.max(1), Ordering::Relaxed);
+    }
+
+    pub fn set_max_queue_batches(&self, max_queue_batches: usize) {
+        self.max_queue_batches
+            .store(max_queue_batches.max(1), Ordering::Relaxed);
     }
 
     /// Spawn a manifest-driven producer which streams `BatchLease`s to the caller.
@@ -143,7 +165,7 @@ impl Pipeline {
             None
         };
 
-        let (tx, rx) = mpsc::channel::<BatchLease>(self.caps.max_queue_batches);
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
         let pipeline = self.clone();
         let task = tokio::spawn(async move {
             pipeline
@@ -204,7 +226,7 @@ impl Pipeline {
             "selected manifest range"
         );
 
-        let (tx, rx) = mpsc::channel::<BatchLease>(self.caps.max_queue_batches);
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
         let pipeline = self.clone();
         let task = tokio::spawn(async move {
             pipeline
@@ -361,7 +383,7 @@ impl Pipeline {
         mpsc::Sender<BatchLease>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
-        let (tx, mut rx) = mpsc::channel::<BatchLease>(self.caps.max_queue_batches);
+        let (tx, mut rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
         let metrics = self.metrics.clone();
 
         let sink_task = {
@@ -451,7 +473,7 @@ impl Pipeline {
         http_client: Option<HttpClient>,
     ) -> Result<()> {
         let ranges = build_manifest_batch_ranges(&records, self.caps)?;
-        let prefetch = std::cmp::max(1, self.caps.prefetch_batches);
+        let prefetch = self.effective_prefetch_batches();
         if prefetch <= 1 {
             let sender = tx;
             for range in ranges {

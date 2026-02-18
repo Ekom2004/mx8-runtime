@@ -2,7 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,51 @@ struct DataLoader {
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     rt: tokio::runtime::Runtime,
+}
+
+#[pyclass]
+#[derive(Debug, Clone, Default)]
+struct Constraints {
+    #[pyo3(get, set)]
+    max_inflight_bytes: Option<u64>,
+    #[pyo3(get, set)]
+    max_process_rss_bytes: Option<u64>,
+}
+
+#[pymethods]
+impl Constraints {
+    #[new]
+    #[pyo3(signature = (max_inflight_bytes=None, max_process_rss_bytes=None))]
+    fn new(max_inflight_bytes: Option<u64>, max_process_rss_bytes: Option<u64>) -> Self {
+        Self {
+            max_inflight_bytes,
+            max_process_rss_bytes,
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Debug, Clone, Default)]
+struct RuntimeConfig {
+    #[pyo3(get, set)]
+    prefetch_batches: Option<usize>,
+    #[pyo3(get, set)]
+    max_queue_batches: Option<usize>,
+    #[pyo3(get, set)]
+    want: Option<u32>,
+}
+
+#[pymethods]
+impl RuntimeConfig {
+    #[new]
+    #[pyo3(signature = (prefetch_batches=None, max_queue_batches=None, want=None))]
+    fn new(prefetch_batches: Option<usize>, max_queue_batches: Option<usize>, want: Option<u32>) -> Self {
+        Self {
+            prefetch_batches,
+            max_queue_batches,
+            want,
+        }
+    }
 }
 
 fn metrics_to_dict<'py>(py: Python<'py>, metrics: &RuntimeMetrics) -> PyResult<Bound<'py, PyDict>> {
@@ -555,6 +600,7 @@ impl DataLoader {
         prefetch_batches=1,
         target_batch_bytes=None,
         max_batch_bytes=None,
+        max_process_rss_bytes=None,
         start_id=None,
         end_id=None,
         node_id=None,
@@ -570,6 +616,7 @@ impl DataLoader {
         prefetch_batches: usize,
         target_batch_bytes: Option<u64>,
         max_batch_bytes: Option<u64>,
+        max_process_rss_bytes: Option<u64>,
         start_id: Option<u64>,
         end_id: Option<u64>,
         node_id: Option<String>,
@@ -611,6 +658,7 @@ impl DataLoader {
             )
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
+        let max_process_rss_bytes_cap = max_process_rss_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
         let caps = RuntimeCaps {
             max_inflight_bytes,
             max_queue_batches,
@@ -618,7 +666,7 @@ impl DataLoader {
             prefetch_batches,
             target_batch_bytes,
             max_batch_bytes,
-            max_process_rss_bytes: env_u64("MX8_MAX_PROCESS_RSS_BYTES"),
+            max_process_rss_bytes: max_process_rss_bytes_cap,
         };
         let pipeline = Pipeline::new(caps);
         let metrics = pipeline.metrics();
@@ -902,6 +950,7 @@ impl ImageFolderLoader {
             prefetch_batches,
             target_batch_bytes,
             max_batch_bytes,
+            None,
             start_id,
             end_id,
             node_id,
@@ -1249,6 +1298,10 @@ fn pack_dir<'py>(
     start_id=None,
     end_id=None,
     node_id=None,
+    profile=None,
+    autotune=None,
+    constraints=None,
+    runtime=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn load(
@@ -1265,17 +1318,118 @@ fn load(
     start_id: Option<u64>,
     end_id: Option<u64>,
     node_id: Option<String>,
+    profile: Option<String>,
+    autotune: Option<bool>,
+    constraints: Option<Py<Constraints>>,
+    runtime: Option<Py<RuntimeConfig>>,
 ) -> PyResult<Py<DataLoader>> {
+    let has_v1_args =
+        profile.is_some() || autotune.is_some() || constraints.is_some() || runtime.is_some();
+
+    let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
+    let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+
+    let mut effective_max_inflight_bytes = max_inflight_bytes;
+    let mut effective_max_queue_batches = max_queue_batches;
+    let mut effective_prefetch_batches = prefetch_batches;
+    let mut effective_max_process_rss_bytes = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
+
+    if has_v1_args {
+        let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+        let defaults = ProfileDefaults::for_profile(selected_profile);
+        let autotune_enabled = autotune.unwrap_or(true);
+        effective_max_inflight_bytes = defaults.max_inflight_bytes;
+        effective_max_queue_batches = defaults.max_queue_batches;
+        effective_prefetch_batches = defaults.prefetch_batches;
+
+        if let Some(runtime_cfg) = &runtime_cfg {
+            if let Some(prefetch) = runtime_cfg.prefetch_batches {
+                effective_prefetch_batches = prefetch.max(1);
+            }
+            if let Some(max_queue) = runtime_cfg.max_queue_batches {
+                effective_max_queue_batches = max_queue.max(1);
+            }
+        }
+
+        if let Some(constraints_cfg) = &constraints_cfg {
+            if let Some(max_inflight) = constraints_cfg.max_inflight_bytes {
+                effective_max_inflight_bytes = max_inflight.max(1);
+            }
+            if let Some(max_process) = constraints_cfg.max_process_rss_bytes {
+                effective_max_process_rss_bytes = Some(max_process.max(1));
+            }
+        }
+
+        if autotune_enabled && effective_max_process_rss_bytes.is_none() {
+            if let Some(node_limit) = detect_node_ram_limit_bytes() {
+                let profile_fraction = match selected_profile {
+                    AutotuneProfile::Safe => 0.60f64,
+                    AutotuneProfile::Balanced => 0.75f64,
+                    AutotuneProfile::Throughput => 0.85f64,
+                };
+                let reserve_bytes = 1u64 << 30;
+                let base_rss = sample_process_rss_bytes_local().unwrap_or(0);
+                let mut derived = ((node_limit as f64) * profile_fraction) as u64;
+                derived = derived.saturating_sub(reserve_bytes);
+                let min_required = base_rss.saturating_add(effective_max_inflight_bytes);
+                if derived < min_required {
+                    derived = min_required;
+                }
+                effective_max_process_rss_bytes = Some(derived.max(effective_max_inflight_bytes));
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "autotune_startup_caps_selected",
+                    mode = "single_node",
+                    profile = match selected_profile {
+                        AutotuneProfile::Safe => "safe",
+                        AutotuneProfile::Balanced => "balanced",
+                        AutotuneProfile::Throughput => "throughput",
+                    },
+                    max_inflight_bytes = effective_max_inflight_bytes,
+                    max_process_rss_bytes = effective_max_process_rss_bytes.unwrap_or(0),
+                    max_queue_batches = effective_max_queue_batches as u64,
+                    prefetch_batches = effective_prefetch_batches as u64,
+                    "v1 profile/autotune startup caps resolved"
+                );
+            }
+        }
+
+        if let Some(max_process) = effective_max_process_rss_bytes {
+            if effective_max_inflight_bytes > max_process {
+                tracing::warn!(
+                    target: "mx8_proof",
+                    event = "autotune_cap_clamped",
+                    requested_max_inflight_bytes = effective_max_inflight_bytes,
+                    clamped_max_inflight_bytes = max_process,
+                    max_process_rss_bytes = max_process,
+                    "clamped max_inflight_bytes to max_process_rss_bytes"
+                );
+                effective_max_inflight_bytes = max_process;
+            }
+        }
+
+        if !autotune_enabled && runtime_cfg.is_some() {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "autotune_disabled_manual_runtime",
+                prefetch_batches = effective_prefetch_batches as u64,
+                max_queue_batches = effective_max_queue_batches as u64,
+                "manual runtime selected with autotune disabled"
+            );
+        }
+    }
+
     let loader = DataLoader::new(
         dataset_link,
         manifest_store_root,
         dev_manifest_path,
         batch_size_samples,
-        max_inflight_bytes,
-        max_queue_batches,
-        prefetch_batches,
+        effective_max_inflight_bytes,
+        effective_max_queue_batches,
+        effective_prefetch_batches,
         target_batch_bytes,
         max_batch_bytes,
+        effective_max_process_rss_bytes,
         start_id,
         end_id,
         node_id,
@@ -1330,6 +1484,82 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse::<u64>().ok()
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+fn parse_u64_ascii(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok()
+}
+
+fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+    let path = std::path::Path::new("/sys/fs/cgroup/memory.max");
+    let txt = std::fs::read_to_string(path).ok()?;
+    let v = txt.trim();
+    if v.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let out = parse_u64_ascii(v)?;
+    if out == 0 || out >= (u64::MAX / 2) {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn detect_proc_memtotal_bytes() -> Option<u64> {
+    let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in txt.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return kib.checked_mul(1024);
+        }
+    }
+    None
+}
+
+fn detect_sysctl_memsize_bytes() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_u64_ascii(std::str::from_utf8(&out.stdout).ok()?)
+}
+
+fn detect_node_ram_limit_bytes() -> Option<u64> {
+    let cgroup = detect_cgroup_memory_limit_bytes();
+    let host = detect_proc_memtotal_bytes().or_else(detect_sysctl_memsize_bytes);
+    match (cgroup, host) {
+        (Some(c), Some(h)) => Some(c.min(h)),
+        (Some(c), None) => Some(c),
+        (None, Some(h)) => Some(h),
+        (None, None) => None,
+    }
+}
+
+fn sample_process_rss_bytes_local() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", pid.as_str()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = std::str::from_utf8(&out.stdout).ok()?;
+    let kib = txt.split_whitespace().next()?.parse::<u64>().ok()?;
+    kib.checked_mul(1024)
 }
 
 const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -1399,6 +1629,356 @@ impl LeaseProgress {
                 Ok(_) => return,
                 Err(actual) => cur = actual,
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AutotuneProfile {
+    Safe,
+    Balanced,
+    Throughput,
+}
+
+impl AutotuneProfile {
+    fn from_name(name: Option<&str>) -> Self {
+        match name
+            .unwrap_or("balanced")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "safe" => Self::Safe,
+            "throughput" => Self::Throughput,
+            _ => Self::Balanced,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_name(std::env::var("MX8_AUTOTUNE_PROFILE").ok().as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProfileDefaults {
+    max_inflight_bytes: u64,
+    max_queue_batches: usize,
+    prefetch_batches: usize,
+}
+
+impl ProfileDefaults {
+    fn for_profile(profile: AutotuneProfile) -> Self {
+        match profile {
+            AutotuneProfile::Safe => Self {
+                max_inflight_bytes: 128 * 1024 * 1024,
+                max_queue_batches: 32,
+                prefetch_batches: 1,
+            },
+            AutotuneProfile::Balanced => Self {
+                max_inflight_bytes: 256 * 1024 * 1024,
+                max_queue_batches: 64,
+                prefetch_batches: 2,
+            },
+            AutotuneProfile::Throughput => Self {
+                max_inflight_bytes: 512 * 1024 * 1024,
+                max_queue_batches: 128,
+                prefetch_batches: 4,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutotuneRails {
+    min_prefetch_batches: usize,
+    max_prefetch_batches: usize,
+    min_max_queue_batches: usize,
+    max_max_queue_batches: usize,
+    min_want: u32,
+    max_want: u32,
+}
+
+impl AutotuneRails {
+    fn for_profile(profile: AutotuneProfile) -> Self {
+        match profile {
+            AutotuneProfile::Safe => Self {
+                min_prefetch_batches: 1,
+                max_prefetch_batches: 4,
+                min_max_queue_batches: 8,
+                max_max_queue_batches: 64,
+                min_want: 1,
+                max_want: 2,
+            },
+            AutotuneProfile::Balanced => Self {
+                min_prefetch_batches: 1,
+                max_prefetch_batches: 8,
+                min_max_queue_batches: 16,
+                max_max_queue_batches: 128,
+                min_want: 1,
+                max_want: 4,
+            },
+            AutotuneProfile::Throughput => Self {
+                min_prefetch_batches: 2,
+                max_prefetch_batches: 16,
+                min_max_queue_batches: 32,
+                max_max_queue_batches: 256,
+                min_want: 1,
+                max_want: 8,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AutotuneShared {
+    enabled: bool,
+    want: AtomicU32,
+    prefetch_batches: AtomicUsize,
+    max_queue_batches: AtomicUsize,
+    wait_ns_interval: AtomicU64,
+    pressure_milli: AtomicU64,
+    wait_ewma_milli: AtomicU64,
+    rss_ewma_milli: AtomicU64,
+    integral_rss_milli: AtomicI64,
+    cooldown_ticks: AtomicU32,
+}
+
+impl AutotuneShared {
+    fn new(enabled: bool, want: u32, prefetch_batches: usize, max_queue_batches: usize) -> Self {
+        Self {
+            enabled,
+            want: AtomicU32::new(want.max(1)),
+            prefetch_batches: AtomicUsize::new(prefetch_batches.max(1)),
+            max_queue_batches: AtomicUsize::new(max_queue_batches.max(1)),
+            wait_ns_interval: AtomicU64::new(0),
+            pressure_milli: AtomicU64::new(0),
+            wait_ewma_milli: AtomicU64::new(0),
+            rss_ewma_milli: AtomicU64::new(0),
+            integral_rss_milli: AtomicI64::new(0),
+            cooldown_ticks: AtomicU32::new(0),
+        }
+    }
+
+    fn on_wait(&self, elapsed: Duration) {
+        if self.enabled {
+            self.wait_ns_interval.fetch_add(
+                elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AutotuneController {
+    wait_ewma: f64,
+    rss_ewma: f64,
+    prev_rss_ewma: f64,
+    integral_rss: f64,
+    cooldown_ticks: u32,
+    increase_ticks: u32,
+}
+
+impl AutotuneController {
+    fn new() -> Self {
+        Self {
+            wait_ewma: 0.0,
+            rss_ewma: 0.0,
+            prev_rss_ewma: 0.0,
+            integral_rss: 0.0,
+            cooldown_ticks: 0,
+            increase_ticks: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutotuneUpdate {
+    want: u32,
+    prefetch_batches: usize,
+    max_queue_batches: usize,
+}
+
+#[derive(Debug)]
+struct AutotuneTickOutput {
+    next: AutotuneUpdate,
+    changed: bool,
+    reason: &'static str,
+    pressure: f64,
+}
+
+fn autotune_tick(
+    state: &mut AutotuneController,
+    current: AutotuneUpdate,
+    rails: AutotuneRails,
+    wait_ratio: f64,
+    rss_ratio: f64,
+    inflight_ratio: f64,
+    interval_secs: f64,
+) -> AutotuneTickOutput {
+    const ALPHA: f64 = 0.2;
+    const RSS_TARGET: f64 = 0.90;
+    const WAIT_TARGET: f64 = 0.05;
+    const KP: f64 = 1.5;
+    const KI: f64 = 0.2;
+    const KD: f64 = 0.1;
+
+    state.wait_ewma = ALPHA * wait_ratio + (1.0 - ALPHA) * state.wait_ewma;
+    state.rss_ewma = ALPHA * rss_ratio + (1.0 - ALPHA) * state.rss_ewma;
+
+    let error = state.rss_ewma - RSS_TARGET;
+    state.integral_rss = (state.integral_rss + error * interval_secs).clamp(-0.5, 0.5);
+    let deriv = (state.rss_ewma - state.prev_rss_ewma) / interval_secs;
+    state.prev_rss_ewma = state.rss_ewma;
+
+    let pressure = (KP * error + KI * state.integral_rss + KD * deriv).clamp(0.0, 1.0);
+
+    let mut next = current;
+    let mut reason = "hold";
+
+    let hard_cut = rss_ratio >= 0.97 || inflight_ratio >= 0.98;
+    let soft_cut = pressure >= 0.60;
+    let starvation = wait_ratio > 0.01 || state.wait_ewma > WAIT_TARGET;
+    let can_increase = state.cooldown_ticks == 0
+        && state.wait_ewma > WAIT_TARGET
+        && pressure <= 0.30
+        && inflight_ratio <= 0.85
+        && starvation;
+
+    if hard_cut {
+        next.prefetch_batches = ((next.prefetch_batches as f64) * 0.5).floor() as usize;
+        next.max_queue_batches = ((next.max_queue_batches as f64) * 0.7).floor() as usize;
+        next.want = ((next.want as f64) * 0.5).floor() as u32;
+        reason = "hard_cut";
+        state.cooldown_ticks = 2;
+    } else if soft_cut {
+        next.prefetch_batches = next.prefetch_batches.saturating_sub(1);
+        next.max_queue_batches = next.max_queue_batches.saturating_sub(2);
+        reason = "soft_cut";
+        state.increase_ticks = 0;
+    } else if can_increase {
+        next.prefetch_batches = next.prefetch_batches.saturating_add(1);
+        next.max_queue_batches = next.max_queue_batches.saturating_add(2);
+        if state.increase_ticks % 2 == 1 {
+            next.want = next.want.saturating_add(1);
+        }
+        state.increase_ticks = state.increase_ticks.saturating_add(1);
+        reason = "aimd_increase";
+    } else {
+        state.increase_ticks = 0;
+        if state.cooldown_ticks > 0 {
+            state.cooldown_ticks -= 1;
+        }
+    }
+
+    next.prefetch_batches = next
+        .prefetch_batches
+        .clamp(rails.min_prefetch_batches, rails.max_prefetch_batches);
+    next.max_queue_batches = next
+        .max_queue_batches
+        .clamp(rails.min_max_queue_batches, rails.max_max_queue_batches);
+    next.want = next.want.clamp(rails.min_want, rails.max_want);
+
+    AutotuneTickOutput {
+        changed: next.prefetch_batches != current.prefetch_batches
+            || next.max_queue_batches != current.max_queue_batches
+            || next.want != current.want,
+        next,
+        reason,
+        pressure,
+    }
+}
+
+async fn autotune_loop(
+    pipeline: Arc<Pipeline>,
+    metrics: Arc<RuntimeMetrics>,
+    shared: Arc<AutotuneShared>,
+    max_inflight_bytes: u64,
+    max_process_rss_bytes: Option<u64>,
+    rails: AutotuneRails,
+) {
+    if !shared.enabled {
+        return;
+    }
+
+    let mut state = AutotuneController::new();
+    let interval = Duration::from_secs(2);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+
+        let wait_ns = shared.wait_ns_interval.swap(0, Ordering::Relaxed);
+        let wait_ratio = (wait_ns as f64 / interval.as_nanos() as f64).clamp(0.0, 1.0);
+        let inflight_ratio = if max_inflight_bytes == 0 {
+            0.0
+        } else {
+            (metrics.inflight_bytes.get() as f64 / max_inflight_bytes as f64).clamp(0.0, 1.5)
+        };
+        let rss_ratio = match max_process_rss_bytes {
+            Some(rss_cap) if rss_cap > 0 => {
+                (metrics.process_rss_bytes.get() as f64 / rss_cap as f64).clamp(0.0, 1.5)
+            }
+            _ => 0.0,
+        };
+
+        let current = AutotuneUpdate {
+            want: shared.want.load(Ordering::Relaxed),
+            prefetch_batches: shared.prefetch_batches.load(Ordering::Relaxed),
+            max_queue_batches: shared.max_queue_batches.load(Ordering::Relaxed),
+        };
+        let tick = autotune_tick(
+            &mut state,
+            current,
+            rails,
+            wait_ratio,
+            rss_ratio,
+            inflight_ratio,
+            interval.as_secs_f64(),
+        );
+
+        shared
+            .pressure_milli
+            .store((tick.pressure * 1000.0).round() as u64, Ordering::Relaxed);
+        shared
+            .wait_ewma_milli
+            .store((state.wait_ewma * 1000.0).round() as u64, Ordering::Relaxed);
+        shared
+            .rss_ewma_milli
+            .store((state.rss_ewma * 1000.0).round() as u64, Ordering::Relaxed);
+        shared.integral_rss_milli.store(
+            (state.integral_rss * 1000.0).round() as i64,
+            Ordering::Relaxed,
+        );
+        shared
+            .cooldown_ticks
+            .store(state.cooldown_ticks, Ordering::Relaxed);
+
+        if tick.changed {
+            shared.want.store(tick.next.want, Ordering::Relaxed);
+            shared
+                .prefetch_batches
+                .store(tick.next.prefetch_batches, Ordering::Relaxed);
+            shared
+                .max_queue_batches
+                .store(tick.next.max_queue_batches, Ordering::Relaxed);
+            pipeline.set_prefetch_batches(tick.next.prefetch_batches);
+            pipeline.set_max_queue_batches(tick.next.max_queue_batches);
+            tracing::info!(
+                target: "mx8_proof",
+                event = "autotune_runtime_adjustment",
+                reason = tick.reason,
+                wait_ratio = wait_ratio,
+                wait_ewma = state.wait_ewma,
+                pressure = tick.pressure,
+                rss_ratio = rss_ratio,
+                inflight_ratio = inflight_ratio,
+                prefetch_batches = tick.next.prefetch_batches as u64,
+                max_queue_batches = tick.next.max_queue_batches as u64,
+                want = tick.next.want as u64,
+                "autotune adjusted runtime knobs"
+            );
         }
     }
 }
@@ -1590,9 +2170,12 @@ struct DistributedDataLoader {
     assigned_rank: u32,
     world_size: u32,
     metrics: Arc<RuntimeMetrics>,
+    pipeline: Arc<Pipeline>,
+    autotune: Arc<AutotuneShared>,
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    autotune_task: Option<tokio::task::JoinHandle<()>>,
     rt: tokio::runtime::Runtime,
 }
 
@@ -1688,6 +2271,7 @@ impl DistributedDataLoader {
             ))
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
+        let max_process_rss_bytes_cap = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
         let caps = RuntimeCaps {
             max_inflight_bytes,
             max_queue_batches,
@@ -1695,10 +2279,46 @@ impl DistributedDataLoader {
             prefetch_batches,
             target_batch_bytes,
             max_batch_bytes,
-            max_process_rss_bytes: env_u64("MX8_MAX_PROCESS_RSS_BYTES"),
+            max_process_rss_bytes: max_process_rss_bytes_cap,
         };
         let pipeline = Arc::new(Pipeline::new(caps));
         let metrics = pipeline.metrics();
+        let autotune_enabled = env_bool("MX8_AUTOTUNE", false);
+        let autotune_profile = AutotuneProfile::from_env();
+        let rails = AutotuneRails::for_profile(autotune_profile);
+        let initial_want = std::cmp::max(1, want).clamp(rails.min_want, rails.max_want);
+        let initial_prefetch = prefetch_batches
+            .max(rails.min_prefetch_batches)
+            .min(rails.max_prefetch_batches);
+        let initial_max_queue = max_queue_batches
+            .max(rails.min_max_queue_batches)
+            .min(rails.max_max_queue_batches);
+        pipeline.set_prefetch_batches(initial_prefetch);
+        pipeline.set_max_queue_batches(initial_max_queue);
+        let autotune = Arc::new(AutotuneShared::new(
+            autotune_enabled,
+            initial_want,
+            initial_prefetch,
+            initial_max_queue,
+        ));
+
+        if autotune_enabled {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "autotune_startup_caps_selected",
+                profile = match autotune_profile {
+                    AutotuneProfile::Safe => "safe",
+                    AutotuneProfile::Balanced => "balanced",
+                    AutotuneProfile::Throughput => "throughput",
+                },
+                prefetch_batches = initial_prefetch as u64,
+                max_queue_batches = initial_max_queue as u64,
+                want = initial_want as u64,
+                max_inflight_bytes = max_inflight_bytes,
+                max_process_rss_bytes = max_process_rss_bytes_cap.unwrap_or(0),
+                "autotune initialized"
+            );
+        }
 
         let heartbeat_task = {
             let interval = Duration::from_millis(std::cmp::max(1, heartbeat_interval_ms) as u64);
@@ -1716,16 +2336,38 @@ impl DistributedDataLoader {
             )))
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<BatchLease>(max_queue_batches);
+        let autotune_task = if autotune_enabled {
+            let pipeline = pipeline.clone();
+            let metrics = metrics.clone();
+            let shared = autotune.clone();
+            Some(rt.spawn(autotune_loop(
+                pipeline,
+                metrics,
+                shared,
+                max_inflight_bytes,
+                max_process_rss_bytes_cap,
+                rails,
+            )))
+        } else {
+            None
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<BatchLease>(initial_max_queue);
         let manifest_bytes = Arc::new(manifest_bytes);
+        let autotune_for_requests = autotune.clone();
+        let pipeline_for_requests = pipeline.clone();
         let task = rt.spawn(async move {
             let mut next_request_at = tokio::time::Instant::now();
-            let want = std::cmp::max(1, want);
             loop {
                 let now = tokio::time::Instant::now();
                 if now < next_request_at {
                     tokio::time::sleep_until(next_request_at).await;
                 }
+                let want = if autotune_for_requests.enabled {
+                    autotune_for_requests.want.load(Ordering::Relaxed).max(1)
+                } else {
+                    std::cmp::max(1, want)
+                };
 
                 let mut client = CoordinatorClient::new(channel.clone())
                     .max_decoding_message_size(grpc_max_message_bytes)
@@ -1759,7 +2401,7 @@ impl DistributedDataLoader {
                     run_lease_and_stream_batches(
                         channel.clone(),
                         grpc_max_message_bytes,
-                        pipeline.clone(),
+                        pipeline_for_requests.clone(),
                         manifest_bytes.clone(),
                         job_id.clone(),
                         node_id.clone(),
@@ -1777,9 +2419,12 @@ impl DistributedDataLoader {
             assigned_rank,
             world_size,
             metrics,
+            pipeline,
+            autotune,
             rx,
             task: Some(task),
             heartbeat_task,
+            autotune_task,
             rt,
         })
     }
@@ -1800,7 +2445,38 @@ impl DistributedDataLoader {
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(metrics_to_dict(py, self.metrics.as_ref())?.into_any())
+        let out = metrics_to_dict(py, self.metrics.as_ref())?;
+        out.set_item(
+            "effective_prefetch_batches",
+            self.pipeline.effective_prefetch_batches(),
+        )?;
+        out.set_item(
+            "effective_max_queue_batches",
+            self.pipeline.effective_max_queue_batches(),
+        )?;
+        out.set_item("effective_want", self.autotune.want.load(Ordering::Relaxed))?;
+        out.set_item("autotune_enabled", self.autotune.enabled)?;
+        out.set_item(
+            "autotune_pressure",
+            self.autotune.pressure_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_wait_ewma",
+            self.autotune.wait_ewma_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_rss_ewma",
+            self.autotune.rss_ewma_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_integral_rss",
+            self.autotune.integral_rss_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_cooldown_ticks",
+            self.autotune.cooldown_ticks.load(Ordering::Relaxed),
+        )?;
+        Ok(out.into_any())
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1808,7 +2484,8 @@ impl DistributedDataLoader {
     }
 
     fn __next__(&mut self) -> PyResult<PyBatch> {
-        self.rt.block_on(async {
+        let wait_started = Instant::now();
+        let out = self.rt.block_on(async {
             match self.rx.recv().await {
                 Some(lease) => Ok(PyBatch { lease }),
                 None => match self.task.take() {
@@ -1822,7 +2499,9 @@ impl DistributedDataLoader {
                     None => Err(PyStopIteration::new_err(())),
                 },
             }
-        })
+        });
+        self.autotune.on_wait(wait_started.elapsed());
+        out
     }
 
     fn close(&mut self) {
@@ -1832,9 +2511,112 @@ impl DistributedDataLoader {
         if let Some(handle) = self.heartbeat_task.take() {
             handle.abort();
         }
+        if let Some(handle) = self.autotune_task.take() {
+            handle.abort();
+        }
     }
 
     fn __del__(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod autotune_tests {
+    use super::{
+        autotune_tick, AutotuneController, AutotuneRails, AutotuneTickOutput, AutotuneUpdate,
+    };
+
+    fn tick(
+        state: &mut AutotuneController,
+        current: AutotuneUpdate,
+        rails: AutotuneRails,
+        wait_ratio: f64,
+        rss_ratio: f64,
+        inflight_ratio: f64,
+    ) -> AutotuneTickOutput {
+        autotune_tick(
+            state,
+            current,
+            rails,
+            wait_ratio,
+            rss_ratio,
+            inflight_ratio,
+            2.0,
+        )
+    }
+
+    #[test]
+    fn autotune_hard_cut_halves_knobs() {
+        let mut state = AutotuneController::new();
+        let rails = AutotuneRails {
+            min_prefetch_batches: 1,
+            max_prefetch_batches: 16,
+            min_max_queue_batches: 8,
+            max_max_queue_batches: 256,
+            min_want: 1,
+            max_want: 8,
+        };
+        let current = AutotuneUpdate {
+            want: 4,
+            prefetch_batches: 8,
+            max_queue_batches: 100,
+        };
+        let out = tick(&mut state, current, rails, 0.0, 0.98, 0.2);
+        assert!(out.changed);
+        assert_eq!(out.reason, "hard_cut");
+        assert_eq!(out.next.prefetch_batches, 4);
+        assert_eq!(out.next.max_queue_batches, 70);
+        assert_eq!(out.next.want, 2);
+    }
+
+    #[test]
+    fn autotune_increase_respects_rails() {
+        let mut state = AutotuneController::new();
+        let rails = AutotuneRails {
+            min_prefetch_batches: 1,
+            max_prefetch_batches: 4,
+            min_max_queue_batches: 8,
+            max_max_queue_batches: 16,
+            min_want: 1,
+            max_want: 2,
+        };
+        let current = AutotuneUpdate {
+            want: 2,
+            prefetch_batches: 4,
+            max_queue_batches: 16,
+        };
+        let out = tick(&mut state, current, rails, 0.30, 0.20, 0.10);
+        assert!(!out.changed);
+        assert_eq!(out.reason, "aimd_increase");
+        assert_eq!(out.next.prefetch_batches, 4);
+        assert_eq!(out.next.max_queue_batches, 16);
+        assert_eq!(out.next.want, 2);
+    }
+
+    #[test]
+    fn autotune_soft_cut_decrements() {
+        let mut state = AutotuneController::new();
+        let rails = AutotuneRails {
+            min_prefetch_batches: 1,
+            max_prefetch_batches: 8,
+            min_max_queue_batches: 8,
+            max_max_queue_batches: 64,
+            min_want: 1,
+            max_want: 4,
+        };
+        // Prime state to build pressure.
+        let current = AutotuneUpdate {
+            want: 3,
+            prefetch_batches: 4,
+            max_queue_batches: 32,
+        };
+        let _ = tick(&mut state, current, rails, 0.0, 0.95, 0.5);
+        let out = tick(&mut state, current, rails, 0.0, 0.95, 0.5);
+        assert_eq!(out.reason, "soft_cut");
+        assert!(out.changed);
+        assert_eq!(out.next.prefetch_batches, 3);
+        assert_eq!(out.next.max_queue_batches, 30);
+        assert_eq!(out.next.want, 3);
     }
 }
