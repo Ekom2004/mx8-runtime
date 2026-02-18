@@ -12,6 +12,7 @@ set -euo pipefail
 #
 # Optional:
 #   WORLD_SIZE=4 ./scripts/torch_ddp_gate.sh
+#   MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh
 #
 # Prereqs:
 # - python3 on PATH
@@ -156,6 +157,87 @@ if [[ "${MX8_TORCH_DDP_NODUPES:-0}" == "1" ]]; then
   "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_nodupes_gate.py"
   stop_coordinator "${COORD_PID}"
   COORD_PID=""
+fi
+
+if [[ "${MX8_TORCH_DDP_AUTOTUNE_AB:-0}" == "1" ]]; then
+  echo "[mx8] running ddp autotune AB gate (baseline vs autotune)"
+
+  AB_STEPS="${MX8_TORCH_AB_STEPS:-96}"
+  AB_WANT="${MX8_TORCH_AB_WANT:-1}"
+  AB_PREFETCH="${MX8_TORCH_AB_PREFETCH_BATCHES:-1}"
+  AB_MAX_QUEUE="${MX8_TORCH_AB_MAX_QUEUE_BATCHES:-1}"
+  AB_MAX_INFLIGHT="${MX8_TORCH_AB_MAX_INFLIGHT_BYTES:-67108864}"
+  AB_MAX_PROCESS_RSS="${MX8_TORCH_AB_MAX_PROCESS_RSS_BYTES:-1073741824}"
+  AB_COMPUTE_MS="${MX8_TORCH_AB_COMPUTE_MS:-5}"
+  AB_MIN_IMPROVEMENT="${MX8_TORCH_AB_MIN_WAIT_IMPROVEMENT:-0.0}"
+
+  run_ab_mode() {
+    local mode="$1"
+    local autotune_flag="$2"
+    local profile="$3"
+    local coord_log="${TMP_ROOT}/coordinator_autotune_ab_${mode}.log"
+    local out_log="${TMP_ROOT}/ddp_autotune_ab_${mode}.log"
+
+    echo "[mx8] starting coordinator (autotune_ab mode=${mode})" >&2
+    COORD_PID="$(start_coordinator "${coord_log}")"
+    wait_coordinator_ready "${COORD_PID}" "${coord_log}"
+
+    MX8_COORD_URL="${COORD_URL}" \
+    MX8_JOB_ID="${MX8_JOB_ID_AUTOTUNE_AB:-m5-ddp-autotune-ab}-${mode}" \
+    WORLD_SIZE="${WORLD_SIZE}" \
+    MX8_TORCH_AB_STEPS="${AB_STEPS}" \
+    MX8_DEV_LEASE_WANT="${AB_WANT}" \
+    MX8_PREFETCH_BATCHES="${AB_PREFETCH}" \
+    MX8_MAX_QUEUE_BATCHES="${AB_MAX_QUEUE}" \
+    MX8_MAX_INFLIGHT_BYTES="${AB_MAX_INFLIGHT}" \
+    MX8_MAX_PROCESS_RSS_BYTES="${AB_MAX_PROCESS_RSS}" \
+    MX8_TORCH_AB_COMPUTE_MS="${AB_COMPUTE_MS}" \
+    MX8_AUTOTUNE="${autotune_flag}" \
+    MX8_AUTOTUNE_PROFILE="${profile}" \
+    MX8_AUTOTUNE_AB_MODE="${mode}" \
+    "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m5_torch_ddp_autotune_ab_gate.py" | tee "${out_log}" >&2
+
+    stop_coordinator "${COORD_PID}"
+    COORD_PID=""
+
+    local wait_ratio
+    wait_ratio="$(grep -E '^wait_ratio:' "${out_log}" | head -n 1 | sed -e 's/^wait_ratio: //')"
+    if [[ -z "${wait_ratio}" ]]; then
+      echo "[mx8] autotune AB gate: failed to parse wait_ratio from ${out_log}" >&2
+      exit 1
+    fi
+    echo "${wait_ratio}"
+  }
+
+  baseline_wait="$(run_ab_mode baseline 0 safe)"
+  autotune_wait="$(run_ab_mode autotune 1 throughput)"
+
+  python3 - "${baseline_wait}" "${autotune_wait}" "${AB_MIN_IMPROVEMENT}" <<'PY'
+import sys
+
+baseline = float(sys.argv[1])
+autotune = float(sys.argv[2])
+min_improvement = float(sys.argv[3])
+
+if baseline <= 0.0:
+    if autotune > 0.01:
+        raise SystemExit(
+            f"[mx8] autotune AB gate FAILED: baseline wait_ratio={baseline:.6f}, autotune={autotune:.6f}"
+        )
+else:
+    target = baseline * (1.0 - min_improvement)
+    if autotune > target:
+        raise SystemExit(
+            "[mx8] autotune AB gate FAILED: "
+            f"baseline={baseline:.6f}, autotune={autotune:.6f}, "
+            f"required<={target:.6f} (min_improvement={min_improvement:.3f})"
+        )
+
+print(
+    "[mx8] autotune AB gate OK: "
+    f"baseline_wait_ratio={baseline:.6f} autotune_wait_ratio={autotune:.6f}"
+)
+PY
 fi
 
 if [[ "${MX8_TORCH_DDP_DETERMINISM:-0}" == "1" ]]; then

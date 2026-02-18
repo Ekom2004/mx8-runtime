@@ -93,7 +93,10 @@ if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then
   ./scripts/soak_demo2_minio_scale.sh
 fi
 
-if [[ "${MX8_SMOKE_TORCH_DDP_DETERMINISM:-0}" == "1" ]]; then
+if [[ "${MX8_SMOKE_TORCH_DDP_AUTOTUNE_AB:-0}" == "1" ]]; then
+  echo "[mx8] torch_ddp_gate (multi-process PyTorch autotune AB gate)"
+  MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh
+elif [[ "${MX8_SMOKE_TORCH_DDP_DETERMINISM:-0}" == "1" ]]; then
   echo "[mx8] torch_ddp_gate (multi-process PyTorch determinism gate)"
   MX8_TORCH_DDP_DETERMINISM=1 ./scripts/torch_ddp_gate.sh
 elif [[ "${MX8_SMOKE_TORCH_DDP_RESTART:-0}" == "1" ]]; then
@@ -105,6 +108,11 @@ elif [[ "${MX8_SMOKE_TORCH_DDP_NODUPES:-0}" == "1" ]]; then
 elif [[ "${MX8_SMOKE_TORCH_DDP:-0}" == "1" ]]; then
   echo "[mx8] torch_ddp_gate (multi-process PyTorch training gate)"
   ./scripts/torch_ddp_gate.sh
+fi
+
+if [[ "${MX8_SMOKE_AUTOTUNE_PRESSURE_SIM:-0}" == "1" ]]; then
+  echo "[mx8] autotune_memory_pressure_sim (simulated RSS pressure reaction gate)"
+  ./scripts/autotune_memory_pressure_sim.sh
 fi
 
 echo "[mx8] smoke OK"

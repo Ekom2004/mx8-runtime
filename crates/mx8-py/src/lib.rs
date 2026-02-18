@@ -137,7 +137,11 @@ struct RuntimeConfig {
 impl RuntimeConfig {
     #[new]
     #[pyo3(signature = (prefetch_batches=None, max_queue_batches=None, want=None))]
-    fn new(prefetch_batches: Option<usize>, max_queue_batches: Option<usize>, want: Option<u32>) -> Self {
+    fn new(
+        prefetch_batches: Option<usize>,
+        max_queue_batches: Option<usize>,
+        want: Option<u32>,
+    ) -> Self {
         Self {
             prefetch_batches,
             max_queue_batches,
@@ -658,7 +662,8 @@ impl DataLoader {
             )
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
-        let max_process_rss_bytes_cap = max_process_rss_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
+        let max_process_rss_bytes_cap =
+            max_process_rss_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
         let caps = RuntimeCaps {
             max_inflight_bytes,
             max_queue_batches,
@@ -1447,6 +1452,8 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<DataLoader>()?;
     m.add_class::<DistributedDataLoader>()?;
+    m.add_class::<Constraints>()?;
+    m.add_class::<RuntimeConfig>()?;
     m.add_class::<PyBatch>()?;
     m.add_function(wrap_pyfunction!(pack, m)?)?;
     m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
@@ -2618,5 +2625,51 @@ mod autotune_tests {
         assert_eq!(out.next.prefetch_batches, 3);
         assert_eq!(out.next.max_queue_batches, 30);
         assert_eq!(out.next.want, 3);
+    }
+
+    #[test]
+    fn autotune_tick_sequence_is_deterministic() {
+        let rails = AutotuneRails {
+            min_prefetch_batches: 1,
+            max_prefetch_batches: 8,
+            min_max_queue_batches: 8,
+            max_max_queue_batches: 64,
+            min_want: 1,
+            max_want: 4,
+        };
+        let seed = AutotuneUpdate {
+            want: 1,
+            prefetch_batches: 2,
+            max_queue_batches: 16,
+        };
+        let signals = [
+            (0.20, 0.50, 0.40),
+            (0.22, 0.55, 0.45),
+            (0.25, 0.60, 0.50),
+            (0.05, 0.98, 0.99),
+            (0.10, 0.70, 0.75),
+            (0.18, 0.40, 0.30),
+        ];
+
+        let run = |mut state: AutotuneController| {
+            let mut cur = seed;
+            let mut out = Vec::new();
+            for (wait, rss, inflight) in signals {
+                let tick = tick(&mut state, cur, rails, wait, rss, inflight);
+                out.push((
+                    tick.next.want,
+                    tick.next.prefetch_batches,
+                    tick.next.max_queue_batches,
+                    tick.reason,
+                    tick.changed,
+                ));
+                cur = tick.next;
+            }
+            out
+        };
+
+        let first = run(AutotuneController::new());
+        let second = run(AutotuneController::new());
+        assert_eq!(first, second);
     }
 }

@@ -26,10 +26,8 @@ import mx8
 
 loader = mx8.load(
     "s3://bucket/prefix@refresh",
-    batch_size_samples=512,
-    max_inflight_bytes=128 * 1024 * 1024,
-    max_queue_batches=64,
-    prefetch_batches=1,
+    profile="balanced",
+    autotune=True,
 )
 
 for batch in loader:
@@ -47,8 +45,37 @@ for batch in loader:
 - `max_inflight_bytes`
 - `max_queue_batches`
 - `prefetch_batches`
+- `max_process_rss_bytes`
 - `start_id`, `end_id` (must be set together)
 - `node_id` (for lock ownership/proof logs)
+- `profile` (`safe|balanced|throughput`)
+- `autotune` (`True|False`)
+- `constraints` (`mx8.Constraints`)
+- `runtime` (`mx8.RuntimeConfig`)
+
+### `mx8.Constraints` and `mx8.RuntimeConfig`
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/train@refresh",
+    profile="throughput",
+    autotune=True,
+    constraints=mx8.Constraints(
+        max_inflight_bytes=512 * 1024 * 1024,
+        max_process_rss_bytes=24 * 1024 * 1024 * 1024,
+    ),
+)
+
+loader_manual = mx8.load(
+    "s3://bucket/train@refresh",
+    autotune=False,
+    runtime=mx8.RuntimeConfig(prefetch_batches=8, max_queue_batches=32),
+)
+```
+
+`runtime.want` is currently consumed by `mx8.DistributedDataLoader` (not by single-node `mx8.load`).
 
 ### `PyBatch` methods/properties
 
@@ -130,9 +157,9 @@ v0 training note: distributed data delivery is supported, but v0 is non-elastic 
 
 ## API shape (v0 vs v1 direction)
 
-v0 exposes explicit tuning knobs in constructor args (`max_inflight_bytes`, `max_queue_batches`, `prefetch_batches`, `want`, ...).
+v0 still supports explicit tuning knobs in constructor args (`max_inflight_bytes`, `max_queue_batches`, `prefetch_batches`, `want`, ...).
 
-Planned v1 introduces a two-layer API:
+v0 also ships the v1-style preview for `mx8.load(...)`:
 
 - simple path (`profile` + `autotune`)
 - advanced path (`constraints` + `RuntimeConfig`)

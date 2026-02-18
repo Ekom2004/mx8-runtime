@@ -21,10 +21,15 @@ Status: working checklist for the hybrid AIMD + PID controller rollout.
 
 - [x] Add env-gated preview in v0 (`MX8_AUTOTUNE`, `MX8_AUTOTUNE_PROFILE`)
 - [x] Expose effective autotune fields in distributed `loader.stats()`
-- [ ] Add first-class v1 public API (`profile=...`, `autotune=True`, `constraints=...`)
+- [x] Add first-class v1 public API (`profile=...`, `autotune=True`, `constraints=...`)
 
 ## Validation gates
 
-- [ ] Add deterministic controller simulation test (unit test for tick transitions)
-- [ ] Add distributed gate showing reduced `data_wait_ratio` vs static baseline
-- [ ] Add regression threshold for no cap breach under autotune
+- [x] Add deterministic controller simulation test (unit test for tick transitions)
+- [x] Add distributed gate showing reduced `data_wait_ratio` vs static baseline
+- [x] Add regression threshold for no cap breach under autotune
+
+Reference command:
+
+- `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
+- `./scripts/autotune_memory_pressure_sim.sh`
