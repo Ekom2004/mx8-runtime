@@ -14,6 +14,23 @@ It is optimized for inference/ETL/preprocessing today, with training support und
 - **Python path is live:** PyO3 package + smoke scripts are available.
 - **Autotune preview is live:** hybrid AIMD + PID-like control adjusts `want`, `prefetch_batches`, and `max_queue_batches` within profile rails (`safe|balanced|throughput`).
 
+## Quickstart (current API)
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/prefix/@refresh",
+    recursive=True,
+    profile="balanced",
+    autotune=True,
+)
+
+for batch in loader:
+    # consume batch.payload / batch.offsets / batch.sample_ids
+    pass
+```
+
 ## Current v0 Constraints
 
 - Training is **non-elastic** in v0: rank/node failure will terminate DDP jobs.
@@ -36,23 +53,21 @@ It is optimized for inference/ETL/preprocessing today, with training support und
 
 MX8 is designed to be hard-capped by config (backpressure via inflight permits).
 
+Need explicit memory rails? Use:
+
 ```python
-import mx8
-
-loader = mx8.vision.ImageFolderLoader(
-    "/path/to/mx8-dataset@refresh",
-    batch_size_samples=64,
-    max_inflight_bytes=256 * 1024 * 1024,
-    max_queue_batches=8,
-    prefetch_batches=4,
+loader = mx8.load(
+    "s3://bucket/prefix/@refresh",
+    profile="balanced",
+    autotune=True,
+    constraints=mx8.Constraints(
+        max_inflight_bytes=256 * 1024 * 1024,
+        max_process_rss_bytes=24 * 1024 * 1024 * 1024,
+    ),
 )
-
-for step, (images, labels) in enumerate(loader):
-    if step % 100 == 0:
-        print(loader.stats())  # includes ram_high_water_bytes
 ```
 
-Note: `max_inflight_bytes` caps loader-path memory. Total process RSS also includes model/framework/user allocations.
+Note: `max_inflight_bytes` caps loader-path memory. Total process RSS includes model/framework/user allocations.
 
 ### Autotune (AIMD + PID-like rails)
 
