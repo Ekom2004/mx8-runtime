@@ -12,6 +12,7 @@ It is optimized for inference/ETL/preprocessing today, with training support und
 - **Pinned snapshot semantics are live:** `plain`, `@refresh`, and `@sha256:` resolve to `manifest_hash`.
 - **S3-compatible path is live:** MinIO gates verify resolver + runtime behavior.
 - **Python path is live:** PyO3 package + smoke scripts are available.
+- **Autotune preview is live:** hybrid AIMD + PID-like control adjusts `want`, `prefetch_batches`, and `max_queue_batches` within profile rails (`safe|balanced|throughput`).
 
 ## Current v0 Constraints
 
@@ -23,6 +24,8 @@ It is optimized for inference/ETL/preprocessing today, with training support und
 
 - **Main smoke gate:** `./scripts/smoke.sh`
 - **Zero-manifest accelerated burn-in:** `MX8_BURNIN_RUNS=3 ./scripts/direct_stream_burnin.sh`
+- **Autotune A/B DDP gate:** `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
+- **Autotune pressure simulation:** `./scripts/autotune_memory_pressure_sim.sh`
 - **Python smoke:** `./scripts/py_smoke.sh`
 - **Wheel + pip smoke:** `./scripts/build_wheel.sh && ./scripts/pip_wheel_smoke.sh`
 - **MinIO/S3-compatible gates:** `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
@@ -50,6 +53,20 @@ for step, (images, labels) in enumerate(loader):
 ```
 
 Note: `max_inflight_bytes` caps loader-path memory. Total process RSS also includes model/framework/user allocations.
+
+### Autotune (AIMD + PID-like rails)
+
+Autotune is available as a preview path in v0 and is exposed through the Python loader API and distributed gate scripts.
+
+- Profiles: `safe`, `balanced`, `throughput`
+- Controller intent: increase throughput while staying inside explicit memory/safety constraints
+- Runtime knobs adjusted by autotune:
+  - `want` (distributed lease demand)
+  - `prefetch_batches`
+  - `max_queue_batches`
+- Env controls (distributed path):
+  - `MX8_AUTOTUNE=1`
+  - `MX8_AUTOTUNE_PROFILE=safe|balanced|throughput` (default `balanced`)
 
 ### Packing (Many Small Objects)
 
