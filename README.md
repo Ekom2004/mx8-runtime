@@ -1,27 +1,37 @@
 # MX8 Runtime (v0)
 
-MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus a tiny per-job coordinator/agent layer for multi-node correctness and pacing.
+MX8 is a bounded, high-performance Rust data runtime (with Python bindings) plus a tiny per-job coordinator/agent layer for multi-node correctness.
 
-## Install (PyPI)
+It is optimized for inference/ETL/preprocessing today, with training support under v0 non-elastic semantics.
 
-- `pip install mx8 pillow numpy torch`
+## What Works Today (Front-page status)
 
-## Documentation
+- **Zero-manifest path is live:** `mx8d-agent` runs direct-stream manifest ingest for lease execution.
+- **Distributed lease flow is live:** membership barrier, lease grant/progress, expiry, and requeue/reassignment are exercised by demos/gates.
+- **Bounded memory runtime is live:** inflight byte caps + queue backpressure are enforced.
+- **Pinned snapshot semantics are live:** `plain`, `@refresh`, and `@sha256:` resolve to `manifest_hash`.
+- **S3-compatible path is live:** MinIO gates verify resolver + runtime behavior.
+- **Python path is live:** PyO3 package + smoke scripts are available.
 
-- Python API: `docs/python_api.md`
-- Vision labels/layouts: `docs/vision_labels.md`
-- S3/runtime tuning: `docs/s3_runtime_tuning.md`
-- Memory contract: `docs/memory_contract.md`
-- Zero-manifest roadmap TODO: `docs/v1_6_zero_manifest_todo.md`
-- AI agent guide: `docs/ai_agent_guide.md`
-- AI agent context (JSON): `docs/ai_agent_context.json`
-- Troubleshooting: `docs/troubleshooting.md`
+## Current v0 Constraints
 
-## Bounded memory (v0)
+- Training is **non-elastic** in v0: rank/node failure will terminate DDP jobs.
+- Cursor semantics are at-least-once at boundaries for inference/ETL (no exactly-once guarantee in v0).
+- Refresh is job-start only (no mid-run pickup).
 
-MX8 is designed to be *hard-capped* by config (backpressure via inflight permits).
+## Quick Verify Commands
 
-Note: v0 hard cap is loader-path memory (`max_inflight_bytes`). Total process RAM also includes model/framework/user allocations.
+- **Main smoke gate:** `./scripts/smoke.sh`
+- **Zero-manifest accelerated burn-in:** `MX8_BURNIN_RUNS=3 ./scripts/direct_stream_burnin.sh`
+- **Python smoke:** `./scripts/py_smoke.sh`
+- **Wheel + pip smoke:** `./scripts/build_wheel.sh && ./scripts/pip_wheel_smoke.sh`
+- **MinIO/S3-compatible gates:** `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
+
+## Key Capability Areas
+
+### Bounded Memory Runtime
+
+MX8 is designed to be hard-capped by config (backpressure via inflight permits).
 
 ```python
 import mx8
@@ -37,72 +47,37 @@ loader = mx8.vision.ImageFolderLoader(
 for step, (images, labels) in enumerate(loader):
     if step % 100 == 0:
         print(loader.stats())  # includes ram_high_water_bytes
-    # Consume batch; do not accumulate batches in a list.
 ```
 
-## Quick gates
+Note: `max_inflight_bytes` caps loader-path memory. Total process RSS also includes model/framework/user allocations.
 
-- Repo smoke (offline + online sub-gates):
-  - `./scripts/smoke.sh`
-  - Direct-stream manifest ingest is now default in `mx8d-agent`.
-- Python smoke:
-  - `./scripts/py_smoke.sh`
-  - `MX8_PY_SMOKE_INSTALL_TORCH=1 ./scripts/py_smoke.sh`
-- Wheel build + pip smoke:
-  - `./scripts/build_wheel.sh`
-  - `./scripts/pip_wheel_smoke.sh`
-- MinIO (S3-compatible) gates:
-  - `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_DEMO2_MINIO_SCALE=1 MX8_SMOKE_MINIO_MANIFEST_STORE=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_MINIO_PACK=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_PY_VISION_PILLOW=1 ./scripts/smoke.sh` (heavier; installs torch+pillow in a temp venv)
-  - `MX8_SMOKE_PY_VISION_DECODE_BENCH=1 ./scripts/smoke.sh` (local rust-vs-python decode backend perf compare)
-- PyTorch DDP gates (local multi-process):
-  - `MX8_SMOKE_TORCH_DDP=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_TORCH_DDP_NODUPES=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_TORCH_DDP_DETERMINISM=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_TORCH_DDP_RESTART=1 ./scripts/smoke.sh`
+### Packing (Many Small Objects)
 
-## Packing (v0)
-
-If your dataset is “many small S3 objects” (e.g. ImageFolder layout with millions of files), run `mx8-pack-s3` once to create tar shards plus a byte-range manifest:
+For many-small-object S3 datasets, pack once into tar shards + byte-range manifest:
 
 - Input: `s3://bucket/raw/train/`
 - Output: `s3://bucket/mx8/train/`
-  - shards: `s3://bucket/mx8/train/shards/shard-00000.tar`
-  - manifest: `s3://bucket/mx8/train/_mx8/manifest.tsv`
-  - labels (optional): `s3://bucket/mx8/train/_mx8/labels.tsv` (if ImageFolder labels are enabled)
+  - `shards/shard-00000.tar`
+  - `_mx8/manifest.tsv`
+  - optional `_mx8/labels.tsv`
 
-You can run the packer either via the CLI:
+CLI example:
 
 - `MX8_PACK_IN=s3://bucket/raw/train/ MX8_PACK_OUT=s3://bucket/mx8/train/ cargo run -p mx8-snapshot --features s3 --bin mx8-pack-s3`
 
-Or via the Python API (after installing `mx8`):
+Python example:
 
 - `python -c "import mx8; mx8.pack('s3://bucket/raw/train/', out='s3://bucket/mx8/train/', shard_mb=512, label_mode='auto')"`
-- Local: `python -c "import mx8; mx8.pack_dir('/path/to/raw', out='/path/to/mx8', shard_mb=512, label_mode='imagefolder', require_labels=True)"`
 
-Then point MX8 at the packed prefix (snapshot resolver will use the precomputed manifest, avoiding large LIST operations).
-
-## Vision v0 (ImageFolder, PyTorch)
-
-For ImageFolder-style datasets (`prefix/<label>/<file>`), MX8 can deliver `(images, labels)` directly as torch tensors:
+### Vision (ImageFolder -> Torch tensors)
 
 ```python
 import mx8
 
-mx8.pack(
-    "s3://bucket/raw/train/",
-    out="s3://bucket/mx8/train/",
-    shard_mb=512,
-    label_mode="imagefolder",
-    require_labels=True,
-)
-
 loader = mx8.vision.ImageFolderLoader(
     "s3://bucket/mx8/train/@refresh",
     batch_size_samples=64,
-    resize_hw=(224, 224),  # (H,W); optional
+    resize_hw=(224, 224),
 )
 
 for images, labels in loader:
@@ -111,29 +86,18 @@ for images, labels in loader:
     pass
 ```
 
-## Training semantics (v0)
+## Current Docs
 
-### Non-elastic
-MX8 v0 does **not** keep PyTorch DDP alive after rank/node failure.
+- Python API: `docs/python_api.md`
+- Vision labels/layouts: `docs/vision_labels.md`
+- S3/runtime tuning: `docs/s3_runtime_tuning.md`
+- Memory contract: `docs/memory_contract.md`
+- Zero-manifest rollout notes: `docs/v1_6_zero_manifest_todo.md`
+- Troubleshooting: `docs/troubleshooting.md`
+- AI agent guide: `docs/ai_agent_guide.md`
+- AI agent context: `docs/ai_agent_context.json`
 
-- If a rank dies, DDP will terminate the job.
-- Lease reassignment is for inference/ETL correctness (keep the job draining), not for elastic training.
+## Roadmap Next (after v1.6)
 
-### Determinism
-For a pinned snapshot (`manifest_hash`) and frozen membership (`world_size` barrier), sharding/shuffle is deterministic by:
-
-- `MX8_SEED` (default: `0`)
-- `MX8_EPOCH` (default: `0`)
-- `MX8_SHUFFLE` (default: `false`; accepts `true/false/1/0`; set to `true` for training-style block shuffles)
-
-### Checkpointing & resume (epoch-level)
-MX8 v0 supports **epoch-level resume**.
-
-On preemption or crash:
-
-- Save your model checkpoint regularly (every N steps).
-- Restart the job; MX8 restarts from the beginning of the current epoch.
-- Data order is deterministic for the same `(manifest_hash, seed, epoch, world_size)` and frozen membership.
-- Some data may be re-processed; training continues correctly.
-
-Mid-epoch resume (dataloader `state_dict()`) is planned for v1.
+- **v1.7 `mx8.mix`:** deterministic weighted mixing across multiple loaders with shared global memory/backpressure caps.
+- **v1.8 video-native path:** clip-level indexing/decode hardening on top of current bounded runtime.
