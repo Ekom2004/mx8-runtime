@@ -23,7 +23,7 @@ use mx8_proto::v0::RequestLeaseRequest;
 
 use mx8_observe::metrics::{Counter, Gauge};
 
-use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
+use mx8_runtime::pipeline::{load_manifest_records_from_path, Pipeline, RuntimeCaps};
 use mx8_runtime::sink::Sink;
 use mx8_runtime::types::Batch;
 
@@ -305,7 +305,7 @@ struct ProgressLoopCtx {
 async fn run_lease(
     channel: Channel,
     pipeline: Arc<Pipeline>,
-    manifest_bytes: Arc<Vec<u8>>,
+    manifest_records: Arc<Vec<mx8_core::types::ManifestRecord>>,
     args: &Args,
     manifest_hash: &str,
     metrics: &Arc<AgentMetrics>,
@@ -351,7 +351,12 @@ async fn run_lease(
     ));
 
     pipeline
-        .run_manifest_bytes_range(sink, &manifest_bytes, range.start_id, range.end_id)
+        .run_manifest_records_range(
+            sink,
+            manifest_records.as_slice(),
+            range.start_id,
+            range.end_id,
+        )
         .await?;
 
     let _ = done_tx.send(());
@@ -464,10 +469,10 @@ async fn main() -> Result<()> {
         // M3: manifest proxy fallback (control-plane only).
         // Cache the pinned manifest locally so future runtime stages can load it without
         // needing to talk to the coordinator.
-        let mut manifest_bytes: Option<Arc<Vec<u8>>> = None;
+        let mut manifest_path: Option<PathBuf> = None;
         match fetch_and_cache_manifest(&mut client, &args, &manifest_hash).await {
-            Ok(Some(bytes)) => {
-                manifest_bytes = Some(bytes);
+            Ok(Some(path)) => {
+                manifest_path = Some(path);
             }
             Ok(None) => {}
             Err(err) => {
@@ -478,9 +483,10 @@ async fn main() -> Result<()> {
             }
         };
 
-        let manifest_bytes = manifest_bytes.ok_or_else(|| {
-            anyhow::anyhow!("manifest bytes unavailable; cannot run leases without GetManifest")
+        let manifest_path = manifest_path.ok_or_else(|| {
+            anyhow::anyhow!("manifest unavailable; cannot run leases without GetManifest")
         })?;
+        let manifest_records = Arc::new(load_manifest_records_from_path(&manifest_path)?);
 
         if args.metrics_snapshot_interval_ms > 0 {
             let metrics_clone = metrics.clone();
@@ -547,7 +553,7 @@ async fn main() -> Result<()> {
             let args_clone = args.clone();
             let metrics_clone = metrics.clone();
             let manifest_hash_clone = manifest_hash.clone();
-            let manifest_bytes = manifest_bytes.clone();
+            let manifest_records = manifest_records.clone();
             tokio::spawn(async move {
                 let want = std::cmp::max(1, args_clone.dev_lease_want);
                 let grpc_max = args_clone.grpc_max_message_bytes;
@@ -607,7 +613,7 @@ async fn main() -> Result<()> {
                             let pipeline = pipeline.clone();
                             let args = args_clone.clone();
                             let manifest_hash = manifest_hash_clone.clone();
-                            let manifest_bytes = manifest_bytes.clone();
+                            let manifest_records = manifest_records.clone();
                             let metrics = metrics_clone.clone();
                             let ch = lease_channel.clone();
                             let lease_id = lease.lease_id.clone();
@@ -626,7 +632,7 @@ async fn main() -> Result<()> {
                                 let res = run_lease(
                                     ch,
                                     pipeline,
-                                    manifest_bytes,
+                                    manifest_records,
                                     &args,
                                     &manifest_hash,
                                     &metrics,
@@ -708,18 +714,36 @@ async fn fetch_and_cache_manifest(
     client: &mut CoordinatorClient<Channel>,
     args: &Args,
     manifest_hash: &str,
-) -> Result<Option<Arc<Vec<u8>>>> {
+) -> Result<Option<PathBuf>> {
     let req = GetManifestRequest {
         job_id: args.job_id.clone(),
         manifest_hash: manifest_hash.to_string(),
     };
 
+    let path = args.manifest_cache_dir.join(manifest_hash);
     let stream_resp = client.get_manifest_stream(req.clone()).await;
-    let (manifest_bytes, schema_version) = match stream_resp {
+    let (manifest_bytes, schema_version, stream_used) = match stream_resp {
         Ok(resp) => {
             let mut stream = resp.into_inner();
-            let mut out: Vec<u8> = Vec::new();
             let mut schema_version: Option<u32> = None;
+            let mut streamed_bytes: u64 = 0;
+            let parent = path.parent().unwrap_or(path.as_path());
+            std::fs::create_dir_all(parent)?;
+            let mut tmp = path.clone();
+            let suffix = format!(
+                "tmp.{}.{}",
+                std::process::id(),
+                mx8_observe::time::unix_time_ms()
+            );
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("manifest");
+            tmp.set_file_name(format!("{file_name}.{suffix}"));
+            let mut tmp_file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
             while let Some(chunk) = stream.message().await? {
                 if let Some(existing) = schema_version {
                     if chunk.schema_version != existing {
@@ -730,26 +754,45 @@ async fn fetch_and_cache_manifest(
                 } else {
                     schema_version = Some(chunk.schema_version);
                 }
-                out.extend_from_slice(chunk.data.as_slice());
+                use std::io::Write;
+                tmp_file.write_all(chunk.data.as_slice())?;
+                streamed_bytes = streamed_bytes.saturating_add(chunk.data.len() as u64);
             }
             let schema_version = schema_version.ok_or_else(|| {
                 anyhow::anyhow!("GetManifestStream returned no chunks (empty manifest)")
             })?;
-            (out, schema_version)
+            use std::io::Write;
+            tmp_file.flush()?;
+            tmp_file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            (None, schema_version, Some(streamed_bytes))
         }
         Err(status) => {
             if status.code() != tonic::Code::Unimplemented {
                 return Err(anyhow::anyhow!("GetManifestStream failed: {status}"));
             }
             let resp = client.get_manifest(req).await?.into_inner();
-            (resp.manifest_bytes, resp.schema_version)
+            (Some(resp.manifest_bytes), resp.schema_version, None)
         }
     };
 
-    let path = args.manifest_cache_dir.join(manifest_hash);
-    let bytes = Arc::new(manifest_bytes);
-    if let Err(err) = write_atomic(&path, bytes.as_slice()) {
-        warn!(error = %err, path = %path.display(), "failed to cache manifest");
+    if let Some(bytes) = manifest_bytes {
+        if let Err(err) = write_atomic(&path, bytes.as_slice()) {
+            warn!(error = %err, path = %path.display(), "failed to cache manifest");
+        } else {
+            info!(
+                target: "mx8_proof",
+                event = "manifest_cached",
+                job_id = %args.job_id,
+                node_id = %args.node_id,
+                manifest_hash = %manifest_hash,
+                schema_version = schema_version,
+                manifest_bytes = bytes.len() as u64,
+                path = %path.display(),
+                source = "unary_fallback",
+                "cached manifest"
+            );
+        }
     } else {
         info!(
             target: "mx8_proof",
@@ -758,10 +801,11 @@ async fn fetch_and_cache_manifest(
             node_id = %args.node_id,
             manifest_hash = %manifest_hash,
             schema_version = schema_version,
-            manifest_bytes = bytes.len() as u64,
+            manifest_bytes = stream_used.unwrap_or(0),
             path = %path.display(),
+            source = "stream",
             "cached manifest"
         );
     }
-    Ok(Some(bytes))
+    Ok(Some(path))
 }

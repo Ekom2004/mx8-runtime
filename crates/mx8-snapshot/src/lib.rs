@@ -50,7 +50,16 @@ pub struct ResolvedSnapshot {
     pub intent_key: Option<String>,
     pub manifest_hash: ManifestHash,
     pub manifest_bytes: Vec<u8>,
+    pub manifest_bytes_materialized: bool,
     pub schema_version: u32,
+}
+
+#[derive(Debug)]
+struct IndexedManifest {
+    manifest_hash: ManifestHash,
+    manifest_bytes: u64,
+    canonical_bytes: Vec<u8>,
+    canonical_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +68,8 @@ pub struct SnapshotResolverConfig {
     pub wait_timeout: Duration,
     pub poll_interval: Duration,
     pub dev_manifest_path: Option<PathBuf>,
+    pub recursive: bool,
+    pub materialize_manifest_bytes: bool,
 }
 
 impl Default for SnapshotResolverConfig {
@@ -68,6 +79,8 @@ impl Default for SnapshotResolverConfig {
             wait_timeout: Duration::from_secs(30),
             poll_interval: Duration::from_millis(100),
             dev_manifest_path: None,
+            recursive: true,
+            materialize_manifest_bytes: true,
         }
     }
 }
@@ -89,7 +102,11 @@ impl SnapshotResolver {
         match parsed {
             DatasetLink::Pinned { manifest_hash, .. } => {
                 let hash = ManifestHash(manifest_hash);
-                let bytes = self.store.get_manifest_bytes(&hash)?;
+                let bytes = if self.cfg.materialize_manifest_bytes {
+                    self.store.get_manifest_bytes(&hash)?
+                } else {
+                    Vec::new()
+                };
                 info!(
                     target: "mx8_proof",
                     event = "snapshot_resolved",
@@ -101,6 +118,7 @@ impl SnapshotResolver {
                     intent_key: None,
                     manifest_hash: hash,
                     manifest_bytes: bytes,
+                    manifest_bytes_materialized: self.cfg.materialize_manifest_bytes,
                     schema_version: MANIFEST_SCHEMA_VERSION,
                 })
             }
@@ -119,7 +137,11 @@ impl SnapshotResolver {
 
         if !refresh {
             if let Some(hash) = self.store.get_current_snapshot(&intent_key)? {
-                let bytes = self.store.get_manifest_bytes(&hash)?;
+                let bytes = if self.cfg.materialize_manifest_bytes {
+                    self.store.get_manifest_bytes(&hash)?
+                } else {
+                    Vec::new()
+                };
                 info!(
                     target: "mx8_proof",
                     event = "snapshot_resolved",
@@ -132,6 +154,7 @@ impl SnapshotResolver {
                     intent_key: Some(intent_key),
                     manifest_hash: hash,
                     manifest_bytes: bytes,
+                    manifest_bytes_materialized: self.cfg.materialize_manifest_bytes,
                     schema_version: MANIFEST_SCHEMA_VERSION,
                 });
             }
@@ -158,16 +181,33 @@ impl SnapshotResolver {
                 "elected indexer"
             );
 
-            let (_records, canonical_bytes) = match self.cfg.dev_manifest_path.clone() {
-                Some(path) => load_dev_manifest_tsv(&path)?,
-                None => index_manifest_for_base(base)?,
+            let indexed = match self.cfg.dev_manifest_path.clone() {
+                Some(path) => {
+                    let (records, canonical_bytes) = load_dev_manifest_tsv(&path)?;
+                    indexed_manifest_from_bytes(
+                        records,
+                        canonical_bytes,
+                        self.cfg.materialize_manifest_bytes,
+                    )?
+                }
+                None => index_manifest_for_base(
+                    base,
+                    self.cfg.recursive,
+                    self.cfg.materialize_manifest_bytes,
+                )?,
             };
-            let manifest_hash = ManifestHash(mx8_manifest_store::sha256_hex(&canonical_bytes));
-
-            self.store
-                .put_manifest_bytes(&manifest_hash, &canonical_bytes)?;
+            let manifest_hash = indexed.manifest_hash.clone();
+            match indexed.canonical_path.as_ref() {
+                Some(path) => self.store.put_manifest_file(&manifest_hash, path)?,
+                None => self
+                    .store
+                    .put_manifest_bytes(&manifest_hash, &indexed.canonical_bytes)?,
+            }
             self.store
                 .set_current_snapshot(&intent_key, &manifest_hash)?;
+            if let Some(path) = indexed.canonical_path.as_ref() {
+                let _ = std::fs::remove_file(path);
+            }
 
             info!(
                 target: "mx8_proof",
@@ -175,13 +215,14 @@ impl SnapshotResolver {
                 mode = if refresh { "refresh" } else { "create" },
                 intent_key = %intent_key,
                 manifest_hash = %manifest_hash.0,
-                manifest_bytes = canonical_bytes.len() as u64,
+                manifest_bytes = indexed.manifest_bytes,
                 "created snapshot"
             );
             return Ok(ResolvedSnapshot {
                 intent_key: Some(intent_key),
                 manifest_hash,
-                manifest_bytes: canonical_bytes,
+                manifest_bytes: indexed.canonical_bytes,
+                manifest_bytes_materialized: self.cfg.materialize_manifest_bytes,
                 schema_version: MANIFEST_SCHEMA_VERSION,
             });
         }
@@ -197,7 +238,11 @@ impl SnapshotResolver {
         );
         while start.elapsed() < self.cfg.wait_timeout {
             if let Some(hash) = self.store.get_current_snapshot(&intent_key)? {
-                let bytes = self.store.get_manifest_bytes(&hash)?;
+                let bytes = if self.cfg.materialize_manifest_bytes {
+                    self.store.get_manifest_bytes(&hash)?
+                } else {
+                    Vec::new()
+                };
                 info!(
                     target: "mx8_proof",
                     event = "snapshot_resolved",
@@ -211,6 +256,7 @@ impl SnapshotResolver {
                     intent_key: Some(intent_key),
                     manifest_hash: hash,
                     manifest_bytes: bytes,
+                    manifest_bytes_materialized: self.cfg.materialize_manifest_bytes,
                     schema_version: MANIFEST_SCHEMA_VERSION,
                 });
             }
@@ -228,12 +274,16 @@ impl SnapshotResolver {
     }
 }
 
-fn index_manifest_for_base(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+fn index_manifest_for_base(
+    base: &str,
+    recursive: bool,
+    materialize_manifest_bytes: bool,
+) -> Result<IndexedManifest, SnapshotError> {
     let trimmed = base.trim();
     if trimmed.starts_with("s3://") {
         #[cfg(feature = "s3")]
         {
-            return index_s3_prefix(trimmed);
+            return index_s3_prefix(trimmed, recursive, materialize_manifest_bytes);
         }
         #[cfg(not(feature = "s3"))]
         {
@@ -243,10 +293,131 @@ fn index_manifest_for_base(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>),
 
     // Local FS prefix indexing (directory path).
     if std::path::Path::new(trimmed).is_dir() {
-        return index_local_prefix(trimmed);
+        let (records, canonical_bytes) = index_local_prefix(trimmed, recursive)?;
+        return indexed_manifest_from_bytes(records, canonical_bytes, materialize_manifest_bytes);
     }
 
     Err(SnapshotError::IndexUnsupported(trimmed.to_string()))
+}
+
+fn indexed_manifest_from_bytes(
+    _records: Vec<ManifestRecord>,
+    canonical_bytes: Vec<u8>,
+    materialize_manifest_bytes: bool,
+) -> Result<IndexedManifest, SnapshotError> {
+    let manifest_hash = ManifestHash(mx8_manifest_store::sha256_hex(&canonical_bytes));
+    let manifest_bytes = canonical_bytes.len() as u64;
+    if materialize_manifest_bytes {
+        return Ok(IndexedManifest {
+            manifest_hash,
+            manifest_bytes,
+            canonical_bytes,
+            canonical_path: None,
+        });
+    }
+
+    let path = new_manifest_temp_path();
+    std::fs::write(&path, &canonical_bytes)
+        .map_err(|e| SnapshotError::IndexIo(format!("write temp manifest file failed: {e}")))?;
+    Ok(IndexedManifest {
+        manifest_hash,
+        manifest_bytes,
+        canonical_bytes: Vec::new(),
+        canonical_path: Some(path),
+    })
+}
+
+fn new_manifest_temp_path() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.push(format!("mx8-manifest-{}-{nanos}.tsv", std::process::id()));
+    path
+}
+
+#[cfg(feature = "s3")]
+struct CanonicalManifestSink {
+    materialize_manifest_bytes: bool,
+    canonical_bytes: Vec<u8>,
+    file_path: Option<PathBuf>,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    hasher: mx8_manifest_store::Sha256Hasher,
+    bytes_written: u64,
+}
+
+#[cfg(feature = "s3")]
+struct CanonicalManifestSinkOutput {
+    manifest_hash: ManifestHash,
+    manifest_bytes: u64,
+    canonical_bytes: Vec<u8>,
+    canonical_path: Option<PathBuf>,
+}
+
+#[cfg(feature = "s3")]
+impl CanonicalManifestSink {
+    fn new(materialize_manifest_bytes: bool) -> Result<Self, SnapshotError> {
+        let (file_path, writer) = if materialize_manifest_bytes {
+            (None, None)
+        } else {
+            let path = new_manifest_temp_path();
+            let file = std::fs::File::create(&path)
+                .map_err(|e| SnapshotError::IndexIo(format!("create temp manifest failed: {e}")))?;
+            (Some(path), Some(std::io::BufWriter::new(file)))
+        };
+
+        let mut sink = Self {
+            materialize_manifest_bytes,
+            canonical_bytes: Vec::new(),
+            file_path,
+            writer,
+            hasher: mx8_manifest_store::sha256_streaming_new(),
+            bytes_written: 0,
+        };
+        let header = format!("schema_version={MANIFEST_SCHEMA_VERSION}\n");
+        sink.write_bytes(header.as_bytes())?;
+        Ok(sink)
+    }
+
+    fn append_record(&mut self, record: &ManifestRecord) -> Result<(), SnapshotError> {
+        let line = manifest_record_tsv_line(record);
+        self.write_bytes(line.as_bytes())
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.hasher.update(bytes);
+        self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
+        if self.materialize_manifest_bytes {
+            self.canonical_bytes.extend_from_slice(bytes);
+            return Ok(());
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| SnapshotError::IndexIo("missing manifest writer".to_string()))?;
+        use std::io::Write as _;
+        writer
+            .write_all(bytes)
+            .map_err(|e| SnapshotError::IndexIo(format!("write temp manifest failed: {e}")))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<CanonicalManifestSinkOutput, SnapshotError> {
+        if let Some(writer) = self.writer.as_mut() {
+            use std::io::Write as _;
+            writer
+                .flush()
+                .map_err(|e| SnapshotError::IndexIo(format!("flush temp manifest failed: {e}")))?;
+        }
+        let digest = self.hasher.finalize();
+        Ok(CanonicalManifestSinkOutput {
+            manifest_hash: ManifestHash(mx8_manifest_store::sha256_to_lower_hex(&digest)),
+            manifest_bytes: self.bytes_written,
+            canonical_bytes: self.canonical_bytes,
+            canonical_path: self.file_path,
+        })
+    }
 }
 
 fn parse_canonical_manifest_tsv_bytes(
@@ -344,7 +515,11 @@ fn parse_canonical_manifest_tsv_bytes(
     Ok((records, canonical))
 }
 
-fn index_local_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+fn index_local_prefix(
+    base: &str,
+    recursive: bool,
+) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+    let scan_started = Instant::now();
     let root = std::path::PathBuf::from(base.trim());
     let manifest_path = root.join("_mx8").join("manifest.tsv");
     if manifest_path.exists() {
@@ -366,8 +541,10 @@ fn index_local_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snap
 
     // Fallback: index directory by walking files (no byte ranges, no labels).
     let mut files: Vec<std::path::PathBuf> = Vec::new();
-    let mut stack: Vec<std::path::PathBuf> = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
+    let mut dirs_scanned: u64 = 0;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.clone(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        dirs_scanned = dirs_scanned.saturating_add(1);
         for entry in std::fs::read_dir(&dir).map_err(|e| {
             SnapshotError::IndexIo(format!("read_dir failed: {}: {e}", dir.display()))
         })? {
@@ -382,7 +559,9 @@ fn index_local_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snap
                 .metadata()
                 .map_err(|e| SnapshotError::IndexIo(format!("{e}")))?;
             if meta.is_dir() {
-                stack.push(path);
+                if recursive {
+                    stack.push((path, depth.saturating_add(1)));
+                }
             } else if meta.is_file() {
                 files.push(path);
             }
@@ -412,11 +591,26 @@ fn index_local_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snap
     }
 
     let canonical = canonicalize_manifest_bytes(&records);
+    info!(
+        target: "mx8_proof",
+        event = "snapshot_index_summary",
+        backend = "local",
+        base = %base,
+        recursive = recursive,
+        objects_indexed = records.len() as u64,
+        dirs_scanned = dirs_scanned,
+        scan_ms = scan_started.elapsed().as_millis() as u64,
+        "snapshot index summary"
+    );
     Ok((records, canonical))
 }
 
 #[cfg(feature = "s3")]
-fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
+fn index_s3_prefix(
+    base: &str,
+    recursive: bool,
+    materialize_manifest_bytes: bool,
+) -> Result<IndexedManifest, SnapshotError> {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum S3LabelMode {
         None,
@@ -603,6 +797,120 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
         }
     }
 
+    fn parse_env_usize(key: &str, default: usize) -> Result<usize, SnapshotError> {
+        match std::env::var(key) {
+            Ok(v) => {
+                let n = v.trim().parse::<usize>().map_err(|_| {
+                    SnapshotError::S3Index(format!(
+                        "invalid usize env var {}={:?} (expected positive integer)",
+                        key, v
+                    ))
+                })?;
+                if n == 0 {
+                    return Err(SnapshotError::S3Index(format!(
+                        "invalid {}=0 (must be > 0)",
+                        key
+                    )));
+                }
+                Ok(n)
+            }
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(e) => Err(SnapshotError::S3Index(format!(
+                "read env var {key} failed: {e}"
+            ))),
+        }
+    }
+
+    struct SpillDir {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for SpillDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn new_spill_dir() -> Result<SpillDir, SnapshotError> {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        path.push(format!("mx8-snapshot-spill-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).map_err(|e| {
+            SnapshotError::S3Index(format!(
+                "failed to create spill directory {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(SpillDir { path })
+    }
+
+    fn write_key_len_prefixed(
+        writer: &mut std::io::BufWriter<std::fs::File>,
+        key: &str,
+    ) -> Result<(), SnapshotError> {
+        let bytes = key.as_bytes();
+        let len_u32 = u32::try_from(bytes.len())
+            .map_err(|_| SnapshotError::S3Index("s3 object key too long".to_string()))?;
+        use std::io::Write as _;
+        writer
+            .write_all(&len_u32.to_le_bytes())
+            .map_err(|e| SnapshotError::S3Index(format!("spill write length failed: {e}")))?;
+        writer
+            .write_all(bytes)
+            .map_err(|e| SnapshotError::S3Index(format!("spill write payload failed: {e}")))?;
+        Ok(())
+    }
+
+    fn read_key_len_prefixed(
+        reader: &mut std::io::BufReader<std::fs::File>,
+    ) -> Result<Option<String>, SnapshotError> {
+        use std::io::Read as _;
+        let mut len = [0u8; 4];
+        let n = reader
+            .read(&mut len)
+            .map_err(|e| SnapshotError::S3Index(format!("spill read length failed: {e}")))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if n != len.len() {
+            return Err(SnapshotError::S3Index(
+                "truncated spill file while reading key length".to_string(),
+            ));
+        }
+        let key_len = u32::from_le_bytes(len) as usize;
+        let mut key = vec![0u8; key_len];
+        reader
+            .read_exact(&mut key)
+            .map_err(|e| SnapshotError::S3Index(format!("spill read key bytes failed: {e}")))?;
+        let key = String::from_utf8(key)
+            .map_err(|e| SnapshotError::S3Index(format!("spill key is not utf-8: {e}")))?;
+        Ok(Some(key))
+    }
+
+    fn spill_sorted_run(
+        spill_dir: &SpillDir,
+        run_idx: usize,
+        keys: &mut Vec<String>,
+    ) -> Result<std::path::PathBuf, SnapshotError> {
+        keys.sort();
+        let path = spill_dir.path.join(format!("run-{run_idx:06}.bin"));
+        let file = std::fs::File::create(&path)
+            .map_err(|e| SnapshotError::S3Index(format!("create spill run failed: {e}")))?;
+        let mut writer = std::io::BufWriter::new(file);
+        for key in keys.iter() {
+            write_key_len_prefixed(&mut writer, key)?;
+        }
+        use std::io::Write as _;
+        writer
+            .flush()
+            .map_err(|e| SnapshotError::S3Index(format!("flush spill run failed: {e}")))?;
+        keys.clear();
+        Ok(path)
+    }
+
     fn parse_s3_base(url: &str) -> Result<(String, String), SnapshotError> {
         // url: s3://bucket/prefix[/]
         let rest = url
@@ -659,6 +967,11 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
     }
 
     let (bucket, prefix) = parse_s3_base(base)?;
+    let list_prefix = if prefix.is_empty() {
+        None
+    } else {
+        Some(format!("{}/", prefix.trim_end_matches('/')))
+    };
     let client = block_on(client_from_env())??;
     let label_mode = parse_label_mode()?;
 
@@ -713,24 +1026,346 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
             objects = records.len() as u64,
             "indexed from precomputed manifest"
         );
-        return Ok((records, canonical));
+        return indexed_manifest_from_bytes(records, canonical, materialize_manifest_bytes);
     }
 
-    let keys = block_on(async {
-        let mut out: Vec<String> = Vec::new();
+    let scan_started = Instant::now();
+    let use_external_sort = parse_env_bool("MX8_SNAPSHOT_S3_EXTERNAL_SORT")?.unwrap_or(false);
+
+    let mut sink = CanonicalManifestSink::new(materialize_manifest_bytes)?;
+    let mut sample_id: u64 = 0;
+    let mut pages_scanned: u64 = 0;
+
+    if use_external_sort {
+        let spill_keys_per_run = parse_env_usize("MX8_SNAPSHOT_S3_SPILL_KEYS_PER_RUN", 100_000)?;
+        let spill_dir = new_spill_dir()?;
+        let mut run_files: Vec<std::path::PathBuf> = Vec::new();
+        let mut run_keys: Vec<String> = Vec::with_capacity(spill_keys_per_run);
+        let mut run_idx: usize = 0;
+
+        let mut label_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut saw_all_imagefolder = true;
+        let mut objects_seen: u64 = 0;
+
+        block_on(async {
+            let mut token: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket);
+                if let Some(p) = list_prefix.as_deref() {
+                    req = req.prefix(p);
+                }
+                if !recursive {
+                    req = req.delimiter("/");
+                }
+                if let Some(t) = token.as_deref() {
+                    req = req.continuation_token(t);
+                }
+                let resp = req.send().await.map_err(|e| {
+                    SnapshotError::S3Index(format!("list_objects_v2 failed while indexing: {e:?}"))
+                })?;
+                pages_scanned = pages_scanned.saturating_add(1);
+
+                if let Some(contents) = resp.contents {
+                    for obj in contents {
+                        let Some(k) = obj.key else { continue };
+                        if k.ends_with('/') {
+                            continue;
+                        }
+                        objects_seen = objects_seen.saturating_add(1);
+                        if label_mode != S3LabelMode::None {
+                            let label = imagefolder_label_for_key(&prefix, &k);
+                            if let Some(l) = label {
+                                label_set.insert(l);
+                            } else {
+                                saw_all_imagefolder = false;
+                            }
+                        }
+                        run_keys.push(k);
+                        if run_keys.len() >= spill_keys_per_run {
+                            let path = spill_sorted_run(&spill_dir, run_idx, &mut run_keys)?;
+                            run_files.push(path);
+                            run_idx = run_idx.saturating_add(1);
+                        }
+                    }
+                }
+
+                if resp.is_truncated.unwrap_or(false) {
+                    token = resp.next_continuation_token;
+                    if token.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok::<_, SnapshotError>(())
+        })??;
+
+        if !run_keys.is_empty() {
+            let path = spill_sorted_run(&spill_dir, run_idx, &mut run_keys)?;
+            run_files.push(path);
+        }
+
+        let use_imagefolder_labels = match label_mode {
+            S3LabelMode::None => false,
+            S3LabelMode::ImageFolder => {
+                if !saw_all_imagefolder {
+                    return Err(SnapshotError::S3Index(
+                        "MX8_S3_LABEL_MODE=imagefolder requires all keys to match prefix/<label>/<file>"
+                            .to_string(),
+                    ));
+                }
+                true
+            }
+            S3LabelMode::Auto => saw_all_imagefolder && label_set.len() >= 2,
+        };
+
+        let mut label_map: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        if use_imagefolder_labels {
+            for (i, label) in label_set.into_iter().enumerate() {
+                label_map.insert(label, i as u64);
+            }
+        }
+
+        let mut readers: Vec<std::io::BufReader<std::fs::File>> =
+            Vec::with_capacity(run_files.len());
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(String, usize)>> =
+            std::collections::BinaryHeap::new();
+
+        for (idx, path) in run_files.iter().enumerate() {
+            let file = std::fs::File::open(path)
+                .map_err(|e| SnapshotError::S3Index(format!("open spill run failed: {e}")))?;
+            let mut reader = std::io::BufReader::new(file);
+            if let Some(key) = read_key_len_prefixed(&mut reader)? {
+                heap.push(std::cmp::Reverse((key, idx)));
+            }
+            readers.push(reader);
+        }
+
+        let mut prev_key: Option<String> = None;
+        while let Some(std::cmp::Reverse((key, run_idx))) = heap.pop() {
+            if let Some(prev) = prev_key.as_deref() {
+                if key.as_str() <= prev {
+                    return Err(SnapshotError::S3Index(format!(
+                        "merged key stream is not strictly increasing ({prev:?} then {key:?})"
+                    )));
+                }
+            }
+            prev_key = Some(key.clone());
+
+            let location = format!("s3://{bucket}/{key}");
+            if location.contains('\n') || location.contains('\t') {
+                return Err(SnapshotError::S3Index(format!(
+                    "s3 object url contains tabs/newlines (sample_id={}): {:?}",
+                    sample_id, location
+                )));
+            }
+            let decode_hint = if use_imagefolder_labels {
+                let label = imagefolder_label_for_key(&prefix, &key).ok_or_else(|| {
+                    SnapshotError::S3Index(format!(
+                        "label missing under imagefolder mode (sample_id={sample_id}, key={key})"
+                    ))
+                })?;
+                let label_id = *label_map.get(&label).ok_or_else(|| {
+                    SnapshotError::S3Index(format!(
+                        "label not present in label map (sample_id={sample_id}, label={label:?})"
+                    ))
+                })?;
+                Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
+            } else {
+                None
+            };
+            let record = ManifestRecord {
+                sample_id,
+                location,
+                byte_offset: None,
+                byte_length: None,
+                decode_hint,
+            };
+            record.validate().map_err(|e| {
+                SnapshotError::S3Index(format!("indexed record failed validation: {e}"))
+            })?;
+            sink.append_record(&record)?;
+            sample_id = sample_id.saturating_add(1);
+
+            let reader = readers.get_mut(run_idx).ok_or_else(|| {
+                SnapshotError::S3Index(format!(
+                    "internal spill reader index out of bounds: {run_idx}"
+                ))
+            })?;
+            if let Some(next_key) = read_key_len_prefixed(reader)? {
+                heap.push(std::cmp::Reverse((next_key, run_idx)));
+            }
+        }
+
+        if sample_id != objects_seen {
+            return Err(SnapshotError::S3Index(format!(
+                "spill/merge object count mismatch (seen={objects_seen}, emitted={sample_id})"
+            )));
+        }
+
+        info!(
+            target: "mx8_proof",
+            event = "snapshot_index_spill_merge",
+            bucket = %bucket,
+            prefix = %prefix,
+            recursive = recursive,
+            spill_runs = run_files.len() as u64,
+            spill_keys_per_run = spill_keys_per_run as u64,
+            "used external spill/merge while indexing s3 prefix"
+        );
+
+        let label_mode_name = if use_imagefolder_labels {
+            "imagefolder"
+        } else {
+            "none"
+        };
+        if sample_id == 0 {
+            warn!(
+                target: "mx8_proof",
+                event = "snapshot_index_empty",
+                base = %base,
+                bucket = %bucket,
+                prefix = %prefix,
+                recursive = recursive,
+                "s3 index produced zero objects"
+            );
+        }
+        let scan_ms = scan_started.elapsed().as_millis() as u64;
+        info!(
+            target: "mx8_proof",
+            event = "snapshot_indexed",
+            base = %base,
+            bucket = %bucket,
+            prefix = %prefix,
+            recursive = recursive,
+            label_mode = label_mode_name,
+            objects = sample_id,
+            "indexed s3 prefix"
+        );
+        info!(
+            target: "mx8_proof",
+            event = "snapshot_index_summary",
+            backend = "s3",
+            bucket = %bucket,
+            prefix = %prefix,
+            recursive = recursive,
+            label_mode = label_mode_name,
+            external_sort = use_external_sort,
+            pages_scanned = pages_scanned,
+            objects_indexed = sample_id,
+            scan_ms = scan_ms,
+            "snapshot index summary"
+        );
+        let output = sink.finish()?;
+        return Ok(IndexedManifest {
+            manifest_hash: output.manifest_hash,
+            manifest_bytes: output.manifest_bytes,
+            canonical_bytes: output.canonical_bytes,
+            canonical_path: output.canonical_path,
+        });
+    }
+
+    let mut label_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut saw_all_imagefolder = true;
+    if label_mode != S3LabelMode::None {
+        block_on(async {
+            let mut token: Option<String> = None;
+            let mut prev_key: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket);
+                if let Some(p) = list_prefix.as_deref() {
+                    req = req.prefix(p);
+                }
+                if !recursive {
+                    req = req.delimiter("/");
+                }
+                if let Some(t) = token.as_deref() {
+                    req = req.continuation_token(t);
+                }
+                let resp = req.send().await.map_err(|e| {
+                    SnapshotError::S3Index(format!(
+                        "list_objects_v2 failed during label scan: {e:?}"
+                    ))
+                })?;
+                pages_scanned = pages_scanned.saturating_add(1);
+
+                if let Some(contents) = resp.contents {
+                    for obj in contents {
+                        let Some(k) = obj.key else { continue };
+                        if k.ends_with('/') {
+                            continue;
+                        }
+                        if let Some(prev) = prev_key.as_deref() {
+                            if k.as_str() <= prev {
+                                return Err(SnapshotError::S3Index(format!(
+                                    "s3 list order is not strictly increasing ({prev:?} then {k:?}); aborting snapshot index"
+                                )));
+                            }
+                        }
+                        prev_key = Some(k.clone());
+                        let label = imagefolder_label_for_key(&prefix, &k);
+                        if let Some(l) = label {
+                            label_set.insert(l);
+                        } else {
+                            saw_all_imagefolder = false;
+                        }
+                    }
+                }
+
+                if resp.is_truncated.unwrap_or(false) {
+                    token = resp.next_continuation_token;
+                    if token.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok::<_, SnapshotError>(())
+        })??;
+    }
+
+    let use_imagefolder_labels = match label_mode {
+        S3LabelMode::None => false,
+        S3LabelMode::ImageFolder => {
+            if !saw_all_imagefolder {
+                return Err(SnapshotError::S3Index(
+                    "MX8_S3_LABEL_MODE=imagefolder requires all keys to match prefix/<label>/<file>"
+                        .to_string(),
+                ));
+            }
+            true
+        }
+        S3LabelMode::Auto => saw_all_imagefolder && label_set.len() >= 2,
+    };
+
+    let mut label_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    if use_imagefolder_labels {
+        for (i, label) in label_set.into_iter().enumerate() {
+            label_map.insert(label, i as u64);
+        }
+    }
+
+    block_on(async {
         let mut token: Option<String> = None;
+        let mut prev_key: Option<String> = None;
         loop {
             let mut req = client.list_objects_v2().bucket(&bucket);
-            if !prefix.is_empty() {
-                req = req.prefix(&prefix);
+            if let Some(p) = list_prefix.as_deref() {
+                req = req.prefix(p);
+            }
+            if !recursive {
+                req = req.delimiter("/");
             }
             if let Some(t) = token.as_deref() {
                 req = req.continuation_token(t);
             }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| SnapshotError::S3Index(format!("list_objects_v2 failed: {e:?}")))?;
+            let resp = req.send().await.map_err(|e| {
+                SnapshotError::S3Index(format!("list_objects_v2 failed while indexing: {e:?}"))
+            })?;
+            pages_scanned = pages_scanned.saturating_add(1);
 
             if let Some(contents) = resp.contents {
                 for obj in contents {
@@ -738,7 +1373,49 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
                     if k.ends_with('/') {
                         continue;
                     }
-                    out.push(k);
+                    if let Some(prev) = prev_key.as_deref() {
+                        if k.as_str() <= prev {
+                            return Err(SnapshotError::S3Index(format!(
+                                "s3 list order is not strictly increasing ({prev:?} then {k:?}); aborting snapshot index"
+                            )));
+                        }
+                    }
+                    prev_key = Some(k.clone());
+                    let location = format!("s3://{bucket}/{k}");
+                    if location.contains('\n') || location.contains('\t') {
+                        return Err(SnapshotError::S3Index(format!(
+                            "s3 object url contains tabs/newlines (sample_id={}): {:?}",
+                            sample_id, location
+                        )));
+                    }
+                    let decode_hint = if use_imagefolder_labels {
+                        let label = imagefolder_label_for_key(&prefix, &k).ok_or_else(|| {
+                            SnapshotError::S3Index(format!(
+                                "label missing under imagefolder mode (sample_id={sample_id}, key={k})"
+                            ))
+                        })?;
+                        let label_id = *label_map.get(&label).ok_or_else(|| {
+                            SnapshotError::S3Index(format!(
+                                "label not present in label map (sample_id={sample_id}, label={label:?})"
+                            ))
+                        })?;
+                        Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
+                    } else {
+                        None
+                    };
+
+                    let record = ManifestRecord {
+                        sample_id,
+                        location,
+                        byte_offset: None,
+                        byte_length: None,
+                        decode_hint,
+                    };
+                    record.validate().map_err(|e| {
+                        SnapshotError::S3Index(format!("indexed record failed validation: {e}"))
+                    })?;
+                    sink.append_record(&record)?;
+                    sample_id = sample_id.saturating_add(1);
                 }
             }
 
@@ -751,110 +1428,59 @@ fn index_s3_prefix(base: &str) -> Result<(Vec<ManifestRecord>, Vec<u8>), Snapsho
                 break;
             }
         }
-        Ok::<_, SnapshotError>(out)
+        Ok::<_, SnapshotError>(())
     })??;
 
-    if keys.is_empty() {
+    if sample_id == 0 {
         warn!(
             target: "mx8_proof",
             event = "snapshot_index_empty",
             base = %base,
             bucket = %bucket,
             prefix = %prefix,
+            recursive = recursive,
             "s3 index produced zero objects"
         );
     }
 
-    let mut keys = keys;
-    keys.sort();
-
-    let mut maybe_labels: Vec<Option<String>> = Vec::with_capacity(keys.len());
-    let mut label_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if label_mode != S3LabelMode::None {
-        for k in &keys {
-            let label = imagefolder_label_for_key(&prefix, k);
-            if let Some(l) = &label {
-                label_set.insert(l.clone());
-            }
-            maybe_labels.push(label);
-        }
+    let label_mode_name = if use_imagefolder_labels {
+        "imagefolder"
     } else {
-        maybe_labels.resize_with(keys.len(), || None);
-    }
-
-    let mut label_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let use_imagefolder_labels = match label_mode {
-        S3LabelMode::None => false,
-        S3LabelMode::ImageFolder => {
-            if maybe_labels.iter().any(|l| l.is_none()) {
-                return Err(SnapshotError::S3Index(
-                    "MX8_S3_LABEL_MODE=imagefolder requires all keys to match prefix/<label>/<file>".to_string(),
-                ));
-            }
-            true
-        }
-        S3LabelMode::Auto => {
-            // Conservative auto-detection: only enable if every key has a label segment and
-            // we observe at least 2 distinct labels (otherwise treat as unlabeled).
-            maybe_labels.iter().all(|l| l.is_some()) && label_set.len() >= 2
-        }
+        "none"
     };
-
-    if use_imagefolder_labels {
-        for (i, label) in label_set.into_iter().enumerate() {
-            label_map.insert(label, i as u64);
-        }
-    }
-
-    let mut records: Vec<ManifestRecord> = Vec::with_capacity(keys.len());
-    for (i, (key, label)) in keys.into_iter().zip(maybe_labels.into_iter()).enumerate() {
-        let location = format!("s3://{bucket}/{key}");
-        if location.contains('\n') || location.contains('\t') {
-            return Err(SnapshotError::S3Index(format!(
-                "s3 object url contains tabs/newlines (sample_id={i}): {location:?}"
-            )));
-        }
-        let decode_hint = if use_imagefolder_labels {
-            let label = label.ok_or_else(|| {
-                SnapshotError::S3Index(format!(
-                    "internal error: label missing under imagefolder mode (sample_id={i})"
-                ))
-            })?;
-            let label_id = *label_map.get(&label).ok_or_else(|| {
-                SnapshotError::S3Index(format!(
-                    "internal error: label not present in label map (sample_id={i}, label={label:?})"
-                ))
-            })?;
-            Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
-        } else {
-            None
-        };
-        let record = ManifestRecord {
-            sample_id: i as u64,
-            location,
-            byte_offset: None,
-            byte_length: None,
-            decode_hint,
-        };
-        record.validate().map_err(|e| {
-            SnapshotError::S3Index(format!("indexed record failed validation: {e}"))
-        })?;
-        records.push(record);
-    }
-
+    let scan_ms = scan_started.elapsed().as_millis() as u64;
     info!(
         target: "mx8_proof",
         event = "snapshot_indexed",
         base = %base,
         bucket = %bucket,
         prefix = %prefix,
-        label_mode = if use_imagefolder_labels { "imagefolder" } else { "none" },
-        objects = records.len() as u64,
+        recursive = recursive,
+        label_mode = label_mode_name,
+        objects = sample_id,
         "indexed s3 prefix"
     );
-
-    let canonical = canonicalize_manifest_bytes(&records);
-    Ok((records, canonical))
+    info!(
+        target: "mx8_proof",
+        event = "snapshot_index_summary",
+        backend = "s3",
+        bucket = %bucket,
+        prefix = %prefix,
+        recursive = recursive,
+        label_mode = label_mode_name,
+        external_sort = use_external_sort,
+        pages_scanned = pages_scanned,
+        objects_indexed = sample_id,
+        scan_ms = scan_ms,
+        "snapshot index summary"
+    );
+    let output = sink.finish()?;
+    Ok(IndexedManifest {
+        manifest_hash: output.manifest_hash,
+        manifest_bytes: output.manifest_bytes,
+        canonical_bytes: output.canonical_bytes,
+        canonical_path: output.canonical_path,
+    })
 }
 
 fn load_dev_manifest_tsv(path: &PathBuf) -> Result<(Vec<ManifestRecord>, Vec<u8>), SnapshotError> {
@@ -961,26 +1587,24 @@ fn canonicalize_manifest_bytes(records: &[ManifestRecord]) -> Vec<u8> {
     let mut out = Vec::with_capacity(records.len() * 64);
     out.extend_from_slice(format!("schema_version={MANIFEST_SCHEMA_VERSION}\n").as_bytes());
     for r in records {
-        // Stable TSV with 5 columns; empty string for None.
-        // sample_id<TAB>location<TAB>byte_offset<TAB>byte_length<TAB>decode_hint\n
-        out.extend_from_slice(r.sample_id.to_string().as_bytes());
-        out.push(b'\t');
-        out.extend_from_slice(r.location.as_bytes());
-        out.push(b'\t');
-        if let Some(v) = r.byte_offset {
-            out.extend_from_slice(v.to_string().as_bytes());
-        }
-        out.push(b'\t');
-        if let Some(v) = r.byte_length {
-            out.extend_from_slice(v.to_string().as_bytes());
-        }
-        out.push(b'\t');
-        if let Some(h) = &r.decode_hint {
-            out.extend_from_slice(h.as_bytes());
-        }
-        out.push(b'\n');
+        append_manifest_record_tsv_line(&mut out, r);
     }
     out
+}
+
+fn append_manifest_record_tsv_line(out: &mut Vec<u8>, r: &ManifestRecord) {
+    out.extend_from_slice(manifest_record_tsv_line(r).as_bytes());
+}
+
+fn manifest_record_tsv_line(r: &ManifestRecord) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\n",
+        r.sample_id,
+        r.location,
+        r.byte_offset.map(|v| v.to_string()).unwrap_or_default(),
+        r.byte_length.map(|v| v.to_string()).unwrap_or_default(),
+        r.decode_hint.clone().unwrap_or_default()
+    )
 }
 
 #[cfg(test)]
@@ -1063,6 +1687,7 @@ mod tests {
                 node_id: Some("test".to_string()),
             },
         )?;
+        assert!(first.manifest_bytes_materialized);
         assert!(!first.manifest_hash.0.is_empty());
         assert!(!first.manifest_bytes.is_empty());
 
@@ -1082,6 +1707,46 @@ mod tests {
         )?;
         assert_eq!(first.manifest_hash.0, second.manifest_hash.0);
         assert_eq!(first.manifest_bytes, second.manifest_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn plain_link_can_skip_manifest_bytes_materialization() -> anyhow::Result<()> {
+        let root = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "mx8-snapshot-nobytes-{}-{}",
+                std::process::id(),
+                mx8_manifest_store::sha256_hex(b"root")
+            ));
+            std::fs::create_dir_all(&p)?;
+            p
+        };
+
+        let manifest_path = root.join("dev_manifest.tsv");
+        std::fs::write(&manifest_path, "0\ta\n")?;
+
+        let store: Arc<dyn ManifestStore> = Arc::new(FsManifestStore::new(root.clone()));
+        let resolver = SnapshotResolver::new(
+            store.clone(),
+            SnapshotResolverConfig {
+                dev_manifest_path: Some(manifest_path),
+                materialize_manifest_bytes: false,
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolver.resolve(
+            "s3://bucket/prefix/",
+            LockOwner {
+                node_id: Some("test".to_string()),
+            },
+        )?;
+        assert!(!resolved.manifest_bytes_materialized);
+        assert!(resolved.manifest_bytes.is_empty());
+
+        let bytes = store.get_manifest_bytes(&resolved.manifest_hash)?;
+        assert!(!bytes.is_empty());
         Ok(())
     }
 
@@ -1111,5 +1776,42 @@ mod tests {
             SnapshotError::DevManifestIo(_) => {}
             other => panic!("expected DevManifestIo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn local_index_non_recursive_excludes_nested_files() -> anyhow::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("mx8-snapshot-local-nonrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested"))?;
+        std::fs::write(root.join("a.txt"), b"a")?;
+        std::fs::write(root.join("nested").join("b.txt"), b"b")?;
+
+        let (records, _canonical) = index_local_prefix(
+            root.to_str().ok_or_else(|| anyhow::anyhow!("utf-8 path"))?,
+            false,
+        )?;
+        assert_eq!(records.len(), 1);
+        assert!(records[0].location.ends_with("a.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_index_recursive_includes_nested_files() -> anyhow::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("mx8-snapshot-local-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested"))?;
+        std::fs::write(root.join("a.txt"), b"a")?;
+        std::fs::write(root.join("nested").join("b.txt"), b"b")?;
+
+        let (records, _canonical) = index_local_prefix(
+            root.to_str().ok_or_else(|| anyhow::anyhow!("utf-8 path"))?,
+            true,
+        )?;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|r| r.location.ends_with("a.txt")));
+        assert!(records.iter().any(|r| r.location.ends_with("b.txt")));
+        Ok(())
     }
 }

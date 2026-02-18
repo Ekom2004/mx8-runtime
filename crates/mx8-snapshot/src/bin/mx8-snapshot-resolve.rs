@@ -35,6 +35,9 @@ struct Args {
 
     #[arg(long, env = "MX8_SNAPSHOT_WAIT_TIMEOUT_MS", default_value_t = 30_000)]
     snapshot_wait_timeout_ms: u64,
+
+    #[arg(long, env = "MX8_SNAPSHOT_RECURSIVE", default_value_t = true)]
+    snapshot_recursive: bool,
 }
 
 fn main() -> Result<()> {
@@ -49,6 +52,8 @@ fn main() -> Result<()> {
         lock_stale_after: Duration::from_millis(args.snapshot_lock_stale_ms),
         wait_timeout: Duration::from_millis(args.snapshot_wait_timeout_ms),
         dev_manifest_path: args.dev_manifest_path.clone(),
+        recursive: args.snapshot_recursive,
+        materialize_manifest_bytes: false,
         ..Default::default()
     };
     let resolver = SnapshotResolver::new(store, cfg);

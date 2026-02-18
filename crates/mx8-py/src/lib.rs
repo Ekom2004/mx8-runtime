@@ -23,6 +23,7 @@ use zune_jpeg::JpegDecoder;
 
 use mx8_manifest_store::fs::FsManifestStore;
 use mx8_manifest_store::LockOwner;
+use mx8_manifest_store::ManifestStore;
 use mx8_proto::v0::coordinator_client::CoordinatorClient;
 use mx8_proto::v0::GetManifestRequest;
 use mx8_proto::v0::HeartbeatRequest;
@@ -598,6 +599,7 @@ impl DataLoader {
         *,
         manifest_store_root=None,
         dev_manifest_path=None,
+        recursive=true,
         batch_size_samples=512,
         max_inflight_bytes=128*1024*1024,
         max_queue_batches=64,
@@ -614,6 +616,7 @@ impl DataLoader {
         dataset_link: String,
         manifest_store_root: Option<PathBuf>,
         dev_manifest_path: Option<PathBuf>,
+        recursive: bool,
         batch_size_samples: usize,
         max_inflight_bytes: u64,
         max_queue_batches: usize,
@@ -627,10 +630,10 @@ impl DataLoader {
     ) -> PyResult<Self> {
         let parsed = mx8_core::dataset_link::DatasetLink::parse(&dataset_link)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-        let dataset_base = match parsed {
-            mx8_core::dataset_link::DatasetLink::Plain(b) => b,
-            mx8_core::dataset_link::DatasetLink::Refresh(b) => b,
-            mx8_core::dataset_link::DatasetLink::Pinned { base, .. } => base,
+        let dataset_base = match &parsed {
+            mx8_core::dataset_link::DatasetLink::Plain(b) => b.clone(),
+            mx8_core::dataset_link::DatasetLink::Refresh(b) => b.clone(),
+            mx8_core::dataset_link::DatasetLink::Pinned { base, .. } => base.clone(),
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -643,24 +646,6 @@ impl DataLoader {
             .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
 
         let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
-
-        let store = std::sync::Arc::new(FsManifestStore::new(root));
-        let resolver = SnapshotResolver::new(
-            store,
-            SnapshotResolverConfig {
-                dev_manifest_path,
-                ..SnapshotResolverConfig::default()
-            },
-        );
-
-        let snapshot = resolver
-            .resolve(
-                &dataset_link,
-                LockOwner {
-                    node_id: node_id.clone(),
-                },
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
         let max_process_rss_bytes_cap =
             max_process_rss_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
@@ -675,6 +660,85 @@ impl DataLoader {
         };
         let pipeline = Pipeline::new(caps);
         let metrics = pipeline.metrics();
+
+        if should_use_zero_manifest_scan(&parsed, &dataset_base) {
+            let reservoir_size = env_usize("MX8_ZERO_MANIFEST_RESERVOIR", 100_000).max(1);
+            match rt.block_on(async {
+                pipeline
+                    .spawn_s3_scan(&dataset_base, recursive, reservoir_size, start_id, end_id)
+                    .await
+            }) {
+                Ok((rx, task)) => {
+                    tracing::info!(
+                        target: "mx8_proof",
+                        event = "zero_manifest_scan_enabled",
+                        dataset_base = %dataset_base,
+                        recursive = recursive,
+                        reservoir_size = reservoir_size as u64,
+                        "using zero-manifest s3 scan path"
+                    );
+
+                    let manifest_hash = format!(
+                        "scan:{}",
+                        mx8_manifest_store::sha256_hex(dataset_base.as_bytes())
+                    );
+                    return Ok(Self {
+                        dataset_base,
+                        manifest_hash,
+                        metrics,
+                        rx,
+                        task: Some(task),
+                        rt,
+                    });
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("precomputed_manifest_exists") {
+                        tracing::info!(
+                            target: "mx8_proof",
+                            event = "zero_manifest_scan_fallback_precomputed_manifest",
+                            dataset_base = %dataset_base,
+                            "falling back to snapshot/manifest path"
+                        );
+                    } else {
+                        return Err(PyValueError::new_err(format!("{err}")));
+                    }
+                }
+            }
+        }
+
+        let store = std::sync::Arc::new(FsManifestStore::new(root));
+        let resolver = SnapshotResolver::new(
+            store.clone(),
+            SnapshotResolverConfig {
+                dev_manifest_path,
+                recursive,
+                materialize_manifest_bytes: true,
+                ..SnapshotResolverConfig::default()
+            },
+        );
+
+        let mut snapshot = resolver
+            .resolve(
+                &dataset_link,
+                LockOwner {
+                    node_id: node_id.clone(),
+                },
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+        if !snapshot.manifest_bytes_materialized {
+            snapshot.manifest_bytes =
+                store
+                    .get_manifest_bytes(&snapshot.manifest_hash)
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "failed to materialize manifest bytes for {}: {e}",
+                            snapshot.manifest_hash.0
+                        ))
+                    })?;
+            snapshot.manifest_bytes_materialized = true;
+        }
 
         let (rx, task) = rt
             .block_on(async move {
@@ -916,6 +980,7 @@ impl ImageFolderLoader {
         *,
         manifest_store_root=None,
         dev_manifest_path=None,
+        recursive=true,
         batch_size_samples=32,
         max_inflight_bytes=128*1024*1024,
         max_queue_batches=64,
@@ -933,6 +998,7 @@ impl ImageFolderLoader {
         dataset_link: String,
         manifest_store_root: Option<PathBuf>,
         dev_manifest_path: Option<PathBuf>,
+        recursive: bool,
         batch_size_samples: usize,
         max_inflight_bytes: u64,
         max_queue_batches: usize,
@@ -949,6 +1015,7 @@ impl ImageFolderLoader {
             dataset_link,
             manifest_store_root,
             dev_manifest_path,
+            recursive,
             batch_size_samples,
             max_inflight_bytes,
             max_queue_batches,
@@ -1177,11 +1244,12 @@ impl PyBatch {
 }
 
 #[pyfunction]
-#[pyo3(signature = (dataset_link, *, manifest_store_root=None, dev_manifest_path=None, node_id=None))]
+#[pyo3(signature = (dataset_link, *, manifest_store_root=None, dev_manifest_path=None, recursive=true, node_id=None))]
 fn resolve_manifest_hash(
     dataset_link: String,
     manifest_store_root: Option<PathBuf>,
     dev_manifest_path: Option<PathBuf>,
+    recursive: bool,
     node_id: Option<String>,
 ) -> PyResult<String> {
     let root = manifest_store_root
@@ -1194,6 +1262,8 @@ fn resolve_manifest_hash(
         store,
         SnapshotResolverConfig {
             dev_manifest_path,
+            recursive,
+            materialize_manifest_bytes: false,
             ..SnapshotResolverConfig::default()
         },
     );
@@ -1294,6 +1364,7 @@ fn pack_dir<'py>(
     *,
     manifest_store_root=None,
     dev_manifest_path=None,
+    recursive=true,
     batch_size_samples=512,
     max_inflight_bytes=128*1024*1024,
     max_queue_batches=64,
@@ -1314,6 +1385,7 @@ fn load(
     dataset_link: String,
     manifest_store_root: Option<PathBuf>,
     dev_manifest_path: Option<PathBuf>,
+    recursive: bool,
     batch_size_samples: usize,
     max_inflight_bytes: u64,
     max_queue_batches: usize,
@@ -1428,6 +1500,7 @@ fn load(
         dataset_link,
         manifest_store_root,
         dev_manifest_path,
+        recursive,
         batch_size_samples,
         effective_max_inflight_bytes,
         effective_max_queue_batches,
@@ -1493,6 +1566,13 @@ fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse::<u64>().ok()
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn env_bool(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(raw) => matches!(
@@ -1501,6 +1581,27 @@ fn env_bool(name: &str, default: bool) -> bool {
         ),
         Err(_) => default,
     }
+}
+
+fn should_use_zero_manifest_scan(parsed: &mx8_core::dataset_link::DatasetLink, base: &str) -> bool {
+    if !env_bool("MX8_ZERO_MANIFEST_ENABLED", true) {
+        return false;
+    }
+
+    if !matches!(
+        parsed,
+        mx8_core::dataset_link::DatasetLink::Plain(_)
+            | mx8_core::dataset_link::DatasetLink::Refresh(_)
+    ) {
+        return false;
+    }
+
+    let trimmed = base.trim();
+    if !trimmed.starts_with("s3://") {
+        return false;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    !lowered.ends_with(".tsv")
 }
 
 fn parse_u64_ascii(raw: &str) -> Option<u64> {

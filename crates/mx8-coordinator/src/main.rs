@@ -73,6 +73,10 @@ struct Args {
     #[arg(long, env = "MX8_SNAPSHOT_WAIT_TIMEOUT_MS", default_value_t = 30_000)]
     snapshot_wait_timeout_ms: u64,
 
+    /// Whether plain/@refresh prefix indexing is recursive.
+    #[arg(long, env = "MX8_SNAPSHOT_RECURSIVE", default_value_t = true)]
+    snapshot_recursive: bool,
+
     /// Legacy: pinned manifest hash for this job.
     ///
     /// Prefer `--dataset-link`; this is kept for compatibility during M3 integration.
@@ -1001,8 +1005,9 @@ impl Coordinator for CoordinatorSvc {
             ));
         };
 
-        let bytes = match store.get_manifest_bytes(&ManifestHash(req.manifest_hash.clone())) {
-            Ok(bytes) => bytes,
+        let manifest_hash = ManifestHash(req.manifest_hash.clone());
+        let manifest_len = match store.get_manifest_len(&manifest_hash) {
+            Ok(len) => len,
             Err(mx8_manifest_store::ManifestStoreError::NotFound(_)) => {
                 return Err(Status::not_found("manifest not found"));
             }
@@ -1015,14 +1020,51 @@ impl Coordinator for CoordinatorSvc {
         };
 
         let (tx, rx) = mpsc::channel::<Result<ManifestChunk, Status>>(4);
+        let store = store.clone();
         tokio::spawn(async move {
-            for chunk in bytes.chunks(MANIFEST_CHUNK_BYTES) {
-                let msg = ManifestChunk {
-                    data: chunk.to_vec(),
-                    schema_version: MANIFEST_SCHEMA_VERSION,
-                };
-                if tx.send(Ok(msg)).await.is_err() {
-                    break;
+            let mut offset: u64 = 0;
+            while offset < manifest_len {
+                let want =
+                    usize::try_from((manifest_len - offset).min(MANIFEST_CHUNK_BYTES as u64))
+                        .unwrap_or(MANIFEST_CHUNK_BYTES);
+                match store.get_manifest_range(&manifest_hash, offset, want) {
+                    Ok(chunk) => {
+                        if chunk.is_empty() {
+                            let _ = tx
+                                .send(Err(Status::internal(
+                                    "manifest range read returned empty chunk before EOF",
+                                )))
+                                .await;
+                            break;
+                        }
+                        let chunk_len = chunk.len() as u64;
+                        let msg = ManifestChunk {
+                            data: chunk,
+                            schema_version: MANIFEST_SCHEMA_VERSION,
+                        };
+                        if tx.send(Ok(msg)).await.is_err() {
+                            break;
+                        }
+                        offset = offset.saturating_add(chunk_len);
+                    }
+                    Err(mx8_manifest_store::ManifestStoreError::NotFound(_)) => {
+                        let _ = tx.send(Err(Status::not_found("manifest not found"))).await;
+                        break;
+                    }
+                    Err(mx8_manifest_store::ManifestStoreError::InvalidManifestHash) => {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument("invalid manifest_hash")))
+                            .await;
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!(
+                                "manifest_store error: {err}"
+                            ))))
+                            .await;
+                        break;
+                    }
                 }
             }
         });
@@ -1048,6 +1090,8 @@ async fn main() -> Result<()> {
             lock_stale_after: std::time::Duration::from_millis(args.snapshot_lock_stale_ms),
             wait_timeout: std::time::Duration::from_millis(args.snapshot_wait_timeout_ms),
             dev_manifest_path: args.dev_manifest_path.clone(),
+            recursive: args.snapshot_recursive,
+            materialize_manifest_bytes: false,
             ..Default::default()
         };
         let resolver = SnapshotResolver::new(store.clone(), cfg);

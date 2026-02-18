@@ -63,6 +63,11 @@ if [[ "${MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT:-0}" == "1" ]]; then
   ./scripts/minio_s3_prefix_snapshot_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_MINIO_S3_PREFIX_RECURSIVE:-0}" == "1" ]]; then
+  echo "[mx8] minio_s3_prefix_recursive_gate (recursive vs top-level indexing)"
+  ./scripts/minio_s3_prefix_recursive_gate.sh
+fi
+
 if [[ "${MX8_SMOKE_MINIO_PACK:-0}" == "1" ]]; then
   echo "[mx8] minio_pack_gate (pack S3 prefix -> tar shards + manifest)"
   ./scripts/minio_pack_gate.sh

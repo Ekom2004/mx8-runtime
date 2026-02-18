@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{io::Read, io::Seek, io::SeekFrom};
 
 use mx8_core::types::ManifestHash;
 
@@ -169,6 +170,44 @@ impl ManifestStore for FsManifestStore {
         }
     }
 
+    fn put_manifest_file(
+        &self,
+        hash: &ManifestHash,
+        path: &Path,
+    ) -> Result<(), ManifestStoreError> {
+        let dest = self.by_hash_path(hash)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&dest)
+        {
+            Ok(mut out) => {
+                use std::io::Write;
+                let mut input = std::fs::File::open(path)?;
+                std::io::copy(&mut input, &mut out)?;
+                out.flush()?;
+                out.sync_all()?;
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = std::fs::read(&dest)?;
+                let incoming = std::fs::read(path)?;
+                if existing == incoming {
+                    Ok(())
+                } else {
+                    Err(ManifestStoreError::HashCollision {
+                        hash: hash.0.clone(),
+                    })
+                }
+            }
+            Err(err) => Err(ManifestStoreError::Io(err)),
+        }
+    }
+
     fn get_manifest_bytes(&self, hash: &ManifestHash) -> Result<Vec<u8>, ManifestStoreError> {
         let path = self.by_hash_path(hash)?;
         match std::fs::read(&path) {
@@ -178,6 +217,41 @@ impl ManifestStore for FsManifestStore {
             }
             Err(err) => Err(ManifestStoreError::Io(err)),
         }
+    }
+
+    fn get_manifest_len(&self, hash: &ManifestHash) -> Result<u64, ManifestStoreError> {
+        let path = self.by_hash_path(hash)?;
+        match std::fs::metadata(&path) {
+            Ok(meta) => Ok(meta.len()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(ManifestStoreError::NotFound(hash.0.clone()))
+            }
+            Err(err) => Err(ManifestStoreError::Io(err)),
+        }
+    }
+
+    fn get_manifest_range(
+        &self,
+        hash: &ManifestHash,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, ManifestStoreError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let path = self.by_hash_path(hash)?;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ManifestStoreError::NotFound(hash.0.clone()));
+            }
+            Err(err) => return Err(ManifestStoreError::Io(err)),
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        let n = file.read(&mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
     }
 
     fn get_current_snapshot(

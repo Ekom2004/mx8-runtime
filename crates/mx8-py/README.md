@@ -55,6 +55,21 @@ for images, labels in loader:
     pass
 ```
 
+## Zero-manifest load (raw prefix)
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/raw-prefix/",
+    recursive=True,  # default
+    profile="balanced",
+)
+
+for batch in loader:
+    pass
+```
+
 ## Bounded memory (v0)
 
 Set a hard cap and periodically print high-water marks:

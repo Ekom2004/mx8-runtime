@@ -9,7 +9,7 @@ This page documents the API that ships today in `mx8==0.x`.
 
 ## Snapshot + packing
 
-- `mx8.resolve_manifest_hash(dataset_link, *, manifest_store_root=None, dev_manifest_path=None, node_id=None) -> str`
+- `mx8.resolve_manifest_hash(dataset_link, *, manifest_store_root=None, dev_manifest_path=None, recursive=True, node_id=None) -> str`
 - `mx8.pack(pack_in, *, out, shard_mb=512, label_mode="auto", require_labels=False) -> dict`
   - S3 input/output packer (`s3://...`).
 - `mx8.pack_dir(in_dir, *, out, shard_mb=512, label_mode="auto", require_labels=False) -> dict`
@@ -25,7 +25,8 @@ Use `mx8.load(...)` for byte-oriented pipelines (ETL/inference/preprocess).
 import mx8
 
 loader = mx8.load(
-    "s3://bucket/prefix@refresh",
+    "s3://bucket/prefix/",
+    recursive=True,  # default
     profile="balanced",
     autotune=True,
 )
@@ -41,6 +42,7 @@ for batch in loader:
 - `dataset_link` (`plain`, `@refresh`, `@sha256:...`)
 - `manifest_store_root` (default `/var/lib/mx8/manifests`)
 - `dev_manifest_path` (dev-only local manifest source)
+- `recursive` (default `True`; set `False` to only index top-level objects/files under the prefix)
 - `batch_size_samples`
 - `max_inflight_bytes`
 - `max_queue_batches`

@@ -1968,6 +1968,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "mx8-core",
  "mx8-observe",
  "mx8-proto",
  "mx8-runtime",

@@ -6,6 +6,8 @@ pub mod fs;
 pub mod s3;
 mod sha256;
 
+pub use sha256::Sha256 as Sha256Hasher;
+
 use std::path::Path;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,7 +50,35 @@ pub trait ManifestStore: Send + Sync + 'static {
         hash: &ManifestHash,
         bytes: &[u8],
     ) -> Result<(), ManifestStoreError>;
+    fn put_manifest_file(
+        &self,
+        hash: &ManifestHash,
+        path: &Path,
+    ) -> Result<(), ManifestStoreError> {
+        let bytes = std::fs::read(path)?;
+        self.put_manifest_bytes(hash, &bytes)
+    }
     fn get_manifest_bytes(&self, hash: &ManifestHash) -> Result<Vec<u8>, ManifestStoreError>;
+    fn get_manifest_len(&self, hash: &ManifestHash) -> Result<u64, ManifestStoreError> {
+        let bytes = self.get_manifest_bytes(hash)?;
+        Ok(bytes.len() as u64)
+    }
+    fn get_manifest_range(
+        &self,
+        hash: &ManifestHash,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, ManifestStoreError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = self.get_manifest_bytes(hash)?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let end = start.saturating_add(len).min(bytes.len());
+        Ok(bytes[start..end].to_vec())
+    }
 
     fn get_current_snapshot(
         &self,
@@ -134,6 +164,14 @@ pub(crate) fn unix_time_ms() -> u64 {
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     sha256::to_lower_hex(&sha256::sha256(bytes))
+}
+
+pub fn sha256_streaming_new() -> Sha256Hasher {
+    Sha256Hasher::new()
+}
+
+pub fn sha256_to_lower_hex(bytes: &[u8]) -> String {
+    sha256::to_lower_hex(bytes)
 }
 
 pub fn open_from_root(root: &str) -> Result<Box<dyn ManifestStore>, ManifestStoreError> {

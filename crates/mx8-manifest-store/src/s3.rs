@@ -279,6 +279,57 @@ impl ManifestStore for S3ManifestStore {
         }
     }
 
+    fn put_manifest_file(
+        &self,
+        hash: &ManifestHash,
+        path: &std::path::Path,
+    ) -> Result<(), ManifestStoreError> {
+        let key = self.key_by_hash(hash)?;
+        let b = self.bucket.clone();
+        let k = key.clone();
+        let path_buf = path.to_path_buf();
+
+        let put = block_on({
+            let c = self.client.clone();
+            async move {
+                let body = match ByteStream::from_path(path_buf).await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        return Err(ManifestStoreError::Runtime(format!(
+                            "create bytestream from file failed: {err:?}"
+                        )));
+                    }
+                };
+                let out = c
+                    .put_object()
+                    .bucket(b)
+                    .key(k)
+                    .if_none_match("*")
+                    .body(body)
+                    .send()
+                    .await;
+                Ok::<_, ManifestStoreError>(out)
+            }
+        })??;
+
+        match put {
+            Ok(_) => Ok(()),
+            Err(err) if is_put_precondition_failed(&err) => {
+                let existing = self.get_manifest_bytes(hash)?;
+                let existing_hash = crate::sha256_hex(&existing);
+                let incoming_hash = hash_file_sha256(path)?;
+                if existing_hash == incoming_hash {
+                    Ok(())
+                } else {
+                    Err(ManifestStoreError::HashCollision {
+                        hash: hash.0.clone(),
+                    })
+                }
+            }
+            Err(err) => Err(map_put_err(err)),
+        }
+    }
+
     fn get_manifest_bytes(&self, hash: &ManifestHash) -> Result<Vec<u8>, ManifestStoreError> {
         let key = self.key_by_hash(hash)?;
         match block_on(self.read_object_bytes(&key))? {
@@ -287,6 +338,71 @@ impl ManifestStore for S3ManifestStore {
                 Err(ManifestStoreError::NotFound(hash.0.clone()))
             }
             Err(e) => Err(e),
+        }
+    }
+
+    fn get_manifest_len(&self, hash: &ManifestHash) -> Result<u64, ManifestStoreError> {
+        let key = self.key_by_hash(hash)?;
+        let out = block_on({
+            let c = self.client.clone();
+            let bucket = self.bucket.clone();
+            let key = key.clone();
+            async move { c.head_object().bucket(bucket).key(key).send().await }
+        })?;
+        match out {
+            Ok(head) => Ok(head.content_length().unwrap_or(0) as u64),
+            Err(err) => match map_head_err(err) {
+                ManifestStoreError::NotFound(_) => {
+                    Err(ManifestStoreError::NotFound(hash.0.clone()))
+                }
+                other => Err(other),
+            },
+        }
+    }
+
+    fn get_manifest_range(
+        &self,
+        hash: &ManifestHash,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, ManifestStoreError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let key = self.key_by_hash(hash)?;
+        let end = offset.saturating_add(len as u64).saturating_sub(1);
+        let range = format!("bytes={offset}-{end}");
+        let out = block_on({
+            let c = self.client.clone();
+            let bucket = self.bucket.clone();
+            let key = key.clone();
+            let range = range.clone();
+            async move {
+                c.get_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .range(range)
+                    .send()
+                    .await
+            }
+        })?;
+        match out {
+            Ok(resp) => {
+                let bytes: AggregatedBytes = block_on(async move {
+                    resp.body.collect().await.map_err(|e| {
+                        ManifestStoreError::Runtime(format!(
+                            "get_object range body collect failed: {e:?}"
+                        ))
+                    })
+                })??;
+                Ok(bytes.into_bytes().to_vec())
+            }
+            Err(err) => match map_get_err(err) {
+                ManifestStoreError::NotFound(_) => {
+                    Err(ManifestStoreError::NotFound(hash.0.clone()))
+                }
+                other => Err(other),
+            },
         }
     }
 
@@ -443,4 +559,35 @@ fn map_get_err(
         }
         other => ManifestStoreError::Runtime(format!("s3 get_object failed: {other:?}")),
     }
+}
+
+fn map_head_err(
+    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError>,
+) -> ManifestStoreError {
+    match err {
+        aws_sdk_s3::error::SdkError::ServiceError(ref se) => {
+            if se.err().is_not_found() {
+                ManifestStoreError::NotFound("no such key".to_string())
+            } else {
+                ManifestStoreError::Runtime(format!("s3 head_object service error: {err:?}"))
+            }
+        }
+        other => ManifestStoreError::Runtime(format!("s3 head_object failed: {other:?}")),
+    }
+}
+
+fn hash_file_sha256(path: &std::path::Path) -> Result<String, ManifestStoreError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = crate::sha256_streaming_new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(crate::sha256_to_lower_hex(&digest))
 }
