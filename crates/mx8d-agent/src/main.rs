@@ -23,7 +23,7 @@ use mx8_proto::v0::RequestLeaseRequest;
 
 use mx8_observe::metrics::{Counter, Gauge};
 
-use mx8_runtime::pipeline::{load_manifest_records_from_path, Pipeline, RuntimeCaps};
+use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
 use mx8_runtime::sink::Sink;
 use mx8_runtime::types::Batch;
 
@@ -302,10 +302,115 @@ struct ProgressLoopCtx {
     grpc_max_message_bytes: usize,
 }
 
+#[derive(Debug, Clone)]
+enum ManifestSource {
+    CachedPath(Arc<PathBuf>),
+    DirectStream,
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(raw) => raw.trim().parse::<usize>().ok().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+async fn fetch_manifest_records_for_range(
+    channel: Channel,
+    args: &Args,
+    manifest_hash: &str,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    let max_line_bytes = env_usize("MX8_AGENT_MANIFEST_STREAM_MAX_LINE_BYTES", 8 * 1024 * 1024);
+    let req = GetManifestRequest {
+        job_id: args.job_id.clone(),
+        manifest_hash: manifest_hash.to_string(),
+    };
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(args.grpc_max_message_bytes)
+        .max_encoding_message_size(args.grpc_max_message_bytes);
+
+    let stream_resp = client.get_manifest_stream(req.clone()).await;
+    match stream_resp {
+        Ok(resp) => {
+            let mut stream = resp.into_inner();
+            let mut parser = mx8_runtime::pipeline::ManifestRangeStreamParser::new(
+                start_id,
+                end_id,
+                max_line_bytes,
+            )?;
+            let mut stream_schema: Option<u32> = None;
+            while let Some(chunk) = stream.message().await? {
+                if let Some(existing) = stream_schema {
+                    if chunk.schema_version != existing {
+                        tracing::error!(
+                            target: "mx8_proof",
+                            event = "manifest_schema_mismatch",
+                            job_id = %args.job_id,
+                            node_id = %args.node_id,
+                            manifest_hash = %manifest_hash,
+                            expected_schema_version = existing,
+                            got_schema_version = chunk.schema_version,
+                            "manifest stream schema mismatch"
+                        );
+                        anyhow::bail!("GetManifestStream returned inconsistent schema_version");
+                    }
+                } else {
+                    stream_schema = Some(chunk.schema_version);
+                }
+                parser.push_chunk(chunk.data.as_slice())?;
+            }
+            anyhow::ensure!(
+                stream_schema.is_some(),
+                "GetManifestStream returned no chunks (empty manifest)"
+            );
+            match parser.finish() {
+                Ok(records) => Ok(records),
+                Err(err) => {
+                    tracing::error!(
+                        target: "mx8_proof",
+                        event = "manifest_stream_truncated",
+                        job_id = %args.job_id,
+                        node_id = %args.node_id,
+                        manifest_hash = %manifest_hash,
+                        start_id = start_id,
+                        end_id = end_id,
+                        error = %err,
+                        "manifest stream parse failed (fail-closed)"
+                    );
+                    Err(err)
+                }
+            }
+        }
+        Err(status) => {
+            if status.code() != tonic::Code::Unimplemented {
+                anyhow::bail!("GetManifestStream failed: {status}");
+            }
+            let resp = client.get_manifest(req).await?.into_inner();
+            mx8_runtime::pipeline::load_manifest_records_range_from_read(
+                std::io::Cursor::new(resp.manifest_bytes),
+                start_id,
+                end_id,
+            )
+        }
+    }
+}
+
 async fn run_lease(
     channel: Channel,
     pipeline: Arc<Pipeline>,
-    manifest_records: Arc<Vec<mx8_core::types::ManifestRecord>>,
+    manifest_source: ManifestSource,
     args: &Args,
     manifest_hash: &str,
     metrics: &Arc<AgentMetrics>,
@@ -313,6 +418,21 @@ async fn run_lease(
 ) -> Result<()> {
     let Some(range) = &lease.range else {
         anyhow::bail!("lease missing range");
+    };
+
+    let direct_records = if matches!(manifest_source, ManifestSource::DirectStream) {
+        Some(
+            fetch_manifest_records_for_range(
+                channel.clone(),
+                args,
+                manifest_hash,
+                range.start_id,
+                range.end_id,
+            )
+            .await?,
+        )
+    } else {
+        None
     };
 
     metrics.leases_started_total.inc();
@@ -326,6 +446,10 @@ async fn run_lease(
         epoch = range.epoch,
         start_id = range.start_id,
         end_id = range.end_id,
+        source = match manifest_source {
+            ManifestSource::CachedPath(_) => "cached_path",
+            ManifestSource::DirectStream => "direct_stream",
+        },
         "lease started"
     );
 
@@ -350,14 +474,19 @@ async fn run_lease(
         done_rx,
     ));
 
-    pipeline
-        .run_manifest_records_range(
-            sink,
-            manifest_records.as_slice(),
-            range.start_id,
-            range.end_id,
-        )
-        .await?;
+    match manifest_source {
+        ManifestSource::CachedPath(path) => {
+            pipeline
+                .run_manifest_path_range(sink, path.as_path(), range.start_id, range.end_id)
+                .await?;
+        }
+        ManifestSource::DirectStream => {
+            let records = direct_records.ok_or_else(|| {
+                anyhow::anyhow!("direct stream mode selected but records were not loaded")
+            })?;
+            pipeline.run_manifest_records(sink, records).await?;
+        }
+    }
 
     let _ = done_tx.send(());
     let _ = reporter.await;
@@ -466,27 +595,38 @@ async fn main() -> Result<()> {
             "registered with coordinator"
         );
 
-        // M3: manifest proxy fallback (control-plane only).
-        // Cache the pinned manifest locally so future runtime stages can load it without
-        // needing to talk to the coordinator.
-        let mut manifest_path: Option<PathBuf> = None;
-        match fetch_and_cache_manifest(&mut client, &args, &manifest_hash).await {
-            Ok(Some(path)) => {
-                manifest_path = Some(path);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                if args.dev_lease_want > 0 {
-                    return Err(anyhow::anyhow!("{err}"));
+        let manifest_stream_direct = env_bool("MX8_AGENT_MANIFEST_STREAM_DIRECT", false);
+        let manifest_source = if manifest_stream_direct {
+            info!(
+                target: "mx8_proof",
+                event = "manifest_ingest_mode_selected",
+                mode = "direct_stream",
+                "using direct stream manifest ingest path"
+            );
+            ManifestSource::DirectStream
+        } else {
+            // M3: manifest proxy fallback (control-plane only).
+            // Cache the pinned manifest locally so future runtime stages can load it without
+            // needing to talk to the coordinator.
+            let mut manifest_path: Option<PathBuf> = None;
+            match fetch_and_cache_manifest(&mut client, &args, &manifest_hash).await {
+                Ok(Some(path)) => {
+                    manifest_path = Some(path);
                 }
-                warn!(error = %err, "GetManifest failed (continuing)");
-            }
-        };
+                Ok(None) => {}
+                Err(err) => {
+                    if args.dev_lease_want > 0 {
+                        return Err(anyhow::anyhow!("{err}"));
+                    }
+                    warn!(error = %err, "GetManifest failed (continuing)");
+                }
+            };
 
-        let manifest_path = manifest_path.ok_or_else(|| {
-            anyhow::anyhow!("manifest unavailable; cannot run leases without GetManifest")
-        })?;
-        let manifest_records = Arc::new(load_manifest_records_from_path(&manifest_path)?);
+            let manifest_path = manifest_path.ok_or_else(|| {
+                anyhow::anyhow!("manifest unavailable; cannot run leases without GetManifest")
+            })?;
+            ManifestSource::CachedPath(Arc::new(manifest_path))
+        };
 
         if args.metrics_snapshot_interval_ms > 0 {
             let metrics_clone = metrics.clone();
@@ -553,7 +693,7 @@ async fn main() -> Result<()> {
             let args_clone = args.clone();
             let metrics_clone = metrics.clone();
             let manifest_hash_clone = manifest_hash.clone();
-            let manifest_records = manifest_records.clone();
+            let manifest_source = manifest_source.clone();
             tokio::spawn(async move {
                 let want = std::cmp::max(1, args_clone.dev_lease_want);
                 let grpc_max = args_clone.grpc_max_message_bytes;
@@ -613,7 +753,7 @@ async fn main() -> Result<()> {
                             let pipeline = pipeline.clone();
                             let args = args_clone.clone();
                             let manifest_hash = manifest_hash_clone.clone();
-                            let manifest_records = manifest_records.clone();
+                            let manifest_source = manifest_source.clone();
                             let metrics = metrics_clone.clone();
                             let ch = lease_channel.clone();
                             let lease_id = lease.lease_id.clone();
@@ -632,7 +772,7 @@ async fn main() -> Result<()> {
                                 let res = run_lease(
                                     ch,
                                     pipeline,
-                                    manifest_records,
+                                    manifest_source,
                                     &args,
                                     &manifest_hash,
                                     &metrics,
@@ -710,6 +850,344 @@ async fn main() -> Result<()> {
     .await
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::{run_lease, AgentMetrics, Args, ManifestSource};
+    use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
+    use mx8_proto::v0::{
+        GetManifestRequest, GetManifestResponse, HeartbeatRequest, HeartbeatResponse, Lease,
+        ManifestChunk, RegisterNodeRequest, RegisterNodeResponse, ReportProgressRequest,
+        ReportProgressResponse, RequestLeaseRequest, RequestLeaseResponse, WorkRange,
+    };
+    use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tokio_stream::Stream;
+    use tonic::transport::{Channel, Server};
+    use tonic::{Request, Response, Status};
+
+    #[derive(Clone)]
+    struct MockCoordinator {
+        manifest_bytes: Arc<Vec<u8>>,
+        reports: Arc<Mutex<Vec<ReportProgressRequest>>>,
+    }
+
+    impl MockCoordinator {
+        fn new(manifest_bytes: Vec<u8>) -> Self {
+            Self {
+                manifest_bytes: Arc::new(manifest_bytes),
+                reports: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Coordinator for MockCoordinator {
+        type GetManifestStreamStream =
+            Pin<Box<dyn Stream<Item = Result<ManifestChunk, Status>> + Send + 'static>>;
+
+        async fn register_node(
+            &self,
+            _request: Request<RegisterNodeRequest>,
+        ) -> Result<Response<RegisterNodeResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn heartbeat(
+            &self,
+            _request: Request<HeartbeatRequest>,
+        ) -> Result<Response<HeartbeatResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn request_lease(
+            &self,
+            _request: Request<RequestLeaseRequest>,
+        ) -> Result<Response<RequestLeaseResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn report_progress(
+            &self,
+            request: Request<ReportProgressRequest>,
+        ) -> Result<Response<ReportProgressResponse>, Status> {
+            let mut guard = self
+                .reports
+                .lock()
+                .map_err(|_| Status::internal("report lock poisoned"))?;
+            guard.push(request.into_inner());
+            Ok(Response::new(ReportProgressResponse {}))
+        }
+
+        async fn get_manifest(
+            &self,
+            _request: Request<GetManifestRequest>,
+        ) -> Result<Response<GetManifestResponse>, Status> {
+            Ok(Response::new(GetManifestResponse {
+                manifest_bytes: self.manifest_bytes.as_ref().clone(),
+                schema_version: mx8_core::types::MANIFEST_SCHEMA_VERSION,
+            }))
+        }
+
+        async fn get_manifest_stream(
+            &self,
+            _request: Request<GetManifestRequest>,
+        ) -> Result<Response<Self::GetManifestStreamStream>, Status> {
+            let chunks = self
+                .manifest_bytes
+                .chunks(7)
+                .map(|c| {
+                    Ok(ManifestChunk {
+                        data: c.to_vec(),
+                        schema_version: mx8_core::types::MANIFEST_SCHEMA_VERSION,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+        }
+    }
+
+    fn test_args(manifest_cache_dir: PathBuf) -> Args {
+        Args {
+            coord_url: "http://127.0.0.1:0".to_string(),
+            job_id: "job".to_string(),
+            node_id: "node".to_string(),
+            manifest_cache_dir,
+            metrics_snapshot_interval_ms: 0,
+            dev_lease_want: 0,
+            batch_size_samples: 2,
+            prefetch_batches: 1,
+            max_queue_batches: 8,
+            max_inflight_bytes: 8 * 1024 * 1024,
+            target_batch_bytes: None,
+            max_batch_bytes: None,
+            max_process_rss_bytes: None,
+            sink_sleep_ms: 0,
+            progress_interval_ms: 60_000,
+            grpc_max_message_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    fn test_pipeline() -> Arc<Pipeline> {
+        Arc::new(Pipeline::new(RuntimeCaps {
+            max_inflight_bytes: 8 * 1024 * 1024,
+            max_queue_batches: 8,
+            batch_size_samples: 2,
+            prefetch_batches: 1,
+            target_batch_bytes: None,
+            max_batch_bytes: None,
+            max_process_rss_bytes: None,
+        }))
+    }
+
+    fn report_summary(
+        reports: &[ReportProgressRequest],
+        lease_id: &str,
+    ) -> Option<(u64, u64, u64)> {
+        let mut best: Option<(u64, u64, u64)> = None;
+        for r in reports.iter().filter(|r| r.lease_id == lease_id) {
+            let cand = (r.cursor, r.delivered_samples, r.delivered_bytes);
+            if best.map(|b| cand.0 >= b.0).unwrap_or(true) {
+                best = Some(cand);
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn manifest_stream_truncated_fails_closed() {
+        let mut parser =
+            mx8_runtime::pipeline::ManifestRangeStreamParser::new(0, 2, 1024).expect("parser init");
+        parser
+            .push_chunk(
+                format!(
+                    "schema_version={}\n0\tloc0\t\t\t\n1\t",
+                    mx8_core::types::MANIFEST_SCHEMA_VERSION
+                )
+                .as_bytes(),
+            )
+            .expect("push");
+        let err = parser.finish().unwrap_err();
+        assert!(err.to_string().contains("expected at least 2 columns"));
+    }
+
+    #[test]
+    fn manifest_stream_schema_mismatch_hard_fails() {
+        let mut parser =
+            mx8_runtime::pipeline::ManifestRangeStreamParser::new(0, 1, 1024).expect("parser init");
+        let mut stream_schema: Option<u32> = None;
+
+        let chunks = vec![
+            (
+                mx8_core::types::MANIFEST_SCHEMA_VERSION,
+                format!(
+                    "schema_version={}\n",
+                    mx8_core::types::MANIFEST_SCHEMA_VERSION
+                )
+                .into_bytes(),
+            ),
+            (
+                mx8_core::types::MANIFEST_SCHEMA_VERSION + 1,
+                b"0\tloc0\t\t\t\n".to_vec(),
+            ),
+        ];
+
+        let mut got_mismatch = false;
+        for (schema, payload) in chunks {
+            if let Some(existing) = stream_schema {
+                if schema != existing {
+                    got_mismatch = true;
+                    break;
+                }
+            } else {
+                stream_schema = Some(schema);
+            }
+            parser.push_chunk(payload.as_slice()).expect("push chunk");
+        }
+        assert!(got_mismatch, "schema mismatch should hard-fail");
+    }
+
+    #[test]
+    fn manifest_stream_parity_with_cached_path() {
+        let manifest = format!(
+            "schema_version={}\n0\tloc0\t\t\t\n1\tloc1\t\t\t\n2\tloc2\t\t\t\n3\tloc3\t\t\t\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        )
+        .into_bytes();
+
+        let full = mx8_runtime::pipeline::load_manifest_records_from_read(std::io::Cursor::new(
+            manifest.clone(),
+        ))
+        .expect("full parse");
+        let expected = full[1..3].to_vec();
+
+        let mut parser =
+            mx8_runtime::pipeline::ManifestRangeStreamParser::new(1, 3, 1024).expect("parser init");
+        for ch in manifest.chunks(3) {
+            parser.push_chunk(ch).expect("push chunk");
+        }
+        let got = parser.finish().expect("finish parse");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn manifest_stream_backpressure_bounded() {
+        let mut parser =
+            mx8_runtime::pipeline::ManifestRangeStreamParser::new(0, 1, 8).expect("parser init");
+        let err = parser.push_chunk(b"schema_version=1").unwrap_err();
+        assert!(err.to_string().contains("manifest line exceeds max bytes"));
+    }
+
+    #[tokio::test]
+    async fn lease_manifest_stream_parity_with_cached_path() -> anyhow::Result<()> {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "mx8-agent-lease-parity-{}-{}",
+            std::process::id(),
+            mx8_observe::time::unix_time_ms()
+        ));
+        std::fs::create_dir_all(&root)?;
+
+        let mut manifest = String::new();
+        manifest.push_str(&format!(
+            "schema_version={}\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        ));
+        for i in 0..5u64 {
+            let p = root.join(format!("sample-{i}.bin"));
+            std::fs::write(&p, [i as u8, (i.wrapping_mul(2)) as u8])?;
+            manifest.push_str(&format!("{i}\t{}\t\t\t\n", p.display()));
+        }
+        let manifest_bytes = manifest.into_bytes();
+        let manifest_path = root.join("manifest.tsv");
+        std::fs::write(&manifest_path, &manifest_bytes)?;
+
+        let mock = MockCoordinator::new(manifest_bytes.clone());
+        let reports = mock.reports.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let incoming = TcpListenerStream::new(listener);
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(mock))
+                .serve_with_incoming(incoming)
+                .await
+        });
+
+        let channel = Channel::from_shared(format!("http://{}", addr))?
+            .connect()
+            .await?;
+        let args = test_args(root.clone());
+        let metrics = Arc::new(AgentMetrics::default());
+        let pipeline = test_pipeline();
+        let range = WorkRange {
+            start_id: 1,
+            end_id: 4,
+            epoch: 1,
+            seed: 0,
+        };
+        let cached_lease = Lease {
+            lease_id: "lease-cached".to_string(),
+            node_id: args.node_id.clone(),
+            range: Some(range.clone()),
+            cursor: range.start_id,
+            expires_unix_time_ms: 0,
+        };
+        let stream_lease = Lease {
+            lease_id: "lease-stream".to_string(),
+            node_id: args.node_id.clone(),
+            range: Some(range.clone()),
+            cursor: range.start_id,
+            expires_unix_time_ms: 0,
+        };
+        let manifest_hash = "manifest-h";
+
+        run_lease(
+            channel.clone(),
+            pipeline.clone(),
+            ManifestSource::CachedPath(Arc::new(manifest_path)),
+            &args,
+            manifest_hash,
+            &metrics,
+            cached_lease,
+        )
+        .await?;
+
+        run_lease(
+            channel.clone(),
+            pipeline,
+            ManifestSource::DirectStream,
+            &args,
+            manifest_hash,
+            &metrics,
+            stream_lease,
+        )
+        .await?;
+
+        let snapshot = reports
+            .lock()
+            .map_err(|_| anyhow::anyhow!("report lock poisoned"))?
+            .clone();
+        let cached = report_summary(&snapshot, "lease-cached")
+            .ok_or_else(|| anyhow::anyhow!("missing cached-path progress reports"))?;
+        let direct = report_summary(&snapshot, "lease-stream")
+            .ok_or_else(|| anyhow::anyhow!("missing direct-stream progress reports"))?;
+
+        assert_eq!(cached, direct);
+        assert_eq!(cached.0, range.end_id);
+        assert_eq!(cached.1, range.end_id - range.start_id);
+        assert_eq!(cached.2, 6);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+}
+
 async fn fetch_and_cache_manifest(
     client: &mut CoordinatorClient<Channel>,
     args: &Args,
@@ -722,7 +1200,7 @@ async fn fetch_and_cache_manifest(
 
     let path = args.manifest_cache_dir.join(manifest_hash);
     let stream_resp = client.get_manifest_stream(req.clone()).await;
-    let (manifest_bytes, schema_version, stream_used) = match stream_resp {
+    let (manifest_bytes, schema_version, manifest_bytes_logged) = match stream_resp {
         Ok(resp) => {
             let mut stream = resp.into_inner();
             let mut schema_version: Option<u32> = None;
@@ -765,14 +1243,15 @@ async fn fetch_and_cache_manifest(
             tmp_file.flush()?;
             tmp_file.sync_all()?;
             std::fs::rename(&tmp, &path)?;
-            (None, schema_version, Some(streamed_bytes))
+            (None, schema_version, streamed_bytes)
         }
         Err(status) => {
             if status.code() != tonic::Code::Unimplemented {
                 return Err(anyhow::anyhow!("GetManifestStream failed: {status}"));
             }
             let resp = client.get_manifest(req).await?.into_inner();
-            (Some(resp.manifest_bytes), resp.schema_version, None)
+            let logged = resp.manifest_bytes.len() as u64;
+            (Some(resp.manifest_bytes), resp.schema_version, logged)
         }
     };
 
@@ -787,7 +1266,7 @@ async fn fetch_and_cache_manifest(
                 node_id = %args.node_id,
                 manifest_hash = %manifest_hash,
                 schema_version = schema_version,
-                manifest_bytes = bytes.len() as u64,
+                manifest_bytes = manifest_bytes_logged,
                 path = %path.display(),
                 source = "unary_fallback",
                 "cached manifest"
@@ -801,7 +1280,7 @@ async fn fetch_and_cache_manifest(
             node_id = %args.node_id,
             manifest_hash = %manifest_hash,
             schema_version = schema_version,
-            manifest_bytes = stream_used.unwrap_or(0),
+            manifest_bytes = manifest_bytes_logged,
             path = %path.display(),
             source = "stream",
             "cached manifest"

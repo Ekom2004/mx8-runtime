@@ -20,3 +20,6 @@ mx8-runtime = { path = "../mx8-runtime" }
 [features]
 default = []
 s3 = ["mx8-runtime/s3"]
+
+[dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }

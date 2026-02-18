@@ -380,9 +380,9 @@ impl Pipeline {
         start_id: u64,
         end_id: u64,
     ) -> Result<()> {
-        let records = parse_canonical_manifest_tsv_path(manifest_path.as_ref())?;
-        self.run_manifest_records_range(sink, &records, start_id, end_id)
-            .await
+        let records =
+            parse_canonical_manifest_tsv_path_range(manifest_path.as_ref(), start_id, end_id)?;
+        self.run_manifest_records(sink, records).await
     }
 
     pub async fn run_manifest_bytes<S: Sink>(
@@ -404,6 +404,15 @@ impl Pipeline {
         let records = parse_canonical_manifest_tsv(manifest_bytes)?;
         self.run_manifest_records_range(sink, &records, start_id, end_id)
             .await
+    }
+
+    pub async fn run_manifest_reader<S: Sink, R: std::io::Read>(
+        &self,
+        sink: Arc<S>,
+        reader: R,
+    ) -> Result<()> {
+        let records = load_manifest_records_from_read(reader)?;
+        self.run_manifest_records(sink, records).await
     }
 
     pub async fn run_manifest_records<S: Sink>(
@@ -842,6 +851,209 @@ pub fn load_manifest_records_from_path(
     manifest_path: impl AsRef<Path>,
 ) -> Result<Vec<mx8_core::types::ManifestRecord>> {
     parse_canonical_manifest_tsv_path(manifest_path.as_ref())
+}
+
+pub fn load_manifest_records_from_reader<R: BufRead>(
+    reader: R,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    parse_canonical_manifest_tsv_reader(reader)
+}
+
+pub fn load_manifest_records_from_read<R: std::io::Read>(
+    reader: R,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    parse_canonical_manifest_tsv_reader(BufReader::new(reader))
+}
+
+/// Adapter for transport-layer chunk streams.
+///
+/// This keeps async/network chunking concerns outside the parser contract:
+/// callers provide an iterator of chunk payloads, and runtime parses via `Read`/`BufRead`.
+pub fn load_manifest_records_from_chunk_iter<I>(
+    chunks: I,
+) -> Result<Vec<mx8_core::types::ManifestRecord>>
+where
+    I: IntoIterator<Item = Vec<u8>>,
+{
+    let reader = ChunkedRead::new(chunks.into_iter());
+    parse_canonical_manifest_tsv_reader(BufReader::new(reader))
+}
+
+pub fn load_manifest_records_range_from_read<R: std::io::Read>(
+    reader: R,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    parse_canonical_manifest_tsv_reader_range(BufReader::new(reader), start_id, end_id)
+}
+
+/// Adapter for transport-layer chunk streams with direct range selection.
+pub fn load_manifest_records_range_from_chunk_iter<I>(
+    chunks: I,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>>
+where
+    I: IntoIterator<Item = Vec<u8>>,
+{
+    let reader = ChunkedRead::new(chunks.into_iter());
+    parse_canonical_manifest_tsv_reader_range(BufReader::new(reader), start_id, end_id)
+}
+
+#[derive(Debug)]
+pub struct ManifestRangeStreamParser {
+    start_id: u64,
+    end_id: u64,
+    max_carry_bytes: usize,
+    line_no: usize,
+    header_seen: bool,
+    expected_sample_id: u64,
+    carry: Vec<u8>,
+    selected: Vec<mx8_core::types::ManifestRecord>,
+}
+
+impl ManifestRangeStreamParser {
+    pub fn new(start_id: u64, end_id: u64, max_carry_bytes: usize) -> Result<Self> {
+        anyhow::ensure!(start_id <= end_id, "invalid range (start_id > end_id)");
+        anyhow::ensure!(max_carry_bytes > 0, "max_carry_bytes must be > 0");
+        let cap = usize::try_from(end_id.saturating_sub(start_id)).unwrap_or(usize::MAX);
+        Ok(Self {
+            start_id,
+            end_id,
+            max_carry_bytes,
+            line_no: 0,
+            header_seen: false,
+            expected_sample_id: 0,
+            carry: Vec::new(),
+            selected: Vec::with_capacity(cap.min(4096)),
+        })
+    }
+
+    pub fn push_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        self.carry.extend_from_slice(bytes);
+        anyhow::ensure!(
+            self.carry.len() <= self.max_carry_bytes,
+            "manifest line exceeds max bytes (max_carry_bytes={})",
+            self.max_carry_bytes
+        );
+        while let Some(pos) = self.carry.iter().position(|b| *b == b'\n') {
+            let line = self.carry[..pos].to_vec();
+            self.carry.drain(..=pos);
+            self.process_line_bytes(&line)?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+        if !self.carry.is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            self.process_line_bytes(&line)?;
+        }
+        anyhow::ensure!(self.header_seen, "empty manifest");
+        let total_rows = self.expected_sample_id as usize;
+        let start =
+            usize::try_from(self.start_id).map_err(|_| anyhow::anyhow!("start_id too large"))?;
+        let end = usize::try_from(self.end_id).map_err(|_| anyhow::anyhow!("end_id too large"))?;
+        anyhow::ensure!(start <= total_rows, "start_id out of range");
+        anyhow::ensure!(end <= total_rows, "end_id out of range");
+        Ok(self.selected)
+    }
+
+    fn process_line_bytes(&mut self, raw: &[u8]) -> Result<()> {
+        let line = std::str::from_utf8(raw)
+            .map_err(|e| anyhow::anyhow!("line {}: manifest not utf-8: {e}", self.line_no + 1))?;
+        self.line_no = self.line_no.saturating_add(1);
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(());
+        }
+        if !self.header_seen {
+            self.process_header_line(line)?;
+            self.header_seen = true;
+            return Ok(());
+        }
+        self.process_record_line(line)
+    }
+
+    fn process_header_line(&self, line: &str) -> Result<()> {
+        let Some((k, v)) = line.split_once('=') else {
+            anyhow::bail!("manifest header missing schema_version");
+        };
+        if k.trim() != "schema_version" {
+            anyhow::bail!("manifest header must be schema_version=<n>");
+        }
+        let schema_version: u32 = v
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid schema_version"))?;
+        anyhow::ensure!(
+            schema_version == mx8_core::types::MANIFEST_SCHEMA_VERSION,
+            "unsupported schema_version {}",
+            schema_version
+        );
+        Ok(())
+    }
+
+    fn process_record_line(&mut self, line: &str) -> Result<()> {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            anyhow::bail!("line {}: expected at least 2 columns", self.line_no);
+        }
+        let sample_id: u64 = cols[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {}: bad sample_id", self.line_no))?;
+        let location = cols[1].trim().to_string();
+
+        let mut byte_offset: Option<u64> = None;
+        let mut byte_length: Option<u64> = None;
+        let mut decode_hint: Option<String> = None;
+
+        if cols.len() >= 4 {
+            if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
+                byte_offset = Some(
+                    cols[2]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_offset", self.line_no))?,
+                );
+                byte_length = Some(
+                    cols[3]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_length", self.line_no))?,
+                );
+            }
+        } else if cols.len() == 3 {
+            anyhow::bail!("line {}: partial byte range", self.line_no);
+        }
+
+        if cols.len() >= 5 && !cols[4].trim().is_empty() {
+            decode_hint = Some(cols[4].trim().to_string());
+        }
+
+        let record = mx8_core::types::ManifestRecord {
+            sample_id,
+            location,
+            byte_offset,
+            byte_length,
+            decode_hint,
+        };
+        record
+            .validate()
+            .map_err(|e| anyhow::anyhow!("line {}: {e}", self.line_no))?;
+        anyhow::ensure!(
+            record.sample_id == self.expected_sample_id,
+            "expected sample_id {} but found {}",
+            self.expected_sample_id,
+            record.sample_id
+        );
+        if record.sample_id >= self.start_id && record.sample_id < self.end_id {
+            self.selected.push(record);
+        }
+        self.expected_sample_id = self.expected_sample_id.saturating_add(1);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1845,6 +2057,15 @@ fn parse_canonical_manifest_tsv_path(path: &Path) -> Result<Vec<mx8_core::types:
     parse_canonical_manifest_tsv_reader(BufReader::new(file))
 }
 
+fn parse_canonical_manifest_tsv_path_range(
+    path: &Path,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    let file = std::fs::File::open(path)?;
+    parse_canonical_manifest_tsv_reader_range(BufReader::new(file), start_id, end_id)
+}
+
 fn parse_canonical_manifest_tsv_reader<R: BufRead>(
     mut reader: R,
 ) -> Result<Vec<mx8_core::types::ManifestRecord>> {
@@ -1959,6 +2180,182 @@ fn parse_canonical_manifest_tsv_reader<R: BufRead>(
     Ok(records)
 }
 
+fn parse_canonical_manifest_tsv_reader_range<R: BufRead>(
+    mut reader: R,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    anyhow::ensure!(start_id <= end_id, "invalid range (start_id > end_id)");
+
+    let mut buf = String::new();
+    let mut line_no: usize = 0;
+    let mut header: Option<String> = None;
+
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        header = Some(line.to_string());
+        break;
+    }
+
+    let first = header.ok_or_else(|| anyhow::anyhow!("empty manifest"))?;
+    let Some((k, v)) = first.split_once('=') else {
+        anyhow::bail!("manifest header missing schema_version");
+    };
+    if k.trim() != "schema_version" {
+        anyhow::bail!("manifest header must be schema_version=<n>");
+    }
+    let schema_version: u32 = v
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid schema_version"))?;
+    anyhow::ensure!(
+        schema_version == mx8_core::types::MANIFEST_SCHEMA_VERSION,
+        "unsupported schema_version {}",
+        schema_version
+    );
+
+    let cap = usize::try_from(end_id.saturating_sub(start_id)).unwrap_or(usize::MAX);
+    let mut selected: Vec<mx8_core::types::ManifestRecord> = Vec::with_capacity(cap.min(4096));
+    let mut expected_sample_id: u64 = 0;
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            anyhow::bail!("line {}: expected at least 2 columns", line_no);
+        }
+        let sample_id: u64 = cols[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {}: bad sample_id", line_no))?;
+        let location = cols[1].trim().to_string();
+
+        let mut byte_offset: Option<u64> = None;
+        let mut byte_length: Option<u64> = None;
+        let mut decode_hint: Option<String> = None;
+
+        if cols.len() >= 4 {
+            if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
+                byte_offset = Some(
+                    cols[2]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_offset", line_no))?,
+                );
+                byte_length = Some(
+                    cols[3]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_length", line_no))?,
+                );
+            }
+        } else if cols.len() == 3 {
+            anyhow::bail!("line {}: partial byte range", line_no);
+        }
+
+        if cols.len() >= 5 && !cols[4].trim().is_empty() {
+            decode_hint = Some(cols[4].trim().to_string());
+        }
+
+        let record = mx8_core::types::ManifestRecord {
+            sample_id,
+            location,
+            byte_offset,
+            byte_length,
+            decode_hint,
+        };
+        record
+            .validate()
+            .map_err(|e| anyhow::anyhow!("line {}: {e}", line_no))?;
+
+        anyhow::ensure!(
+            record.sample_id == expected_sample_id,
+            "expected sample_id {} but found {}",
+            expected_sample_id,
+            record.sample_id
+        );
+
+        if record.sample_id >= start_id && record.sample_id < end_id {
+            selected.push(record);
+        }
+        expected_sample_id = expected_sample_id.saturating_add(1);
+    }
+
+    let len = expected_sample_id as usize;
+    let start = usize::try_from(start_id).map_err(|_| anyhow::anyhow!("start_id too large"))?;
+    let end = usize::try_from(end_id).map_err(|_| anyhow::anyhow!("end_id too large"))?;
+    anyhow::ensure!(start <= len, "start_id out of range");
+    anyhow::ensure!(end <= len, "end_id out of range");
+    Ok(selected)
+}
+
+struct ChunkedRead<I>
+where
+    I: Iterator<Item = Vec<u8>>,
+{
+    iter: I,
+    cur: std::io::Cursor<Vec<u8>>,
+    exhausted: bool,
+}
+
+impl<I> ChunkedRead<I>
+where
+    I: Iterator<Item = Vec<u8>>,
+{
+    fn new(iter: I) -> Self {
+        Self {
+            iter,
+            cur: std::io::Cursor::new(Vec::new()),
+            exhausted: false,
+        }
+    }
+}
+
+impl<I> std::io::Read for ChunkedRead<I>
+where
+    I: Iterator<Item = Vec<u8>>,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let n = std::io::Read::read(&mut self.cur, buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            if self.exhausted {
+                return Ok(0);
+            }
+            match self.iter.next() {
+                Some(chunk) => {
+                    self.cur = std::io::Cursor::new(chunk);
+                }
+                None => {
+                    self.exhausted = true;
+                }
+            }
+        }
+    }
+}
+
 fn select_record_range(
     records: Vec<mx8_core::types::ManifestRecord>,
     start_id: u64,
@@ -2044,6 +2441,193 @@ mod s3_parse_tests {
         assert_eq!(out.len(), 25);
         for (idx, sid) in out.iter().enumerate() {
             assert_eq!(*sid as usize, idx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod manifest_reader_tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::sink::Sink;
+    use crate::types::Batch;
+
+    fn manifest_with_n_rows(n: usize) -> Vec<u8> {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "schema_version={}\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        ));
+        for i in 0..n {
+            out.push_str(&format!("{i}\tfile:///tmp/{i}.bin\t\t\t\n"));
+        }
+        out.into_bytes()
+    }
+
+    #[test]
+    fn manifest_reader_accepts_valid_canonical_tsv() -> Result<()> {
+        let bytes = manifest_with_n_rows(3);
+        let records = load_manifest_records_from_read(std::io::Cursor::new(bytes))?;
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].sample_id, 0);
+        assert_eq!(records[2].sample_id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_reader_rejects_missing_schema_header() {
+        let bytes = b"0\tfile:///tmp/0.bin\t\t\t\n".to_vec();
+        let err = load_manifest_records_from_read(std::io::Cursor::new(bytes)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("manifest header missing schema_version"));
+    }
+
+    #[test]
+    fn manifest_reader_rejects_non_sequential_sample_ids() {
+        let bytes = format!(
+            "schema_version={}\n0\tfile:///tmp/0.bin\t\t\t\n2\tfile:///tmp/2.bin\t\t\t\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        )
+        .into_bytes();
+        let err = load_manifest_records_from_read(std::io::Cursor::new(bytes)).unwrap_err();
+        assert!(err.to_string().contains("expected sample_id 1 but found 2"));
+    }
+
+    #[test]
+    fn manifest_reader_matches_bytes_parser_semantics() {
+        let good = manifest_with_n_rows(4);
+        let from_bytes = parse_canonical_manifest_tsv(&good).unwrap();
+        let from_reader = load_manifest_records_from_read(std::io::Cursor::new(good)).unwrap();
+        assert_eq!(from_bytes, from_reader);
+
+        let bad = format!(
+            "schema_version={}\n0\tfile:///tmp/0.bin\t\t\t\n0\tfile:///tmp/0b.bin\t\t\t\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        )
+        .into_bytes();
+        let bad_bytes_err = parse_canonical_manifest_tsv(&bad).unwrap_err().to_string();
+        let bad_reader_err = load_manifest_records_from_read(std::io::Cursor::new(bad))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(bad_bytes_err, bad_reader_err);
+    }
+
+    #[test]
+    fn manifest_reader_handles_large_input_without_full_buffer_requirement() -> Result<()> {
+        let bytes = manifest_with_n_rows(25_000);
+        let chunks: Vec<Vec<u8>> = bytes.chunks(257).map(|c| c.to_vec()).collect();
+        let records = load_manifest_records_from_chunk_iter(chunks)?;
+        assert_eq!(records.len(), 25_000);
+        assert_eq!(records.first().map(|r| r.sample_id), Some(0));
+        assert_eq!(records.last().map(|r| r.sample_id), Some(24_999));
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_reader_range_matches_full_select_semantics() -> Result<()> {
+        let bytes = manifest_with_n_rows(64);
+        let full = parse_canonical_manifest_tsv(&bytes)?;
+        let expected = select_record_range_slice(&full, 7, 23)?;
+        let actual = parse_canonical_manifest_tsv_reader_range(std::io::Cursor::new(bytes), 7, 23)?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_reader_range_rejects_out_of_range() {
+        let bytes = manifest_with_n_rows(10);
+        let err = parse_canonical_manifest_tsv_reader_range(std::io::Cursor::new(bytes), 0, 11)
+            .unwrap_err();
+        assert!(err.to_string().contains("end_id out of range"));
+    }
+
+    #[derive(Default)]
+    struct CaptureSink {
+        sample_ids: Mutex<Vec<u64>>,
+    }
+
+    impl CaptureSink {
+        fn snapshot(&self) -> Vec<u64> {
+            self.sample_ids
+                .lock()
+                .expect("capture sink lock poisoned")
+                .clone()
+        }
+    }
+
+    impl Sink for CaptureSink {
+        fn deliver(&self, batch: Batch) -> Result<()> {
+            let mut out = self
+                .sample_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("capture sink lock poisoned"))?;
+            out.extend(batch.sample_ids.iter().copied());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_stream_reader_path_parity_with_bytes_path() -> Result<()> {
+        let caps = RuntimeCaps {
+            max_inflight_bytes: 8 * 1024 * 1024,
+            max_queue_batches: 8,
+            batch_size_samples: 5,
+            prefetch_batches: 1,
+            target_batch_bytes: None,
+            max_batch_bytes: None,
+            max_process_rss_bytes: None,
+        };
+        let pipeline = Pipeline::new(caps);
+
+        let mut root = std::env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        root.push(format!(
+            "mx8-runtime-reader-parity-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let _cleanup = TempDirCleanup { path: root.clone() };
+
+        let mut manifest = String::new();
+        manifest.push_str(&format!(
+            "schema_version={}\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        ));
+        for i in 0..23u64 {
+            let p = root.join(format!("sample-{i}.bin"));
+            std::fs::write(&p, [i as u8, (i.wrapping_mul(3)) as u8])?;
+            manifest.push_str(&format!("{}\t{}\t\t\t\n", i, p.display()));
+        }
+        let manifest = manifest.into_bytes();
+
+        let sink_bytes = Arc::new(CaptureSink::default());
+        pipeline
+            .run_manifest_bytes(sink_bytes.clone(), &manifest)
+            .await?;
+
+        let sink_reader = Arc::new(CaptureSink::default());
+        pipeline
+            .run_manifest_reader(sink_reader.clone(), std::io::Cursor::new(manifest.clone()))
+            .await?;
+
+        assert_eq!(sink_bytes.snapshot(), sink_reader.snapshot());
+        Ok(())
+    }
+
+    struct TempDirCleanup {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempDirCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }

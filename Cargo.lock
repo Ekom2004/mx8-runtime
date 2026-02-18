@@ -1973,6 +1973,7 @@ dependencies = [
  "mx8-proto",
  "mx8-runtime",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
