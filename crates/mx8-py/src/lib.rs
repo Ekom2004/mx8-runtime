@@ -39,7 +39,8 @@ use mx8_snapshot::pack_dir::{
 };
 use mx8_snapshot::pack_s3::{pack_s3, LabelMode as PackLabelMode, PackS3Config};
 use mx8_snapshot::video_stage1::{
-    build_video_stage1_index_from_manifest_bytes, canonicalize_video_stage1_tsv, VideoStage1Config,
+    build_video_stage1_index_from_manifest_bytes, canonicalize_video_stage1_tsv, VideoClipRecord,
+    VideoStage1Config,
 };
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 use mx8_wire::TryToCore;
@@ -129,6 +130,34 @@ struct MixedDataLoader {
     snapshot_enabled: bool,
     snapshot_period_ticks: u64,
     snapshot_emitted_total: u64,
+}
+
+#[pyclass]
+struct VideoBatch {
+    sample_ids: Vec<u64>,
+    clip_ids: Vec<String>,
+    media_uris: Vec<String>,
+    clip_starts: Vec<u64>,
+    offsets: Vec<u64>,
+    payload: Vec<u8>,
+}
+
+#[pyclass]
+struct VideoDataLoader {
+    manifest_hash: String,
+    clips: Vec<VideoClipRecord>,
+    next_idx: usize,
+    batch_size_samples: usize,
+    max_inflight_bytes: u64,
+    bytes_per_clip: usize,
+    seed: u64,
+    epoch: u64,
+    clip_len: u32,
+    stride: u32,
+    fps_policy: String,
+    delivered_batches: u64,
+    delivered_samples: u64,
+    delivered_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1140,6 +1169,138 @@ impl MixedDataLoader {
     }
 }
 
+#[pymethods]
+impl VideoBatch {
+    #[getter]
+    fn sample_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Ok(PyList::new_bound(py, self.sample_ids.iter().copied()))
+    }
+
+    #[getter]
+    fn clip_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Ok(PyList::new_bound(py, self.clip_ids.iter().cloned()))
+    }
+
+    #[getter]
+    fn media_uris<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Ok(PyList::new_bound(py, self.media_uris.iter().cloned()))
+    }
+
+    #[getter]
+    fn clip_starts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Ok(PyList::new_bound(py, self.clip_starts.iter().copied()))
+    }
+
+    #[getter]
+    fn offsets<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Ok(PyList::new_bound(py, self.offsets.iter().copied()))
+    }
+
+    #[getter]
+    fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new_bound(py, &self.payload))
+    }
+}
+
+impl VideoDataLoader {
+    fn clip_payload_bytes(&self, clip: &VideoClipRecord) -> PyResult<Vec<u8>> {
+        if clip.media_uri.starts_with("s3://") {
+            return Err(PyRuntimeError::new_err(
+                "mx8.video stage2a currently supports local media paths only",
+            ));
+        }
+        let path = std::path::PathBuf::from(&clip.media_uri);
+        let bytes = std::fs::read(&path).map_err(|e| {
+            PyRuntimeError::new_err(format!("video decode read failed for {}: {e}", path.display()))
+        })?;
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = ((clip.clip_start as usize).saturating_mul(64)) % bytes.len();
+        let end = start.saturating_add(self.bytes_per_clip).min(bytes.len());
+        Ok(bytes[start..end].to_vec())
+    }
+}
+
+#[pymethods]
+impl VideoDataLoader {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if self.next_idx >= self.clips.len() {
+            return Err(PyStopIteration::new_err(()));
+        }
+        let end_idx = self
+            .next_idx
+            .saturating_add(self.batch_size_samples)
+            .min(self.clips.len());
+        let mut sample_ids = Vec::with_capacity(end_idx.saturating_sub(self.next_idx));
+        let mut clip_ids = Vec::with_capacity(end_idx.saturating_sub(self.next_idx));
+        let mut media_uris = Vec::with_capacity(end_idx.saturating_sub(self.next_idx));
+        let mut clip_starts = Vec::with_capacity(end_idx.saturating_sub(self.next_idx));
+        let mut offsets = Vec::with_capacity(end_idx.saturating_sub(self.next_idx).saturating_add(1));
+        offsets.push(0);
+        let mut payload = Vec::<u8>::new();
+
+        for idx in self.next_idx..end_idx {
+            let clip = &self.clips[idx];
+            let clip_payload = self.clip_payload_bytes(clip)?;
+            payload.extend_from_slice(&clip_payload);
+            offsets.push(payload.len() as u64);
+            sample_ids.push(clip.sample_id);
+            clip_ids.push(clip.clip_id.clone());
+            media_uris.push(clip.media_uri.clone());
+            clip_starts.push(clip.clip_start);
+        }
+
+        let payload_bytes = payload.len() as u64;
+        if payload_bytes > self.max_inflight_bytes {
+            return Err(PyRuntimeError::new_err(format!(
+                "video batch payload {} exceeds max_inflight_bytes {}",
+                payload_bytes, self.max_inflight_bytes
+            )));
+        }
+
+        self.next_idx = end_idx;
+        self.delivered_batches = self.delivered_batches.saturating_add(1);
+        self.delivered_samples = self.delivered_samples.saturating_add(sample_ids.len() as u64);
+        self.delivered_bytes = self.delivered_bytes.saturating_add(payload_bytes);
+
+        let out = Py::new(
+            py,
+            VideoBatch {
+                sample_ids,
+                clip_ids,
+                media_uris,
+                clip_starts,
+                offsets,
+                payload,
+            },
+        )?;
+        Ok(out.into_bound(py).into_any())
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = PyDict::new_bound(py);
+        out.set_item("manifest_hash", &self.manifest_hash)?;
+        out.set_item("seed", self.seed)?;
+        out.set_item("epoch", self.epoch)?;
+        out.set_item("clip_len", self.clip_len)?;
+        out.set_item("stride", self.stride)?;
+        out.set_item("fps_policy", &self.fps_policy)?;
+        out.set_item("bytes_per_clip", self.bytes_per_clip as u64)?;
+        out.set_item("max_inflight_bytes", self.max_inflight_bytes)?;
+        out.set_item("clips_total", self.clips.len() as u64)?;
+        out.set_item("clips_remaining", (self.clips.len().saturating_sub(self.next_idx)) as u64)?;
+        out.set_item("video_delivered_batches_total", self.delivered_batches)?;
+        out.set_item("video_delivered_samples_total", self.delivered_samples)?;
+        out.set_item("video_delivered_bytes_total", self.delivered_bytes)?;
+        Ok(out.into_any())
+    }
+}
+
 impl ImageFolderLoader {
     fn next_python_decode<'py>(
         &self,
@@ -2034,6 +2195,128 @@ fn load(
 }
 
 #[pyfunction]
+#[pyo3(signature = (
+    dataset_link,
+    *,
+    manifest_store_root=None,
+    dev_manifest_path=None,
+    recursive=true,
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    seed=0,
+    epoch=0,
+    constraints=None,
+    node_id=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn video(
+    py: Python<'_>,
+    dataset_link: String,
+    manifest_store_root: Option<PathBuf>,
+    dev_manifest_path: Option<PathBuf>,
+    recursive: bool,
+    clip_len: u32,
+    stride: u32,
+    fps: u32,
+    batch_size_samples: usize,
+    seed: u64,
+    epoch: u64,
+    constraints: Option<Constraints>,
+    node_id: Option<String>,
+) -> PyResult<Py<VideoDataLoader>> {
+    let root = manifest_store_root
+        .or(env_path("MX8_MANIFEST_STORE_ROOT"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
+    let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
+    let store = std::sync::Arc::new(FsManifestStore::new(root));
+    let resolver = SnapshotResolver::new(
+        store,
+        SnapshotResolverConfig {
+            dev_manifest_path,
+            recursive,
+            materialize_manifest_bytes: true,
+            ..SnapshotResolverConfig::default()
+        },
+    );
+    let snapshot = resolver
+        .resolve(
+            &dataset_link,
+            LockOwner {
+                node_id: node_id.clone(),
+            },
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+    let fps_policy = format!("fixed_fps:{fps}");
+    let cfg = VideoStage1Config {
+        clip_len,
+        stride,
+        fps_policy: fps_policy.clone(),
+        seed,
+        epoch,
+        max_clips_in_memory: env_usize("MX8_VIDEO_STAGE2_MAX_CLIPS_IN_MEMORY", 2_000_000),
+    };
+    let index =
+        build_video_stage1_index_from_manifest_bytes(&snapshot.manifest_hash, &snapshot.manifest_bytes, &cfg)
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+    let max_inflight_bytes = constraints
+        .as_ref()
+        .and_then(|c| c.max_inflight_bytes)
+        .unwrap_or(128 * 1024 * 1024)
+        .max(1);
+    let bytes_per_clip = env_usize("MX8_VIDEO_STAGE2_BYTES_PER_CLIP", 4096).max(1);
+    if batch_size_samples == 0 {
+        return Err(PyValueError::new_err(
+            "video batch_size_samples must be > 0",
+        ));
+    }
+    if (batch_size_samples as u64).saturating_mul(bytes_per_clip as u64) > max_inflight_bytes {
+        return Err(PyValueError::new_err(format!(
+            "video batch_size_samples ({batch_size_samples}) * bytes_per_clip ({bytes_per_clip}) exceeds max_inflight_bytes ({max_inflight_bytes}); lower batch size or raise cap"
+        )));
+    }
+
+    tracing::info!(
+        target: "mx8_proof",
+        event = "video_loader_initialized",
+        manifest_hash = %snapshot.manifest_hash.0,
+        clip_len = clip_len as u64,
+        stride = stride as u64,
+        fps = fps as u64,
+        batch_size_samples = batch_size_samples as u64,
+        clips_total = index.summary.clip_count,
+        max_inflight_bytes = max_inflight_bytes,
+        bytes_per_clip = bytes_per_clip as u64,
+        seed = seed,
+        epoch = epoch,
+        "initialized stage2a video loader"
+    );
+
+    Py::new(
+        py,
+        VideoDataLoader {
+            manifest_hash: snapshot.manifest_hash.0,
+            clips: index.clips,
+            next_idx: 0,
+            batch_size_samples,
+            max_inflight_bytes,
+            bytes_per_clip,
+            seed,
+            epoch,
+            clip_len,
+            stride,
+            fps_policy,
+            delivered_batches: 0,
+            delivered_samples: 0,
+            delivered_bytes: 0,
+        },
+    )
+}
+
+#[pyfunction]
 #[pyo3(signature = (loaders, *, weights, seed=0, epoch=0, starvation_window=10_000))]
 fn mix(
     py: Python<'_>,
@@ -2135,6 +2418,8 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<DataLoader>()?;
     m.add_class::<MixedDataLoader>()?;
+    m.add_class::<VideoDataLoader>()?;
+    m.add_class::<VideoBatch>()?;
     m.add_class::<DistributedDataLoader>()?;
     m.add_class::<Constraints>()?;
     m.add_class::<RuntimeConfig>()?;
@@ -2142,6 +2427,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pack, m)?)?;
     m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(video, m)?)?;
     m.add_function(wrap_pyfunction!(mix, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
     Ok(())

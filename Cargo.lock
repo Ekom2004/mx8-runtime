@@ -1846,7 +1846,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "mx8-coordinator"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-core"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-manifest-store"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-observe"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-proto"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-py"
-version = "0.0.6"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "fast_image_resize",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-runtime"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-snapshot"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-wire"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "mx8-core",
  "mx8-proto",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "mx8d-agent"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",

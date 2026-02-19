@@ -135,4 +135,9 @@ if [[ "${MX8_SMOKE_VIDEO_STAGE1:-0}" == "1" ]]; then
   ./scripts/video_stage1_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_VIDEO_STAGE2A:-0}" == "1" ]]; then
+  echo "[mx8] video_stage2a_gate (v1.8 stage-2a cpu video API gate)"
+  ./scripts/video_stage2a_gate.sh
+fi
+
 echo "[mx8] smoke OK"
