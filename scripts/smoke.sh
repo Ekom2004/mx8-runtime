@@ -68,6 +68,11 @@ if [[ "${MX8_SMOKE_MINIO_S3_PREFIX_RECURSIVE:-0}" == "1" ]]; then
   ./scripts/minio_s3_prefix_recursive_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_MINIO_VIDEO_STAGE1:-0}" == "1" ]]; then
+  echo "[mx8] minio_video_stage1_gate (S3 stage1 video metadata extraction)"
+  ./scripts/minio_video_stage1_gate.sh
+fi
+
 if [[ "${MX8_SMOKE_MINIO_PACK:-0}" == "1" ]]; then
   echo "[mx8] minio_pack_gate (pack S3 prefix -> tar shards + manifest)"
   ./scripts/minio_pack_gate.sh

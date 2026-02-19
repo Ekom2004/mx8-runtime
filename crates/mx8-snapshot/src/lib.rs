@@ -651,6 +651,33 @@ fn stage1_video_decode_hint_for_local(path: &std::path::Path) -> Result<Option<S
     )))
 }
 
+#[cfg(feature = "s3")]
+fn stage1_video_decode_hint_for_s3_key(key: &str, object_size_bytes: Option<i64>) -> Option<String> {
+    if !snapshot_env_bool("MX8_VIDEO_STAGE1_INDEX", false) {
+        return None;
+    }
+    let path = std::path::Path::new(key);
+    if !is_video_extension(path) {
+        return None;
+    }
+    let bytes_per_frame_estimate = std::env::var("MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(50_000);
+    let size_u64 = object_size_bytes.and_then(|v| u64::try_from(v).ok()).unwrap_or(1);
+    let est_frames = size_u64.max(1).saturating_div(bytes_per_frame_estimate).max(1);
+    let codec = codec_from_extension(path);
+    let codec_field = if is_supported_video_codec(codec) {
+        codec.to_string()
+    } else {
+        "unsupported".to_string()
+    };
+    Some(format!(
+        "mx8:video;frames={est_frames};stream_id=0;codec={codec_field}"
+    ))
+}
+
 fn index_local_prefix(
     base: &str,
     recursive: bool,
@@ -710,10 +737,30 @@ fn index_local_prefix(
         ));
     }
 
+    let video_stage1_enabled = snapshot_env_bool("MX8_VIDEO_STAGE1_INDEX", false);
+    let mut video_candidates_total: u64 = 0;
+    let mut video_hints_emitted_total: u64 = 0;
+    let mut video_codec_unsupported_total: u64 = 0;
+    let mut video_probe_corrupt_total: u64 = 0;
+
     let mut records: Vec<ManifestRecord> = Vec::with_capacity(files.len());
     for (i, path) in files.into_iter().enumerate() {
         let abs = path.canonicalize().unwrap_or(path);
+        if video_stage1_enabled && is_video_extension(&abs) {
+            video_candidates_total = video_candidates_total.saturating_add(1);
+        }
         let decode_hint = stage1_video_decode_hint_for_local(&abs)?;
+        if let Some(hint) = decode_hint.as_deref() {
+            if hint.starts_with("mx8:video;") {
+                video_hints_emitted_total = video_hints_emitted_total.saturating_add(1);
+            }
+            if hint.contains("codec=unsupported") {
+                video_codec_unsupported_total = video_codec_unsupported_total.saturating_add(1);
+            }
+            if hint.contains("corrupt=true") {
+                video_probe_corrupt_total = video_probe_corrupt_total.saturating_add(1);
+            }
+        }
         let record = ManifestRecord {
             sample_id: i as u64,
             location: abs.display().to_string(),
@@ -738,6 +785,19 @@ fn index_local_prefix(
         dirs_scanned = dirs_scanned,
         scan_ms = scan_started.elapsed().as_millis() as u64,
         "snapshot index summary"
+    );
+    info!(
+        target: "mx8_proof",
+        event = "snapshot_video_stage1_metadata_summary",
+        backend = "local",
+        base = %base,
+        recursive = recursive,
+        video_stage1_enabled = video_stage1_enabled,
+        video_candidates_total = video_candidates_total,
+        video_hints_emitted_total = video_hints_emitted_total,
+        video_codec_unsupported_total = video_codec_unsupported_total,
+        video_probe_corrupt_total = video_probe_corrupt_total,
+        "video stage1 metadata extraction summary"
     );
     Ok((records, canonical))
 }
@@ -1111,6 +1171,7 @@ fn index_s3_prefix(
     };
     let client = block_on(client_from_env())??;
     let label_mode = parse_label_mode()?;
+    let video_stage1_enabled = snapshot_env_bool("MX8_VIDEO_STAGE1_INDEX", false);
 
     // Fast path: if the dataset prefix is already packed, use the precomputed canonical manifest.
     //
@@ -1183,6 +1244,9 @@ fn index_s3_prefix(
         let mut label_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut saw_all_imagefolder = true;
         let mut objects_seen: u64 = 0;
+        let mut video_candidates_total: u64 = 0;
+        let mut video_hints_emitted_total: u64 = 0;
+        let mut video_codec_unsupported_total: u64 = 0;
 
         block_on(async {
             let mut token: Option<String> = None;
@@ -1209,6 +1273,9 @@ fn index_s3_prefix(
                             continue;
                         }
                         objects_seen = objects_seen.saturating_add(1);
+                        if video_stage1_enabled && is_video_extension(std::path::Path::new(&k)) {
+                            video_candidates_total = video_candidates_total.saturating_add(1);
+                        }
                         if label_mode != S3LabelMode::None {
                             let label = imagefolder_label_for_key(&prefix, &k);
                             if let Some(l) = label {
@@ -1298,7 +1365,10 @@ fn index_s3_prefix(
                     sample_id, location
                 )));
             }
-            let decode_hint = if use_imagefolder_labels {
+            let decode_hint = if let Some(video_hint) = stage1_video_decode_hint_for_s3_key(&key, None)
+            {
+                Some(video_hint)
+            } else if use_imagefolder_labels {
                 let label = imagefolder_label_for_key(&prefix, &key).ok_or_else(|| {
                     SnapshotError::S3Index(format!(
                         "label missing under imagefolder mode (sample_id={sample_id}, key={key})"
@@ -1313,6 +1383,14 @@ fn index_s3_prefix(
             } else {
                 None
             };
+            if let Some(hint) = decode_hint.as_deref() {
+                if hint.starts_with("mx8:video;") {
+                    video_hints_emitted_total = video_hints_emitted_total.saturating_add(1);
+                }
+                if hint.contains("codec=unsupported") {
+                    video_codec_unsupported_total = video_codec_unsupported_total.saturating_add(1);
+                }
+            }
             let record = ManifestRecord {
                 sample_id,
                 location,
@@ -1395,6 +1473,20 @@ fn index_s3_prefix(
             scan_ms = scan_ms,
             "snapshot index summary"
         );
+        info!(
+            target: "mx8_proof",
+            event = "snapshot_video_stage1_metadata_summary",
+            backend = "s3",
+            bucket = %bucket,
+            prefix = %prefix,
+            recursive = recursive,
+            external_sort = true,
+            video_stage1_enabled = video_stage1_enabled,
+            video_candidates_total = video_candidates_total,
+            video_hints_emitted_total = video_hints_emitted_total,
+            video_codec_unsupported_total = video_codec_unsupported_total,
+            "video stage1 metadata extraction summary"
+        );
         let output = sink.finish()?;
         return Ok(IndexedManifest {
             manifest_hash: output.manifest_hash,
@@ -1406,6 +1498,9 @@ fn index_s3_prefix(
 
     let mut label_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut saw_all_imagefolder = true;
+    let mut video_candidates_total: u64 = 0;
+    let mut video_hints_emitted_total: u64 = 0;
+    let mut video_codec_unsupported_total: u64 = 0;
     if label_mode != S3LabelMode::None {
         block_on(async {
             let mut token: Option<String> = None;
@@ -1506,9 +1601,13 @@ fn index_s3_prefix(
 
             if let Some(contents) = resp.contents {
                 for obj in contents {
+                    let key_size = obj.size;
                     let Some(k) = obj.key else { continue };
                     if k.ends_with('/') {
                         continue;
+                    }
+                    if video_stage1_enabled && is_video_extension(std::path::Path::new(&k)) {
+                        video_candidates_total = video_candidates_total.saturating_add(1);
                     }
                     if let Some(prev) = prev_key.as_deref() {
                         if k.as_str() <= prev {
@@ -1525,21 +1624,34 @@ fn index_s3_prefix(
                             sample_id, location
                         )));
                     }
-                    let decode_hint = if use_imagefolder_labels {
-                        let label = imagefolder_label_for_key(&prefix, &k).ok_or_else(|| {
-                            SnapshotError::S3Index(format!(
-                                "label missing under imagefolder mode (sample_id={sample_id}, key={k})"
-                            ))
-                        })?;
-                        let label_id = *label_map.get(&label).ok_or_else(|| {
-                            SnapshotError::S3Index(format!(
-                                "label not present in label map (sample_id={sample_id}, label={label:?})"
-                            ))
-                        })?;
-                        Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
-                    } else {
-                        None
-                    };
+                    let decode_hint =
+                        if let Some(video_hint) = stage1_video_decode_hint_for_s3_key(&k, key_size)
+                        {
+                            Some(video_hint)
+                        } else if use_imagefolder_labels {
+                            let label = imagefolder_label_for_key(&prefix, &k).ok_or_else(|| {
+                                SnapshotError::S3Index(format!(
+                                    "label missing under imagefolder mode (sample_id={sample_id}, key={k})"
+                                ))
+                            })?;
+                            let label_id = *label_map.get(&label).ok_or_else(|| {
+                                SnapshotError::S3Index(format!(
+                                    "label not present in label map (sample_id={sample_id}, label={label:?})"
+                                ))
+                            })?;
+                            Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
+                        } else {
+                            None
+                        };
+                    if let Some(hint) = decode_hint.as_deref() {
+                        if hint.starts_with("mx8:video;") {
+                            video_hints_emitted_total = video_hints_emitted_total.saturating_add(1);
+                        }
+                        if hint.contains("codec=unsupported") {
+                            video_codec_unsupported_total =
+                                video_codec_unsupported_total.saturating_add(1);
+                        }
+                    }
 
                     let record = ManifestRecord {
                         sample_id,
@@ -1610,6 +1722,20 @@ fn index_s3_prefix(
         objects_indexed = sample_id,
         scan_ms = scan_ms,
         "snapshot index summary"
+    );
+    info!(
+        target: "mx8_proof",
+        event = "snapshot_video_stage1_metadata_summary",
+        backend = "s3",
+        bucket = %bucket,
+        prefix = %prefix,
+        recursive = recursive,
+        external_sort = false,
+        video_stage1_enabled = video_stage1_enabled,
+        video_candidates_total = video_candidates_total,
+        video_hints_emitted_total = video_hints_emitted_total,
+        video_codec_unsupported_total = video_codec_unsupported_total,
+        "video stage1 metadata extraction summary"
     );
     let output = sink.finish()?;
     Ok(IndexedManifest {
