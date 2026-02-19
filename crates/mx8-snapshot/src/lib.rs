@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 pub mod labels;
 pub mod pack_dir;
+pub mod video_stage1;
 
 #[cfg(feature = "s3")]
 pub mod pack_s3;
@@ -515,6 +516,141 @@ fn parse_canonical_manifest_tsv_bytes(
     Ok((records, canonical))
 }
 
+fn snapshot_env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+fn is_video_extension(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("mp4")
+            | Some("mov")
+            | Some("avi")
+            | Some("mkv")
+            | Some("webm")
+            | Some("m4v")
+            | Some("mpg")
+            | Some("mpeg")
+    )
+}
+
+fn codec_from_extension(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("webm") => "vp9",
+        Some("avi") | Some("mpg") | Some("mpeg") => "mpeg4",
+        _ => "h264",
+    }
+}
+
+fn is_supported_video_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "h264" | "hevc" | "vp9" | "mpeg4" | "av1" | "h263" | "mjpeg"
+    )
+}
+
+fn probe_video_with_ffprobe(path: &std::path::Path) -> Result<Option<(u64, String)>, SnapshotError> {
+    let out = std::process::Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=codec_name,nb_frames")
+        .arg("-of")
+        .arg("csv=p=0")
+        .arg(path.as_os_str())
+        .output();
+
+    let out = match out {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SnapshotError::IndexIo(format!(
+                "ffprobe invocation failed for {}: {e}",
+                path.display()
+            )))
+        }
+    };
+
+    if !out.status.success() {
+        return Ok(Some((1, "corrupt".to_string())));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().next().map(str::trim).unwrap_or_default();
+    if line.is_empty() {
+        return Ok(Some((1, "corrupt".to_string())));
+    }
+    let mut parts = line.split(',');
+    let codec = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let frames_raw = parts.next().unwrap_or("").trim();
+    let frames = frames_raw.parse::<u64>().ok().filter(|v| *v > 0).unwrap_or(1);
+    if codec.is_empty() {
+        return Ok(Some((frames, "corrupt".to_string())));
+    }
+    Ok(Some((frames, codec)))
+}
+
+fn stage1_video_decode_hint_for_local(path: &std::path::Path) -> Result<Option<String>, SnapshotError> {
+    if !snapshot_env_bool("MX8_VIDEO_STAGE1_INDEX", false) {
+        return Ok(None);
+    }
+    if !is_video_extension(path) {
+        return Ok(None);
+    }
+    let disable_ffprobe = snapshot_env_bool("MX8_VIDEO_STAGE1_DISABLE_FFPROBE", false);
+    let probed = if disable_ffprobe {
+        None
+    } else {
+        probe_video_with_ffprobe(path)?
+    };
+
+    let (frames, codec) = match probed {
+        Some((frames, codec)) if codec == "corrupt" => {
+            return Ok(Some(
+                "mx8:video;frames=1;stream_id=0;corrupt=true".to_string(),
+            ))
+        }
+        Some((frames, codec)) => (frames, codec),
+        None => {
+            let bytes_per_frame_estimate = std::env::var("MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(50_000);
+            let file_len = std::fs::metadata(path)
+                .map_err(|e| SnapshotError::IndexIo(format!("stat {} failed: {e}", path.display())))?
+                .len();
+            let est_frames = file_len.max(1).saturating_div(bytes_per_frame_estimate).max(1);
+            (est_frames, codec_from_extension(path).to_string())
+        }
+    };
+
+    let codec_field = if is_supported_video_codec(&codec) {
+        codec
+    } else {
+        "unsupported".to_string()
+    };
+    Ok(Some(format!(
+        "mx8:video;frames={frames};stream_id=0;codec={codec_field}"
+    )))
+}
+
 fn index_local_prefix(
     base: &str,
     recursive: bool,
@@ -577,12 +713,13 @@ fn index_local_prefix(
     let mut records: Vec<ManifestRecord> = Vec::with_capacity(files.len());
     for (i, path) in files.into_iter().enumerate() {
         let abs = path.canonicalize().unwrap_or(path);
+        let decode_hint = stage1_video_decode_hint_for_local(&abs)?;
         let record = ManifestRecord {
             sample_id: i as u64,
             location: abs.display().to_string(),
             byte_offset: None,
             byte_length: None,
-            decode_hint: None,
+            decode_hint,
         };
         record
             .validate()

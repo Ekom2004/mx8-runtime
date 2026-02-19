@@ -120,4 +120,14 @@ if [[ "${MX8_SMOKE_AUTOTUNE_PRESSURE_SIM:-0}" == "1" ]]; then
   ./scripts/autotune_memory_pressure_sim.sh
 fi
 
+if [[ "${MX8_SMOKE_MIX:-0}" == "1" ]]; then
+  echo "[mx8] mix_gate (v1.7 weighted round-robin scheduler gate)"
+  ./scripts/mix_gate.sh
+fi
+
+if [[ "${MX8_SMOKE_VIDEO_STAGE1:-0}" == "1" ]]; then
+  echo "[mx8] video_stage1_gate (v1.8 stage-1 clip-index contract gate)"
+  ./scripts/video_stage1_gate.sh
+fi
+
 echo "[mx8] smoke OK"

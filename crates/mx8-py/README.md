@@ -70,6 +70,44 @@ for batch in loader:
     pass
 ```
 
+## Mix multiple loaders (v1.7 preview)
+
+`mx8.mix(...)` composes existing loaders into one deterministic stream.
+`weights` are sampling proportions (not model-loss weights).
+
+```python
+import mx8
+
+loader_a = mx8.load("s3://bucket/dataset_a/@refresh", profile="balanced", autotune=True)
+loader_b = mx8.load("s3://bucket/dataset_b/@refresh", profile="balanced", autotune=True)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[1, 1],   # fairness baseline (50:50)
+    seed=0,
+    epoch=0,
+)
+
+for batch in mixed:
+    pass
+
+print(mixed.stats())
+```
+
+Skewed example:
+
+```python
+mixed = mx8.mix([loader_a, loader_b], weights=[7, 3], seed=0, epoch=0)
+```
+
+`seed` and `epoch` define deterministic schedule behavior:
+
+- same `seed` + `epoch` => same source-pick sequence
+- same `seed`, different `epoch` => controlled schedule variation
+
+`starvation_window` is an optional watchdog threshold in scheduler ticks used for starvation counters in `mixed.stats()`.
+Set `MX8_MIX_SNAPSHOT=1` (and optional `MX8_MIX_SNAPSHOT_PERIOD_TICKS=64`) to emit periodic `mix_snapshot` proof events.
+
 ## Bounded memory (v0)
 
 Set a hard cap and periodically print high-water marks:

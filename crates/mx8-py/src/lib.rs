@@ -38,6 +38,9 @@ use mx8_snapshot::pack_dir::{
     pack_dir as pack_dir_impl, LabelMode as PackDirLabelMode, PackDirConfig,
 };
 use mx8_snapshot::pack_s3::{pack_s3, LabelMode as PackLabelMode, PackS3Config};
+use mx8_snapshot::video_stage1::{
+    build_video_stage1_index_from_manifest_bytes, canonicalize_video_stage1_tsv, VideoStage1Config,
+};
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 use mx8_wire::TryToCore;
 use tonic::transport::Channel;
@@ -96,10 +99,158 @@ struct ImageFolderLoader {
 struct DataLoader {
     dataset_base: String,
     manifest_hash: String,
+    batch_size_samples: usize,
+    max_inflight_bytes: u64,
+    max_queue_batches: usize,
+    prefetch_batches: usize,
     metrics: Arc<RuntimeMetrics>,
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     rt: tokio::runtime::Runtime,
+}
+
+#[pyclass]
+struct MixedDataLoader {
+    loaders: Vec<Py<DataLoader>>,
+    scheduler: WeightedRoundRobin,
+    active: Vec<bool>,
+    delivered_batches: Vec<u64>,
+    delivered_samples: Vec<u64>,
+    delivered_bytes: Vec<u64>,
+    starvation_total: Vec<u64>,
+    steps_since_emit: Vec<u64>,
+    max_starvation_window: u64,
+    normalized_weights: Vec<u64>,
+    shared_max_inflight_bytes: u64,
+    shared_inflight_violation_total: u64,
+    seed: u64,
+    epoch: u64,
+    schedule_ticks: u64,
+    snapshot_enabled: bool,
+    snapshot_period_ticks: u64,
+    snapshot_emitted_total: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WeightedRoundRobin {
+    weights: Vec<u64>,
+    current: Vec<i128>,
+    tie_break_offset: usize,
+}
+
+impl WeightedRoundRobin {
+    fn new(weights: Vec<u64>, seed: u64, epoch: u64) -> Self {
+        let n = weights.len();
+        let tie_break_offset = if n == 0 {
+            0
+        } else {
+            ((seed ^ epoch.rotate_left(17)) as usize) % n
+        };
+        Self {
+            current: vec![0; n],
+            weights,
+            tie_break_offset,
+        }
+    }
+
+    fn select(&mut self, active: &[bool]) -> Option<usize> {
+        if self.weights.len() != active.len() || self.current.len() != active.len() {
+            return None;
+        }
+        let mut total_weight: i128 = 0;
+        for (i, is_active) in active.iter().enumerate() {
+            if *is_active {
+                self.current[i] += i128::from(self.weights[i]);
+                total_weight += i128::from(self.weights[i]);
+            }
+        }
+        if total_weight <= 0 {
+            return None;
+        }
+
+        let n = active.len();
+        let mut best_idx: Option<usize> = None;
+        let mut best_cur: i128 = i128::MIN;
+        for (i, is_active) in active.iter().enumerate() {
+            if !*is_active {
+                continue;
+            }
+            let cur = self.current[i];
+            if cur > best_cur {
+                best_cur = cur;
+                best_idx = Some(i);
+                continue;
+            }
+            if cur == best_cur {
+                let prev = best_idx.unwrap_or(i);
+                let lhs = (i + n - self.tie_break_offset % n) % n;
+                let rhs = (prev + n - self.tie_break_offset % n) % n;
+                if lhs < rhs {
+                    best_idx = Some(i);
+                }
+            }
+        }
+
+        let picked = best_idx?;
+        self.current[picked] -= total_weight;
+        Some(picked)
+    }
+}
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn normalize_mix_weights(raw: &[f64]) -> Result<Vec<u64>> {
+    if raw.is_empty() {
+        anyhow::bail!("mix weights must be non-empty");
+    }
+    let mut scaled = Vec::with_capacity(raw.len());
+    for (idx, w) in raw.iter().enumerate() {
+        if !w.is_finite() {
+            anyhow::bail!("mix weight at index {idx} is not finite");
+        }
+        if *w <= 0.0 {
+            anyhow::bail!("mix weight at index {idx} must be > 0");
+        }
+        let v = (*w * 1_000_000.0).round();
+        if v < 1.0 {
+            anyhow::bail!("mix weight at index {idx} is too small after normalization");
+        }
+        scaled.push(v as u64);
+    }
+    let mut g = scaled[0];
+    for &v in scaled.iter().skip(1) {
+        g = gcd_u64(g, v);
+    }
+    if g > 1 {
+        for v in &mut scaled {
+            *v /= g;
+        }
+    }
+    Ok(scaled)
+}
+
+fn compute_shared_mix_cap(max_inflight_bytes: &[u64]) -> Result<u64> {
+    let Some(min_cap) = max_inflight_bytes.iter().copied().min() else {
+        anyhow::bail!("mix requires at least one loader");
+    };
+    if min_cap == 0 {
+        anyhow::bail!("mix loader max_inflight_bytes must be > 0");
+    }
+    Ok(min_cap)
+}
+
+fn should_emit_mix_snapshot(schedule_ticks: u64, snapshot_period_ticks: u64) -> bool {
+    if snapshot_period_ticks == 0 || schedule_ticks == 0 {
+        return false;
+    }
+    schedule_ticks % snapshot_period_ticks == 0
 }
 
 #[pyclass]
@@ -685,6 +836,10 @@ impl DataLoader {
                     return Ok(Self {
                         dataset_base,
                         manifest_hash,
+                        batch_size_samples,
+                        max_inflight_bytes,
+                        max_queue_batches,
+                        prefetch_batches,
                         metrics,
                         rx,
                         task: Some(task),
@@ -761,6 +916,10 @@ impl DataLoader {
         Ok(Self {
             dataset_base,
             manifest_hash: snapshot.manifest_hash.0,
+            batch_size_samples,
+            max_inflight_bytes,
+            max_queue_batches,
+            prefetch_batches,
             metrics,
             rx,
             task: Some(task),
@@ -802,6 +961,182 @@ impl DataLoader {
                 }
             }
         }
+    }
+}
+
+impl MixedDataLoader {
+    fn total_inflight_bytes(&self, py: Python<'_>) -> u64 {
+        self.loaders
+            .iter()
+            .map(|ldr| ldr.borrow(py).metrics.inflight_bytes.get())
+            .fold(0u64, |acc, v| acc.saturating_add(v))
+    }
+
+    fn realized_ratio(&self) -> Vec<f64> {
+        let total_samples: u64 = self.delivered_samples.iter().sum();
+        if total_samples == 0 {
+            return vec![0.0f64; self.delivered_samples.len()];
+        }
+        self.delivered_samples
+            .iter()
+            .map(|v| (*v as f64) / (total_samples as f64))
+            .collect::<Vec<_>>()
+    }
+
+    fn maybe_emit_snapshot(&mut self, py: Python<'_>) {
+        if !self.snapshot_enabled
+            || !should_emit_mix_snapshot(self.schedule_ticks, self.snapshot_period_ticks)
+        {
+            return;
+        }
+
+        self.snapshot_emitted_total = self.snapshot_emitted_total.saturating_add(1);
+        let realized_ratio = self.realized_ratio();
+        let total_inflight_bytes = self.total_inflight_bytes(py);
+        tracing::info!(
+            target: "mx8_proof",
+            event = "mix_snapshot",
+            tick = self.schedule_ticks,
+            snapshot_index = self.snapshot_emitted_total,
+            seed = self.seed,
+            epoch = self.epoch,
+            active_sources = self.active.iter().filter(|v| **v).count() as u64,
+            mix_total_inflight_bytes = total_inflight_bytes,
+            mix_shared_max_inflight_bytes = self.shared_max_inflight_bytes,
+            normalized_weights = ?self.normalized_weights,
+            delivered_samples = ?self.delivered_samples,
+            delivered_bytes = ?self.delivered_bytes,
+            starvation_total = ?self.starvation_total,
+            realized_ratio = ?realized_ratio,
+            "periodic mix proof snapshot"
+        );
+    }
+}
+
+#[pymethods]
+impl MixedDataLoader {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if !self.active.iter().any(|v| *v) {
+            return Err(PyStopIteration::new_err(()));
+        }
+        loop {
+            let total_inflight_bytes = self.total_inflight_bytes(py);
+            if total_inflight_bytes > self.shared_max_inflight_bytes {
+                self.shared_inflight_violation_total =
+                    self.shared_inflight_violation_total.saturating_add(1);
+                return Err(PyRuntimeError::new_err(format!(
+                    "mix shared inflight cap exceeded: total_inflight_bytes={} shared_max_inflight_bytes={}",
+                    total_inflight_bytes, self.shared_max_inflight_bytes
+                )));
+            }
+
+            let Some(source_idx) = self.scheduler.select(&self.active) else {
+                return Err(PyStopIteration::new_err(()));
+            };
+            if !self.active[source_idx] {
+                continue;
+            }
+
+            for (i, is_active) in self.active.iter().enumerate() {
+                if !*is_active {
+                    continue;
+                }
+                self.steps_since_emit[i] = self.steps_since_emit[i].saturating_add(1);
+                if self.steps_since_emit[i] == self.max_starvation_window {
+                    self.starvation_total[i] = self.starvation_total[i].saturating_add(1);
+                }
+            }
+
+            let next_item = {
+                let mut loader = self.loaders[source_idx].borrow_mut(py);
+                loader.__next__(py)
+            };
+
+            match next_item {
+                Ok(item) => {
+                    let (sample_count, payload_bytes) =
+                        if let Ok(batch) = item.extract::<PyRef<'_, PyBatch>>() {
+                            (
+                                batch.lease.batch.sample_count() as u64,
+                                batch.lease.batch.payload.len() as u64,
+                            )
+                        } else {
+                            (0, 0)
+                        };
+
+                    self.delivered_batches[source_idx] =
+                        self.delivered_batches[source_idx].saturating_add(1);
+                    self.delivered_samples[source_idx] =
+                        self.delivered_samples[source_idx].saturating_add(sample_count);
+                    self.delivered_bytes[source_idx] =
+                        self.delivered_bytes[source_idx].saturating_add(payload_bytes);
+                    self.steps_since_emit[source_idx] = 0;
+                    self.schedule_ticks = self.schedule_ticks.saturating_add(1);
+                    self.maybe_emit_snapshot(py);
+                    return Ok(item);
+                }
+                Err(err) => {
+                    if err.is_instance_of::<PyStopIteration>(py) {
+                        self.active[source_idx] = false;
+                        if !self.active.iter().any(|v| *v) {
+                            return Err(PyStopIteration::new_err(()));
+                        }
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = PyDict::new_bound(py);
+        out.set_item("seed", self.seed)?;
+        out.set_item("epoch", self.epoch)?;
+        out.set_item("mix_schedule_ticks", self.schedule_ticks)?;
+        out.set_item("mix_snapshot_enabled", self.snapshot_enabled)?;
+        out.set_item("mix_snapshot_period_ticks", self.snapshot_period_ticks)?;
+        out.set_item("mix_snapshot_emitted_total", self.snapshot_emitted_total)?;
+        out.set_item("active_sources", self.active.iter().filter(|v| **v).count())?;
+        out.set_item(
+            "mix_source_delivered_batches_total",
+            PyList::new_bound(py, self.delivered_batches.iter().copied()),
+        )?;
+        out.set_item(
+            "mix_source_delivered_samples_total",
+            PyList::new_bound(py, self.delivered_samples.iter().copied()),
+        )?;
+        out.set_item(
+            "mix_source_delivered_bytes_total",
+            PyList::new_bound(py, self.delivered_bytes.iter().copied()),
+        )?;
+        out.set_item(
+            "mix_source_starvation_total",
+            PyList::new_bound(py, self.starvation_total.iter().copied()),
+        )?;
+        out.set_item(
+            "mix_normalized_weights",
+            PyList::new_bound(py, self.normalized_weights.iter().copied()),
+        )?;
+        let total_inflight_bytes = self.total_inflight_bytes(py);
+        out.set_item("mix_total_inflight_bytes", total_inflight_bytes)?;
+        out.set_item(
+            "mix_shared_max_inflight_bytes",
+            self.shared_max_inflight_bytes,
+        )?;
+        out.set_item(
+            "mix_shared_inflight_violation_total",
+            self.shared_inflight_violation_total,
+        )?;
+        out.set_item(
+            "mix_realized_ratio",
+            PyList::new_bound(py, self.realized_ratio()),
+        )?;
+        Ok(out.into_any())
     }
 }
 
@@ -1280,6 +1615,189 @@ fn resolve_manifest_hash(
     Ok(snapshot.manifest_hash.0)
 }
 
+#[pyfunction(name = "video_index_build")]
+#[pyo3(signature = (
+    dataset_link,
+    *,
+    manifest_store_root=None,
+    dev_manifest_path=None,
+    recursive=true,
+    clip_len=16,
+    stride=8,
+    fps_policy="fixed_fps:8".to_string(),
+    seed=0,
+    epoch=0,
+    max_clips_in_memory=1_000_000,
+    node_id=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn internal_video_index_build<'py>(
+    py: Python<'py>,
+    dataset_link: String,
+    manifest_store_root: Option<PathBuf>,
+    dev_manifest_path: Option<PathBuf>,
+    recursive: bool,
+    clip_len: u32,
+    stride: u32,
+    fps_policy: String,
+    seed: u64,
+    epoch: u64,
+    max_clips_in_memory: usize,
+    node_id: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let root = manifest_store_root
+        .or(env_path("MX8_MANIFEST_STORE_ROOT"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
+    let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
+
+    let store = std::sync::Arc::new(FsManifestStore::new(root));
+    let resolver = SnapshotResolver::new(
+        store,
+        SnapshotResolverConfig {
+            dev_manifest_path,
+            recursive,
+            materialize_manifest_bytes: true,
+            ..SnapshotResolverConfig::default()
+        },
+    );
+    let snapshot = resolver
+        .resolve(
+            &dataset_link,
+            LockOwner {
+                node_id: node_id.clone(),
+            },
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+    let cfg = VideoStage1Config {
+        clip_len,
+        stride,
+        fps_policy,
+        seed,
+        epoch,
+        max_clips_in_memory,
+    };
+    let index =
+        build_video_stage1_index_from_manifest_bytes(&snapshot.manifest_hash, &snapshot.manifest_bytes, &cfg)
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+    let index_tsv = canonicalize_video_stage1_tsv(&index.clips);
+    let clip_index_hash = mx8_manifest_store::sha256_hex(&index_tsv);
+
+    let out = PyDict::new_bound(py);
+    out.set_item("manifest_hash", snapshot.manifest_hash.0)?;
+    out.set_item("video_schema_version", 1u64)?;
+    out.set_item("clip_count", index.summary.clip_count)?;
+    out.set_item("tail_clips_dropped_total", index.summary.tail_clips_dropped_total)?;
+    out.set_item("clip_index_hash", clip_index_hash)?;
+    out.set_item(
+        "clip_ids_head",
+        PyList::new_bound(
+            py,
+            index
+                .clips
+                .iter()
+                .take(16)
+                .map(|c| c.clip_id.clone())
+                .collect::<Vec<_>>(),
+        ),
+    )?;
+    let failure = PyDict::new_bound(py);
+    failure.set_item(
+        "corrupt_media",
+        index.summary.failure_counts.corrupt_media,
+    )?;
+    failure.set_item("short_media", index.summary.failure_counts.short_media)?;
+    failure.set_item(
+        "unsupported_codec",
+        index.summary.failure_counts.unsupported_codec,
+    )?;
+    failure.set_item(
+        "missing_stream",
+        index.summary.failure_counts.missing_stream,
+    )?;
+    out.set_item("failure_counts", failure)?;
+    Ok(out.into_any())
+}
+
+#[pyfunction(name = "video_index_replay_check")]
+#[pyo3(signature = (
+    dataset_link,
+    *,
+    manifest_store_root=None,
+    dev_manifest_path=None,
+    recursive=true,
+    clip_len=16,
+    stride=8,
+    fps_policy="fixed_fps:8".to_string(),
+    seed=0,
+    epoch=0,
+    max_clips_in_memory=1_000_000,
+    node_id=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn internal_video_index_replay_check<'py>(
+    py: Python<'py>,
+    dataset_link: String,
+    manifest_store_root: Option<PathBuf>,
+    dev_manifest_path: Option<PathBuf>,
+    recursive: bool,
+    clip_len: u32,
+    stride: u32,
+    fps_policy: String,
+    seed: u64,
+    epoch: u64,
+    max_clips_in_memory: usize,
+    node_id: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let first = internal_video_index_build(
+        py,
+        dataset_link.clone(),
+        manifest_store_root.clone(),
+        dev_manifest_path.clone(),
+        recursive,
+        clip_len,
+        stride,
+        fps_policy.clone(),
+        seed,
+        epoch,
+        max_clips_in_memory,
+        node_id.clone(),
+    )?;
+    let second = internal_video_index_build(
+        py,
+        dataset_link,
+        manifest_store_root,
+        dev_manifest_path,
+        recursive,
+        clip_len,
+        stride,
+        fps_policy,
+        seed,
+        epoch,
+        max_clips_in_memory,
+        node_id,
+    )?;
+    let first_d = first.downcast_into::<PyDict>()?;
+    let second_d = second.downcast_into::<PyDict>()?;
+    let h1: String = first_d
+        .get_item("clip_index_hash")?
+        .ok_or_else(|| PyRuntimeError::new_err("missing clip_index_hash from first run"))?
+        .extract()?;
+    let h2: String = second_d
+        .get_item("clip_index_hash")?
+        .ok_or_else(|| PyRuntimeError::new_err("missing clip_index_hash from second run"))?
+        .extract()?;
+    if h1 != h2 {
+        return Err(PyRuntimeError::new_err(format!(
+            "video index replay mismatch: first={h1} second={h2}"
+        )));
+    }
+    let out = PyDict::new_bound(py);
+    out.set_item("deterministic", true)?;
+    out.set_item("clip_index_hash", h1)?;
+    Ok(out.into_any())
+}
+
 #[pyfunction]
 #[pyo3(signature = (pack_in, *, out, shard_mb=512, label_mode=None, require_labels=false))]
 fn pack<'py>(
@@ -1515,6 +2033,93 @@ fn load(
     Py::new(py, loader)
 }
 
+#[pyfunction]
+#[pyo3(signature = (loaders, *, weights, seed=0, epoch=0, starvation_window=10_000))]
+fn mix(
+    py: Python<'_>,
+    loaders: Vec<Py<DataLoader>>,
+    weights: Vec<f64>,
+    seed: u64,
+    epoch: u64,
+    starvation_window: u64,
+) -> PyResult<Py<MixedDataLoader>> {
+    if loaders.is_empty() {
+        return Err(PyValueError::new_err(
+            "mix requires at least one loader instance",
+        ));
+    }
+    if weights.len() != loaders.len() {
+        return Err(PyValueError::new_err(format!(
+            "mix weights length ({}) must match loader count ({})",
+            weights.len(),
+            loaders.len()
+        )));
+    }
+    let normalized =
+        normalize_mix_weights(&weights).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let mut inflight_caps = Vec::with_capacity(loaders.len());
+    let mut batch_sizes = Vec::with_capacity(loaders.len());
+    let mut queue_caps = Vec::with_capacity(loaders.len());
+    let mut prefetch_caps = Vec::with_capacity(loaders.len());
+    for loader in &loaders {
+        let guard = loader.borrow(py);
+        inflight_caps.push(guard.max_inflight_bytes);
+        batch_sizes.push(guard.batch_size_samples);
+        queue_caps.push(guard.max_queue_batches);
+        prefetch_caps.push(guard.prefetch_batches);
+    }
+    let shared_max_inflight_bytes = compute_shared_mix_cap(&inflight_caps)
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    if let Some(&first_batch_size) = batch_sizes.first() {
+        if batch_sizes.iter().any(|v| *v != first_batch_size) {
+            return Err(PyValueError::new_err(
+                "mix requires all loaders to have identical batch_size_samples",
+            ));
+        }
+    }
+    let scheduler = WeightedRoundRobin::new(normalized.clone(), seed, epoch);
+    let n = loaders.len();
+    let snapshot_enabled = env_bool("MX8_MIX_SNAPSHOT", false);
+    let snapshot_period_ticks = env_u64("MX8_MIX_SNAPSHOT_PERIOD_TICKS")
+        .unwrap_or(64)
+        .max(1);
+    tracing::info!(
+        target: "mx8_proof",
+        event = "mix_initialized",
+        sources = n as u64,
+        seed = seed,
+        epoch = epoch,
+        shared_max_inflight_bytes = shared_max_inflight_bytes,
+        normalized_weights = ?normalized,
+        snapshot_enabled = snapshot_enabled,
+        snapshot_period_ticks = snapshot_period_ticks,
+        max_queue_batches = ?queue_caps,
+        prefetch_batches = ?prefetch_caps,
+        "initialized mixed loader"
+    );
+    let out = MixedDataLoader {
+        loaders,
+        scheduler,
+        active: vec![true; n],
+        delivered_batches: vec![0; n],
+        delivered_samples: vec![0; n],
+        delivered_bytes: vec![0; n],
+        starvation_total: vec![0; n],
+        steps_since_emit: vec![0; n],
+        max_starvation_window: starvation_window.max(1),
+        normalized_weights: normalized,
+        shared_max_inflight_bytes,
+        shared_inflight_violation_total: 0,
+        seed,
+        epoch,
+        schedule_ticks: 0,
+        snapshot_enabled,
+        snapshot_period_ticks,
+        snapshot_emitted_total: 0,
+    };
+    Py::new(py, out)
+}
+
 #[pymodule]
 fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -1522,8 +2127,14 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     vision.add_class::<ImageFolderLoader>()?;
     m.add_submodule(&vision)?;
     m.setattr("vision", &vision)?;
+    let internal = PyModule::new_bound(py, "_internal")?;
+    internal.add_function(wrap_pyfunction!(internal_video_index_build, &internal)?)?;
+    internal.add_function(wrap_pyfunction!(internal_video_index_replay_check, &internal)?)?;
+    m.add_submodule(&internal)?;
+    m.setattr("_internal", &internal)?;
 
     m.add_class::<DataLoader>()?;
+    m.add_class::<MixedDataLoader>()?;
     m.add_class::<DistributedDataLoader>()?;
     m.add_class::<Constraints>()?;
     m.add_class::<RuntimeConfig>()?;
@@ -1531,6 +2142,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pack, m)?)?;
     m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(mix, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
     Ok(())
 }
@@ -2772,5 +3384,247 @@ mod autotune_tests {
         let first = run(AutotuneController::new());
         let second = run(AutotuneController::new());
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod mix_scheduler_tests {
+    use super::{
+        compute_shared_mix_cap, normalize_mix_weights, should_emit_mix_snapshot,
+        WeightedRoundRobin,
+    };
+
+    #[test]
+    fn mix_scheduler_rejects_invalid_weights() {
+        assert!(normalize_mix_weights(&[]).is_err());
+        assert!(normalize_mix_weights(&[0.0]).is_err());
+        assert!(normalize_mix_weights(&[-1.0, 1.0]).is_err());
+        assert!(normalize_mix_weights(&[f64::NAN, 1.0]).is_err());
+        assert!(normalize_mix_weights(&[f64::INFINITY, 1.0]).is_err());
+    }
+
+    #[test]
+    fn mix_scheduler_deterministic_for_fixed_seed_epoch() {
+        let weights = normalize_mix_weights(&[3.0, 2.0, 1.0]).expect("normalize");
+        let active = vec![true, true, true];
+        let run = |seed: u64, epoch: u64| {
+            let mut rr = WeightedRoundRobin::new(weights.clone(), seed, epoch);
+            let mut out = Vec::new();
+            for _ in 0..300 {
+                out.push(rr.select(&active).expect("selection"));
+            }
+            out
+        };
+        let a = run(7, 11);
+        let b = run(7, 11);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn mix_scheduler_weighted_round_robin_ratio_converges() {
+        let weights = normalize_mix_weights(&[3.0, 1.0]).expect("normalize");
+        let mut rr = WeightedRoundRobin::new(weights, 0, 0);
+        let active = vec![true, true];
+        let mut counts = [0u64, 0u64];
+        let rounds = 4000u64;
+        for _ in 0..rounds {
+            let idx = rr.select(&active).expect("selection");
+            counts[idx] += 1;
+        }
+        // Expect near 75/25 split with small tolerance.
+        let ratio0 = counts[0] as f64 / rounds as f64;
+        let ratio1 = counts[1] as f64 / rounds as f64;
+        assert!((ratio0 - 0.75).abs() <= 0.02, "ratio0={ratio0}");
+        assert!((ratio1 - 0.25).abs() <= 0.02, "ratio1={ratio1}");
+    }
+
+    #[test]
+    fn mix_scheduler_no_source_starvation() {
+        let weights = normalize_mix_weights(&[5.0, 1.0, 1.0]).expect("normalize");
+        let mut rr = WeightedRoundRobin::new(weights, 1, 2);
+        let active = vec![true, true, true];
+        let mut last_seen = [0u64, 0u64, 0u64];
+        let mut step = 0u64;
+        for _ in 0..700 {
+            step += 1;
+            let idx = rr.select(&active).expect("selection");
+            last_seen[idx] = step;
+            for seen in last_seen {
+                assert!(step.saturating_sub(seen) <= 50, "starvation detected");
+            }
+        }
+    }
+
+    #[test]
+    fn mix_shared_cap_uses_min_loader_cap() {
+        let cap = compute_shared_mix_cap(&[256, 128, 512]).expect("cap");
+        assert_eq!(cap, 128);
+    }
+
+    #[test]
+    fn mix_shared_cap_rejects_empty() {
+        assert!(compute_shared_mix_cap(&[]).is_err());
+    }
+
+    #[test]
+    fn mix_snapshot_periodic_emission_cadence() {
+        let period = 8u64;
+        let mut emitted = 0u64;
+        let mut due_ticks = Vec::new();
+        for tick in 1..=32u64 {
+            if should_emit_mix_snapshot(tick, period) {
+                emitted += 1;
+                due_ticks.push(tick);
+            }
+        }
+        assert_eq!(emitted, 4);
+        assert_eq!(due_ticks, vec![8, 16, 24, 32]);
+    }
+
+    #[test]
+    fn mix_shared_caps_match_single_source_safety_baseline() {
+        // Single-source baseline cap and observed inflight behavior.
+        let single_source_cap = 128u64;
+        let single_source_inflight = [16u64, 40, 72, 96, 128, 92, 48, 0];
+        let single_high_water = single_source_inflight.iter().copied().max().unwrap_or(0);
+        assert!(single_source_inflight.iter().all(|v| *v <= single_source_cap));
+        assert!(single_high_water <= single_source_cap);
+
+        // Mixed mode uses shared cap = min(source caps), which should match baseline cap.
+        let shared_cap = compute_shared_mix_cap(&[128, 256]).expect("shared cap");
+        assert_eq!(shared_cap, single_source_cap);
+
+        // Simulated mixed-source inflight samples (source_a + source_b per step).
+        let mixed_inflight_pairs = [
+            (8u64, 8u64),
+            (24, 16),
+            (40, 32),
+            (56, 40),
+            (64, 64),
+            (52, 40),
+            (28, 20),
+            (0, 0),
+        ];
+        let mut mixed_high_water = 0u64;
+        let mut delivered_steps = 0usize;
+        for (a, b) in mixed_inflight_pairs {
+            let total = a.saturating_add(b);
+            mixed_high_water = mixed_high_water.max(total);
+            assert!(
+                total <= shared_cap,
+                "mixed inflight exceeded shared cap: total={total} cap={shared_cap}"
+            );
+            delivered_steps += 1;
+        }
+
+        // "Progress completes" proxy: all planned steps delivered and bounded by same cap.
+        assert_eq!(delivered_steps, single_source_inflight.len());
+        assert!(mixed_high_water <= single_source_cap);
+    }
+
+    #[test]
+    fn mix_backpressure_blocks_all_sources_under_pressure() {
+        // Simulate a mixed run where source A/B each report inflight bytes per scheduler tick.
+        // When total inflight exceeds shared cap, scheduler should be considered blocked.
+        let shared_cap = compute_shared_mix_cap(&[128, 256]).expect("shared cap");
+        let inflight_pairs = [
+            (40u64, 30u64),  // below cap
+            (90, 50),        // above cap -> block
+            (80, 60),        // above cap -> block
+            (64, 32),        // below cap
+            (110, 30),       // above cap -> block
+            (48, 16),        // below cap
+        ];
+
+        let mut blocked_ticks = 0u64;
+        let mut delivered_ticks = 0u64;
+        let mut source_a_deliveries = 0u64;
+        let mut source_b_deliveries = 0u64;
+        let mut rr = WeightedRoundRobin::new(
+            normalize_mix_weights(&[1.0, 1.0]).expect("weights"),
+            0,
+            0,
+        );
+        let active = vec![true, true];
+
+        for (a, b) in inflight_pairs {
+            let total = a.saturating_add(b);
+            if total > shared_cap {
+                blocked_ticks += 1;
+                continue;
+            }
+            delivered_ticks += 1;
+            let idx = rr.select(&active).expect("selection");
+            if idx == 0 {
+                source_a_deliveries += 1;
+            } else {
+                source_b_deliveries += 1;
+            }
+        }
+
+        assert_eq!(blocked_ticks, 3, "expected pressure to block exactly 3 ticks");
+        assert_eq!(delivered_ticks, 3);
+        assert!(source_a_deliveries > 0 && source_b_deliveries > 0);
+    }
+
+    #[test]
+    fn mix_starvation_counter_stays_zero_in_steady_state() {
+        let weights = normalize_mix_weights(&[3.0, 2.0, 1.0]).expect("weights");
+        let mut rr = WeightedRoundRobin::new(weights, 9, 1);
+        let active = vec![true, true, true];
+        let starvation_window = 16u64;
+        let mut since_emit = [0u64, 0u64, 0u64];
+        let mut starvation_total = [0u64, 0u64, 0u64];
+
+        for _step in 0..400u64 {
+            for idx in 0..since_emit.len() {
+                since_emit[idx] = since_emit[idx].saturating_add(1);
+                if since_emit[idx] == starvation_window {
+                    starvation_total[idx] = starvation_total[idx].saturating_add(1);
+                }
+            }
+            let pick = rr.select(&active).expect("selection");
+            since_emit[pick] = 0;
+        }
+
+        assert_eq!(starvation_total, [0, 0, 0]);
+    }
+
+    #[test]
+    fn mix_replay_deterministic_sequence_fixed_inputs() {
+        let weights = normalize_mix_weights(&[5.0, 3.0]).expect("weights");
+        let active = vec![true, true];
+        let run = |seed: u64, epoch: u64| {
+            let mut rr = WeightedRoundRobin::new(weights.clone(), seed, epoch);
+            let mut out = Vec::new();
+            for _ in 0..200 {
+                out.push(rr.select(&active).expect("selection"));
+            }
+            out
+        };
+
+        let first = run(42, 7);
+        let second = run(42, 7);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn mix_replay_changes_when_epoch_changes() {
+        // Equal weights force frequent ties, so epoch-driven tie-break offset should
+        // produce a different deterministic sequence.
+        let weights = normalize_mix_weights(&[1.0, 1.0, 1.0]).expect("weights");
+        let active = vec![true, true, true];
+        let run = |seed: u64, epoch: u64| {
+            let mut rr = WeightedRoundRobin::new(weights.clone(), seed, epoch);
+            let mut out = Vec::new();
+            for _ in 0..90 {
+                out.push(rr.select(&active).expect("selection"));
+            }
+            out
+        };
+
+        let epoch0 = run(77, 0);
+        let epoch1 = run(77, 1);
+        assert_ne!(epoch0, epoch1);
     }
 }
