@@ -26,6 +26,10 @@ jobs:
           python-version: "3.9"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # turbojpeg-sys builds libjpeg-turbo via CMake; disabling SIMD avoids NASM/YASM
+          # toolchain requirements in manylinux release runners.
+          CMAKE_ARGS: -DWITH_SIMD=0
         with:
           command: build
           args: --release --out dist --manifest-path crates/mx8-py/Cargo.toml
