@@ -126,6 +126,40 @@ Decode backend behavior:
 - optional Rust JPEG codec: set `MX8_RUST_JPEG_CODEC=zune|image|turbo` (default: `zune`)
 - optional Rust resize backend: set `MX8_RUST_RESIZE_BACKEND=fast|image` (default: `fast`)
 
+## Video loader (v1.8 scaffold)
+
+Use `mx8.video(...)` for clip-oriented delivery scaffolding while CPU decode contract work is in progress.
+
+```python
+import mx8
+
+loader = mx8.video(
+    "s3://bucket/video_prefix/",
+    recursive=True,
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    constraints=mx8.Constraints(max_inflight_bytes=128 * 1024 * 1024),
+)
+
+for batch in loader:
+    clip_ids = batch.clip_ids
+    payload = batch.payload
+    offsets = batch.offsets
+```
+
+Current staged contract:
+
+- `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offsets`, `payload`
+- offsets are monotonic and `offsets[-1] == len(payload)`
+- init rejects invalid cap combinations (`batch_size_samples * bytes_per_clip > max_inflight_bytes`)
+
+Internal contract and gate checklist:
+
+- `docs/internal_video_stage2b_contract.md`
+- `./scripts/video_stage2b_gate.sh`
+
 ## Distributed loader (DDP/local multi-rank)
 
 `mx8.DistributedDataLoader` is the distributed control-plane loader used by DDP-style jobs.
