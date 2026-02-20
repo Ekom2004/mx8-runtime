@@ -182,18 +182,14 @@ S3 range-streaming status:
 - backend: `video_decode_backend` (`cli|ffi`)
 - runtime decode counters: `video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_*_total`, `video_decode_failed_total`, `video_decode_ms_total`
 
-Internal contract and gate checklist:
+Video gate checklist:
 
-- `docs/internal_video_stage2b_contract.md`
 - `./scripts/video_stage2b_gate.sh`
 - `./scripts/video_stage2b_stress_gate.sh`
 - `./scripts/video_stage2b_clean_env_gate.sh`
-- `docs/video_stage2b_clean_env_runbook.md`
 - `./scripts/video_stage2c_perf_gate.sh`
-- `docs/video_stage2c_perf_baseline.md`
-- `docs/release_stage2c_runbook.md`
 - `./scripts/video_stage3a_backend_gate.sh`
-- `docs/release_stage3a_backend_runbook.md`
+- `./scripts/video_ga_gate.sh --quick|--full`
 - `docs/video_ga_checklist.md`
 
 Runtime proof logs (target: `mx8_proof`) now include:
@@ -241,6 +237,6 @@ v0 also ships the v1-style preview for `mx8.load(...)`:
 - simple path (`profile` + `autotune`)
 - advanced path (`constraints` + `RuntimeConfig`)
 
-Formal contract (single source of truth):
+Formal contract note:
 
-- `docs/v1_autotune_api_contract.md` (includes control equations, default gains, rails, and observability fields)
+- `docs/python_api.md` + `docs/memory_contract.md` are the public contract surface for v0.

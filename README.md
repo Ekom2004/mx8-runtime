@@ -75,7 +75,6 @@ Install:
 ## Docs Map
 
 - Product architecture: `ARCHITECTURE.MD`
-- Implementation plan + milestones: `implementation.md`
 - Python API reference: `docs/python_api.md`
 - Memory model/caps: `docs/memory_contract.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`

@@ -7,13 +7,10 @@ The v0 focus is “don’t OOM”: MX8 enforces backpressure with hard caps (so 
 Further docs:
 
 - Python API: `../../docs/python_api.md`
-- v1 autotune API contract (planned): `../../docs/v1_autotune_api_contract.md`
 - Vision labels/layout: `../../docs/vision_labels.md`
-- Vision decode backend plan: `../../docs/vision_decode_backend_plan.md`
 - S3/runtime tuning: `../../docs/s3_runtime_tuning.md`
 - Memory contract: `../../docs/memory_contract.md`
-- AI agent guide: `../../docs/ai_agent_guide.md`
-- AI agent context (JSON): `../../docs/ai_agent_context.json`
+- Video GA checklist: `../../docs/video_ga_checklist.md`
 - Troubleshooting: `../../docs/troubleshooting.md`
 
 ## Install (from wheel)

@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 
 - `ARCHITECTURE.MD`: canonical architecture + locked decisions (read first).
-- `implementation.md`: milestone-based implementation plan.
+- `VISION.md`: high-level product direction.
 - `main.rs`: placeholder (codebase is still being bootstrapped).
 - `skills/`: local Codex skills used for workflow/persona support (not runtime code).
 
@@ -11,7 +11,7 @@ When code is added, keep layout aligned to `ARCHITECTURE.MD` (e.g., a Rust works
 
 ## Build, Test, and Development Commands
 
-This repo is currently doc-first; code scaffolding will land as part of `implementation.md` (M0+).
+This repo is currently code-first with architecture + API docs as the source of truth.
 
 Once the Rust workspace exists:
 - `cargo build`: build all crates.
