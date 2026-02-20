@@ -21,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust targets (macOS universal2)
+        if: matrix.target == 'universal2'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: actions/setup-python@v5
         with:
           python-version: "3.9"
