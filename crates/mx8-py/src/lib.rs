@@ -1291,6 +1291,16 @@ impl VideoBatch {
 }
 
 impl VideoDataLoader {
+    fn decode_failed_total(&self) -> u64 {
+        self.decode_failed_io_read_failed
+            .saturating_add(self.decode_failed_corrupt_media)
+            .saturating_add(self.decode_failed_short_media)
+            .saturating_add(self.decode_failed_unsupported_codec)
+            .saturating_add(self.decode_failed_missing_stream)
+            .saturating_add(self.decode_failed_backend_unavailable)
+            .saturating_add(self.decode_failed_decode_failed)
+    }
+
     fn derive_decode_contract(
         clip_len: u32,
         bytes_per_clip: usize,
@@ -1517,6 +1527,7 @@ impl VideoDataLoader {
         if self.next_idx >= self.clips.len() {
             return Err(PyStopIteration::new_err(()));
         }
+        let batch_started = Instant::now();
         let end_idx = self
             .next_idx
             .saturating_add(self.batch_size_samples)
@@ -1531,13 +1542,33 @@ impl VideoDataLoader {
         let mut payload = Vec::<u8>::new();
 
         for idx in self.next_idx..end_idx {
-            let clip = &self.clips[idx];
+            let (sample_id, clip_id_for_log, media_uri_for_log, clip_start_for_log) = {
+                let clip = &self.clips[idx];
+                (
+                    clip.sample_id,
+                    clip.clip_id.clone(),
+                    clip.media_uri.clone(),
+                    clip.clip_start,
+                )
+            };
             self.decode_attempted_clips = self.decode_attempted_clips.saturating_add(1);
             let decode_started = Instant::now();
-            let clip_payload = match self.clip_payload_bytes(clip) {
+            let clip_payload = match self.clip_payload_bytes(&self.clips[idx]) {
                 Ok(v) => v,
                 Err(err) => {
                     self.bump_decode_failure(err.class);
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "video_decode_failed",
+                        class = err.class,
+                        media_uri = %media_uri_for_log,
+                        clip_id = %clip_id_for_log,
+                        clip_start = clip_start_for_log,
+                        decode_attempted_clips_total = self.decode_attempted_clips,
+                        decode_failed_total = self.decode_failed_total(),
+                        detail = %err.detail,
+                        "video decode failed"
+                    );
                     return Err(err.into_pyerr());
                 }
             };
@@ -1549,10 +1580,10 @@ impl VideoDataLoader {
             self.decode_succeeded_clips = self.decode_succeeded_clips.saturating_add(1);
             payload.extend_from_slice(&clip_payload);
             offsets.push(payload.len() as u64);
-            sample_ids.push(clip.sample_id);
-            clip_ids.push(clip.clip_id.clone());
-            media_uris.push(clip.media_uri.clone());
-            clip_starts.push(clip.clip_start);
+            sample_ids.push(sample_id);
+            clip_ids.push(clip_id_for_log);
+            media_uris.push(media_uri_for_log);
+            clip_starts.push(clip_start_for_log);
         }
 
         let payload_bytes = payload.len() as u64;
@@ -1569,6 +1600,21 @@ impl VideoDataLoader {
             .delivered_samples
             .saturating_add(sample_ids.len() as u64);
         self.delivered_bytes = self.delivered_bytes.saturating_add(payload_bytes);
+        let batch_decode_ms = batch_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        tracing::info!(
+            target: "mx8_proof",
+            event = "video_decode_batch",
+            batch_samples = sample_ids.len() as u64,
+            payload_bytes = payload_bytes,
+            batch_decode_ms = batch_decode_ms,
+            decode_attempted_clips_total = self.decode_attempted_clips,
+            decode_succeeded_clips_total = self.decode_succeeded_clips,
+            decode_failed_total = self.decode_failed_total(),
+            "video decode batch delivered"
+        );
 
         let out = Py::new(
             py,
@@ -1661,14 +1707,7 @@ impl VideoDataLoader {
             "video_decode_failed_decode_failed_total",
             self.decode_failed_decode_failed,
         )?;
-        let decode_failed_total = self
-            .decode_failed_io_read_failed
-            .saturating_add(self.decode_failed_corrupt_media)
-            .saturating_add(self.decode_failed_short_media)
-            .saturating_add(self.decode_failed_unsupported_codec)
-            .saturating_add(self.decode_failed_missing_stream)
-            .saturating_add(self.decode_failed_backend_unavailable)
-            .saturating_add(self.decode_failed_decode_failed);
+        let decode_failed_total = self.decode_failed_total();
         out.set_item("video_decode_failed_total", decode_failed_total)?;
         out.set_item("video_decode_ms_total", self.decode_ms_total)?;
         Ok(out.into_any())

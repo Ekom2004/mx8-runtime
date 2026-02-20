@@ -166,6 +166,12 @@ Internal contract and gate checklist:
 
 - `docs/internal_video_stage2b_contract.md`
 - `./scripts/video_stage2b_gate.sh`
+- `./scripts/video_stage2b_stress_gate.sh`
+
+Runtime proof logs (target: `mx8_proof`) now include:
+
+- `event="video_decode_batch"` for delivered decode batches
+- `event="video_decode_failed"` with failure class + media URI context
 
 ## Distributed loader (DDP/local multi-rank)
 

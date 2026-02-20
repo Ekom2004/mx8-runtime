@@ -145,4 +145,9 @@ if [[ "${MX8_SMOKE_VIDEO_STAGE2B:-0}" == "1" ]]; then
   ./scripts/video_stage2b_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_VIDEO_STAGE2B_STRESS:-0}" == "1" ]]; then
+  echo "[mx8] video_stage2b_stress_gate (v1.8 stage-2b decode-heavy bounded stress gate)"
+  ./scripts/video_stage2b_stress_gate.sh
+fi
+
 echo "[mx8] smoke OK"
