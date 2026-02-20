@@ -155,4 +155,9 @@ if [[ "${MX8_SMOKE_VIDEO_STAGE2B_CLEAN_ENV:-0}" == "1" ]]; then
   ./scripts/video_stage2b_clean_env_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_VIDEO_STAGE2C_PERF:-0}" == "1" ]]; then
+  echo "[mx8] video_stage2c_perf_gate (v1.8 stage-2c decode perf threshold gate)"
+  ./scripts/video_stage2c_perf_gate.sh
+fi
+
 echo "[mx8] smoke OK"

@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import mx8
@@ -118,6 +119,7 @@ def _run_loader(
     epoch: int,
     max_inflight_bytes: int,
 ):
+    started = time.perf_counter()
     loader = mx8.video(
         str(dataset_root),
         manifest_store_root=str(store_root),
@@ -147,7 +149,8 @@ def _run_loader(
         sample_count += len(clip_ids)
         max_payload = max(max_payload, payload_bytes)
         seq.extend(clip_ids)
-    return loader.stats(), seq, batch_count, sample_count, max_payload
+    elapsed_s = max(1e-9, time.perf_counter() - started)
+    return loader.stats(), seq, batch_count, sample_count, max_payload, elapsed_s
 
 
 def main() -> None:
@@ -176,7 +179,7 @@ def main() -> None:
         "MX8_VIDEO_STAGE2_BYTES_PER_CLIP", "49152"
     )
 
-    stats1, seq1, batches1, samples1, max_payload1 = _run_loader(
+    stats1, seq1, batches1, samples1, max_payload1, elapsed_s1 = _run_loader(
         ds_root,
         store_root,
         clip_len=clip_len,
@@ -188,7 +191,7 @@ def main() -> None:
         epoch=epoch,
         max_inflight_bytes=max_inflight_bytes,
     )
-    stats2, seq2, batches2, samples2, max_payload2 = _run_loader(
+    stats2, seq2, batches2, samples2, max_payload2, elapsed_s2 = _run_loader(
         ds_root,
         store_root,
         clip_len=clip_len,
@@ -220,6 +223,33 @@ def main() -> None:
     if int(stats1.get("video_decode_ms_total", 0)) <= 0:
         raise RuntimeError("stress gate: missing decode timing")
 
+    decode_ms_total = int(stats1.get("video_decode_ms_total", 0))
+    samples_per_sec = samples1 / elapsed_s1
+    decode_ms_per_batch = decode_ms_total / max(1, batches1)
+    decode_ms_per_clip = decode_ms_total / max(1, samples1)
+
+    min_samples_per_sec = float(
+        os.environ.get("MX8_VIDEO_STAGE2C_MIN_SAMPLES_PER_SEC", "0")
+    )
+    max_decode_ms_per_batch = float(
+        os.environ.get("MX8_VIDEO_STAGE2C_MAX_DECODE_MS_PER_BATCH", "0")
+    )
+    max_decode_ms_per_clip = float(
+        os.environ.get("MX8_VIDEO_STAGE2C_MAX_DECODE_MS_PER_CLIP", "0")
+    )
+    if min_samples_per_sec > 0 and samples_per_sec < min_samples_per_sec:
+        raise RuntimeError(
+            f"stress gate: samples_per_sec={samples_per_sec:.3f} below min={min_samples_per_sec:.3f}"
+        )
+    if max_decode_ms_per_batch > 0 and decode_ms_per_batch > max_decode_ms_per_batch:
+        raise RuntimeError(
+            f"stress gate: decode_ms_per_batch={decode_ms_per_batch:.3f} above max={max_decode_ms_per_batch:.3f}"
+        )
+    if max_decode_ms_per_clip > 0 and decode_ms_per_clip > max_decode_ms_per_clip:
+        raise RuntimeError(
+            f"stress gate: decode_ms_per_clip={decode_ms_per_clip:.3f} above max={max_decode_ms_per_clip:.3f}"
+        )
+
     max_payload = max(max_payload1, max_payload2)
     if max_payload > max_inflight_bytes:
         raise RuntimeError(
@@ -232,6 +262,15 @@ def main() -> None:
     print("  samples:", samples1)
     print("  max_payload_bytes:", max_payload)
     print("  max_inflight_bytes:", max_inflight_bytes)
+    print("  run1_elapsed_s:", f"{elapsed_s1:.3f}")
+    print("  run2_elapsed_s:", f"{elapsed_s2:.3f}")
+    print("  samples_per_sec:", f"{samples_per_sec:.3f}")
+    print("  decode_ms_total:", decode_ms_total)
+    print("  decode_ms_per_batch:", f"{decode_ms_per_batch:.3f}")
+    print("  decode_ms_per_clip:", f"{decode_ms_per_clip:.3f}")
+    print("  perf_min_samples_per_sec:", f"{min_samples_per_sec:.3f}")
+    print("  perf_max_decode_ms_per_batch:", f"{max_decode_ms_per_batch:.3f}")
+    print("  perf_max_decode_ms_per_clip:", f"{max_decode_ms_per_clip:.3f}")
     print("  replay_determinism: ok")
     print("  decode_failures: 0")
 
