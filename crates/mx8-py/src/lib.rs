@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -154,6 +155,7 @@ struct VideoDataLoader {
     epoch: u64,
     clip_len: u32,
     stride: u32,
+    decode_fps: u32,
     fps_policy: String,
     delivered_batches: u64,
     delivered_samples: u64,
@@ -1203,25 +1205,146 @@ impl VideoBatch {
 }
 
 impl VideoDataLoader {
+    fn decode_target_side(&self, clip_len: u32) -> PyResult<usize> {
+        let clip_len = usize::try_from(clip_len).map_err(|_| {
+            PyRuntimeError::new_err(format!("clip_len conversion overflow: {clip_len}"))
+        })?;
+        if clip_len == 0 {
+            return Err(PyRuntimeError::new_err(
+                "clip_len must be > 0 for decode sizing",
+            ));
+        }
+        let bytes_per_frame = std::cmp::max(1, self.bytes_per_clip / clip_len);
+        let pixels_per_frame = std::cmp::max(1, bytes_per_frame / 3);
+        let side = (pixels_per_frame as f64).sqrt().floor() as usize;
+        Ok(std::cmp::max(1, side))
+    }
+
+    fn decode_error(path: &std::path::Path, class: &str, detail: &str) -> PyErr {
+        PyRuntimeError::new_err(format!(
+            "video decode {class} for {}: {detail}",
+            path.display()
+        ))
+    }
+
+    fn classify_ffmpeg_failure(stderr: &str) -> &'static str {
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("no such file or directory") {
+            return "io_read_failed";
+        }
+        if lower.contains("invalid data found when processing input")
+            || lower.contains("moov atom not found")
+            || lower.contains("error reading header")
+        {
+            return "corrupt_media";
+        }
+        if lower.contains("matches no streams")
+            || lower.contains("stream specifier")
+            || lower.contains("output file #0 does not contain any stream")
+        {
+            return "missing_stream";
+        }
+        if lower.contains("unsupported codec")
+            || lower.contains("unknown codec")
+            || lower.contains("decoder")
+        {
+            return "unsupported_codec";
+        }
+        if lower.contains("end of file") {
+            return "short_media";
+        }
+        "decode_failed"
+    }
+
     fn clip_payload_bytes(&self, clip: &VideoClipRecord) -> PyResult<Vec<u8>> {
         if clip.media_uri.starts_with("s3://") {
             return Err(PyRuntimeError::new_err(
-                "mx8.video stage2a currently supports local media paths only",
+                "mx8.video stage2b currently supports local media paths only",
             ));
         }
         let path = std::path::PathBuf::from(&clip.media_uri);
-        let bytes = std::fs::read(&path).map_err(|e| {
-            PyRuntimeError::new_err(format!(
-                "video decode read failed for {}: {e}",
-                path.display()
-            ))
-        })?;
-        if bytes.is_empty() {
-            return Ok(Vec::new());
+        if !path.exists() {
+            return Err(Self::decode_error(
+                &path,
+                "io_read_failed",
+                "input path does not exist",
+            ));
         }
-        let start = ((clip.clip_start as usize).saturating_mul(64)) % bytes.len();
-        let end = start.saturating_add(self.bytes_per_clip).min(bytes.len());
-        Ok(bytes[start..end].to_vec())
+
+        let side = self.decode_target_side(clip.clip_len)?;
+        let frame_bytes = side
+            .checked_mul(side)
+            .and_then(|v| v.checked_mul(3))
+            .ok_or_else(|| PyRuntimeError::new_err("video decode frame byte size overflow"))?;
+        let clip_len_usize = usize::try_from(clip.clip_len).map_err(|_| {
+            PyRuntimeError::new_err(format!("clip_len conversion overflow: {}", clip.clip_len))
+        })?;
+        let expected_clip_bytes = frame_bytes
+            .checked_mul(clip_len_usize)
+            .ok_or_else(|| PyRuntimeError::new_err("video decode clip byte size overflow"))?;
+        let start_seconds = (clip.clip_start as f64) / f64::from(self.decode_fps);
+        let seek_arg = format!("{start_seconds:.6}");
+        let scale_arg = format!("scale={side}:{side}:flags=bilinear");
+        let ffmpeg_bin = std::env::var("MX8_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
+
+        let output = Command::new(&ffmpeg_bin)
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-ss")
+            .arg(seek_arg)
+            .arg("-i")
+            .arg(&path)
+            .arg("-an")
+            .arg("-sn")
+            .arg("-dn")
+            .arg("-frames:v")
+            .arg(clip_len_usize.to_string())
+            .arg("-vf")
+            .arg(scale_arg)
+            .arg("-pix_fmt")
+            .arg("rgb24")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("pipe:1")
+            .output()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Self::decode_error(
+                    &path,
+                    "decode_backend_unavailable",
+                    &format!("ffmpeg binary not found: {ffmpeg_bin}"),
+                ),
+                _ => Self::decode_error(&path, "io_read_failed", &e.to_string()),
+            })?;
+
+        if !output.status.success() {
+            let stderr_text = String::from_utf8_lossy(&output.stderr);
+            let class = Self::classify_ffmpeg_failure(&stderr_text);
+            let detail = stderr_text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .unwrap_or("ffmpeg decode failed");
+            return Err(Self::decode_error(&path, class, detail));
+        }
+
+        let mut decoded = output.stdout;
+        if decoded.len() < expected_clip_bytes {
+            return Err(Self::decode_error(
+                &path,
+                "short_media",
+                &format!(
+                    "decoded bytes {} below expected {}",
+                    decoded.len(),
+                    expected_clip_bytes
+                ),
+            ));
+        }
+        if decoded.len() > expected_clip_bytes {
+            decoded.truncate(expected_clip_bytes);
+        }
+        Ok(decoded)
     }
 }
 
@@ -2238,6 +2361,9 @@ fn video(
     constraints: Option<Constraints>,
     node_id: Option<String>,
 ) -> PyResult<Py<VideoDataLoader>> {
+    if fps == 0 {
+        return Err(PyValueError::new_err("video fps must be > 0"));
+    }
     let root = manifest_store_root
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
         .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
@@ -2323,6 +2449,7 @@ fn video(
             epoch,
             clip_len,
             stride,
+            decode_fps: fps,
             fps_policy,
             delivered_batches: 0,
             delivered_samples: 0,

@@ -1,17 +1,49 @@
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import mx8
 
 
+def _ffmpeg_bin() -> str:
+    ffmpeg_bin = os.environ.get("MX8_FFMPEG_BIN", "ffmpeg")
+    if shutil.which(ffmpeg_bin) is None:
+        raise RuntimeError(f"ffmpeg not found on PATH (MX8_FFMPEG_BIN={ffmpeg_bin})")
+    return ffmpeg_bin
+
+
+def _make_mp4(path: Path, color: str, *, fps: int = 8, seconds: int = 2) -> None:
+    ffmpeg_bin = _ffmpeg_bin()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c={color}:s=64x64:r={fps}:d={seconds}",
+        "-pix_fmt",
+        "yuv420p",
+        str(path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed creating {path}: {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+
+
 def _make_local_videos(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    # Deterministic local payloads; .mp4 extension triggers stage1 video indexing.
-    (root / "clip_a.mp4").write_bytes(b"A" * 480_000)
-    (root / "clip_b.mp4").write_bytes(b"B" * 360_000)
+    _make_mp4(root / "clip_a.mp4", "red")
+    _make_mp4(root / "clip_b.mp4", "green")
     nested = root / "nested"
     nested.mkdir(parents=True, exist_ok=True)
-    (nested / "clip_c.mp4").write_bytes(b"C" * 300_000)
+    _make_mp4(nested / "clip_c.mp4", "blue")
 
 
 def _collect_sequence(loader, max_batches: int) -> list[str]:
@@ -41,7 +73,6 @@ def main() -> None:
 
     # Stage2a CPU gate path uses stage1 local metadata extraction.
     os.environ["MX8_VIDEO_STAGE1_INDEX"] = "1"
-    os.environ["MX8_VIDEO_STAGE1_DISABLE_FFPROBE"] = "1"
     os.environ["MX8_VIDEO_STAGE2_BYTES_PER_CLIP"] = os.environ.get(
         "MX8_VIDEO_STAGE2_BYTES_PER_CLIP", "1024"
     )

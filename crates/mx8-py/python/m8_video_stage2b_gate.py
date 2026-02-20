@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import mx8
@@ -11,15 +13,46 @@ def _write_bytes(path: Path, fill: bytes, n: int) -> None:
 
 def _make_local_videos(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    _write_bytes(root / "clip_a.mp4", b"A", 480_000)
-    _write_bytes(root / "clip_b.mp4", b"B", 360_000)
-    _write_bytes(root / "nested" / "clip_c.mp4", b"C", 300_000)
+    _make_mp4(root / "clip_a.mp4", "red")
+    _make_mp4(root / "clip_b.mp4", "green")
+    _make_mp4(root / "nested" / "clip_c.mp4", "blue")
+
+
+def _ffmpeg_bin() -> str:
+    ffmpeg_bin = os.environ.get("MX8_FFMPEG_BIN", "ffmpeg")
+    if shutil.which(ffmpeg_bin) is None:
+        raise RuntimeError(f"ffmpeg not found on PATH (MX8_FFMPEG_BIN={ffmpeg_bin})")
+    return ffmpeg_bin
+
+
+def _make_mp4(path: Path, color: str, *, fps: int = 8, seconds: int = 2) -> None:
+    ffmpeg_bin = _ffmpeg_bin()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c={color}:s=64x64:r={fps}:d={seconds}",
+        "-pix_fmt",
+        "yuv420p",
+        str(path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed creating {path}: {proc.stderr.strip() or proc.stdout.strip()}"
+        )
 
 
 def _make_failure_probe_video(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     target = root / "missing_soon.mp4"
-    _write_bytes(target, b"Z", 256_000)
+    _make_mp4(target, "yellow")
     return target
 
 
@@ -109,6 +142,7 @@ def _check_runtime_io_failure(
         max_inflight_bytes=8 * 1024 * 1024,
         max_process_rss_bytes=None,
     )
+    _ffmpeg_bin()
     doomed = _make_failure_probe_video(data_root)
     loader = mx8.video(
         str(data_root),
@@ -129,7 +163,7 @@ def _check_runtime_io_failure(
             next(loader)
     except RuntimeError as e:
         msg = str(e)
-        if "video decode read failed" in msg:
+        if "video decode io_read_failed" in msg:
             return "io_read_failed"
         raise RuntimeError(f"unexpected runtime decode failure: {msg}")
     raise RuntimeError("expected runtime IO decode failure but loader did not fail")
@@ -143,7 +177,6 @@ def main() -> None:
     _make_local_videos(ds_root)
 
     os.environ["MX8_VIDEO_STAGE1_INDEX"] = "1"
-    os.environ["MX8_VIDEO_STAGE1_DISABLE_FFPROBE"] = "1"
     os.environ["MX8_VIDEO_STAGE2_BYTES_PER_CLIP"] = os.environ.get(
         "MX8_VIDEO_STAGE2_BYTES_PER_CLIP", "2048"
     )

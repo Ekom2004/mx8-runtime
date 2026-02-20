@@ -17,6 +17,10 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "[mx8] python3 not found on PATH" >&2
   exit 1
 fi
+if ! command -v "${MX8_FFMPEG_BIN:-ffmpeg}" >/dev/null 2>&1; then
+  echo "[mx8] ffmpeg not found on PATH (MX8_FFMPEG_BIN=${MX8_FFMPEG_BIN:-ffmpeg})" >&2
+  exit 1
+fi
 
 echo "[mx8] video stage2b gate: cargo test -p mx8-snapshot video_stage1"
 CARGO_INCREMENTAL=0 RUSTFLAGS="-C debuginfo=0" cargo test -p mx8-snapshot video_stage1
@@ -45,7 +49,6 @@ echo "[mx8] maturin develop"
 echo "[mx8] python video stage2b gate"
 MX8_VIDEO_STAGE2B_TMP_ROOT="${TMP_ROOT}" \
 MX8_VIDEO_STAGE1_INDEX=1 \
-MX8_VIDEO_STAGE1_DISABLE_FFPROBE=1 \
 MX8_VIDEO_STAGE2_BYTES_PER_CLIP="${MX8_VIDEO_STAGE2_BYTES_PER_CLIP:-2048}" \
   "${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m8_video_stage2b_gate.py"
 

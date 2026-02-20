@@ -154,6 +154,7 @@ Current staged contract:
 - `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offsets`, `payload`
 - offsets are monotonic and `offsets[-1] == len(payload)`
 - init rejects invalid cap combinations (`batch_size_samples * bytes_per_clip > max_inflight_bytes`)
+- current CPU decode backend uses local `ffmpeg` CLI (`MX8_FFMPEG_BIN` override, default `ffmpeg`)
 
 Internal contract and gate checklist:
 
