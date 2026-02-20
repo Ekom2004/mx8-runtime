@@ -256,6 +256,13 @@ Date: 2026-02-12
 - v0 baseline: CPU decode is supported everywhere.
 - v0 GPU decode: Linux + NVIDIA (NVDEC) first.
 - GPU decode is best-effort and must fail open to CPU (any GPU-decode error falls back to CPU) with a consistent output contract.
+- Public `mx8.video(...)` surface is GA for the **current** clip decode/delivery contract (not for future range-streaming optimizations).
+- Decode backend selector rails are part of the contract:
+  - default backend: `MX8_VIDEO_DECODE_BACKEND=cli`
+  - optional backend: `MX8_VIDEO_DECODE_BACKEND=ffi` (compiled when native ffmpeg bindings are enabled)
+  - safety behavior: backend failure/fallback is explicit via proof logs (`event="video_decode_backend_fallback"`).
+- Deterministic Stage2D range-planning sidecar contract is locked for replay consistency; end-to-end S3 range-streaming decode is roadmap work on top of this contract.
+- GA go/no-go is enforced by the video gate set (`scripts/video_ga_gate.sh --full`) and documented contract checks.
 
 ### Leases and progress semantics
 - Cursor advances only after **DELIVER** to Python/consumer (not after fetch/decode).
