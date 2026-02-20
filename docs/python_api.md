@@ -228,6 +228,20 @@ Important fields:
 
 v0 training note: distributed data delivery is supported, but v0 is non-elastic (DDP rank death terminates training).
 
+## Planned: `mx8.mix(...)` (v1.7 contract draft)
+
+`mx8.mix` is the next API surface for deterministic weighted blending of multiple loaders under one bounded runtime envelope.
+
+Contract draft is tracked in `docs/mix_v17_contract.md`.
+
+Design targets:
+- deterministic replay of mixed order for fixed manifests/weights/seed/epoch/membership,
+- shared global backpressure and memory caps (no per-source unbounded queues),
+- explicit failure on source exhaustion in initial release (no silent source drop),
+- acceptance gates for determinism digest, ratio tolerance, and memory bounds.
+
+Current gate scaffold command: `./scripts/mix_gate.sh`
+
 ## API shape (v0 vs v1 direction)
 
 v0 still supports explicit tuning knobs in constructor args (`max_inflight_bytes`, `max_queue_batches`, `prefetch_batches`, `want`, ...).

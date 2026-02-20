@@ -3,10 +3,14 @@ set -euo pipefail
 
 # v1.7 mix gate:
 # - scheduler unit/integration tests
-# - public Python API end-to-end mix gate
+# - public Python API deterministic replay + ratio + memory-cap gate
 #
 # Usage:
 #   ./scripts/mix_gate.sh
+#
+# Optional tuning:
+#   MX8_MIX_GATE_STEPS=400 MX8_MIX_GATE_RATIO_TOL=0.02 ./scripts/mix_gate.sh
+#   MX8_MIX_GATE_WEIGHTS=0.8,0.2 ./scripts/mix_gate.sh
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"

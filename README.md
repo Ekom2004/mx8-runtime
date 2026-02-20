@@ -61,6 +61,7 @@ Install:
 - Python smoke: `./scripts/py_smoke.sh`
 - Wheel smoke: `./scripts/build_wheel.sh && ./scripts/pip_wheel_smoke.sh`
 - Zero-manifest burn-in: `MX8_BURNIN_RUNS=3 ./scripts/direct_stream_burnin.sh`
+- Mix gate: `./scripts/mix_gate.sh`
 - DDP autotune A/B: `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
 - Autotune pressure simulation: `./scripts/autotune_memory_pressure_sim.sh`
 - Video Stage 3A backend parity: `./scripts/video_stage3a_backend_gate.sh`
@@ -76,6 +77,7 @@ Install:
 
 - Product architecture: `ARCHITECTURE.MD`
 - Python API reference: `docs/python_api.md`
+- `mx8.mix` v1.7 contract draft: `docs/mix_v17_contract.md`
 - Memory model/caps: `docs/memory_contract.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
 - Troubleshooting: `docs/troubleshooting.md`
@@ -83,5 +85,5 @@ Install:
 
 ## Near-Term Roadmap
 
-- **Dataset mixing (`mx8.mix`)** for multi-source training/inference pipelines.
+- **Dataset mixing (`mx8.mix`)** for multi-source training/inference pipelines (contract drafted; implementation next).
 - **Video-native hardening** for range-streaming and decode reliability at scale.
