@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -42,6 +43,10 @@ use mx8_snapshot::pack_s3::{pack_s3, LabelMode as PackLabelMode, PackS3Config};
 use mx8_snapshot::video_stage1::{
     build_video_stage1_index_from_manifest_bytes, canonicalize_video_stage1_tsv, VideoClipRecord,
     VideoStage1Config,
+};
+use mx8_snapshot::video_stage2d::{
+    plan_video_ranges, ByteRange, RangePlannerConfig, VideoRangeChunk, VideoRangeSidecar,
+    VIDEO_RANGE_SCHEMA_VERSION,
 };
 use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 use mx8_wire::TryToCore;
@@ -159,6 +164,8 @@ struct VideoBatch {
 struct VideoDataLoader {
     manifest_hash: String,
     clips: Vec<VideoClipRecord>,
+    stage2d_sidecars: HashMap<String, VideoRangeSidecar>,
+    rt: tokio::runtime::Runtime,
     next_idx: usize,
     batch_size_samples: usize,
     max_inflight_bytes: u64,
@@ -183,6 +190,11 @@ struct VideoDataLoader {
     decode_failed_backend_unavailable: u64,
     decode_failed_decode_failed: u64,
     decode_ms_total: u64,
+    s3_range_requests_total: u64,
+    s3_range_bytes_fetched_total: u64,
+    s3_stage2d_plan_used_total: u64,
+    s3_stage2d_plan_fallback_total: u64,
+    s3_full_object_range_fallback_total: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1410,37 +1422,24 @@ impl VideoDataLoader {
         }
     }
 
-    fn clip_payload_bytes(&self, clip: &VideoClipRecord) -> Result<Vec<u8>, VideoDecodeError> {
-        if clip.media_uri.starts_with("s3://") {
-            return Err(Self::decode_error(
-                std::path::Path::new(&clip.media_uri),
-                "decode_failed",
-                "mx8.video stage2b currently supports local media paths only",
-            ));
-        }
-        let path = std::path::PathBuf::from(&clip.media_uri);
-        if !path.exists() {
-            return Err(Self::decode_error(
-                &path,
-                "io_read_failed",
-                "input path does not exist",
-            ));
-        }
-
+    fn decode_clip_from_path(
+        &self,
+        path: &std::path::Path,
+        start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
         let side = self.decode_contract.frame_width;
         let clip_len_usize =
             usize::try_from(self.decode_contract.frames_per_clip).map_err(|_| {
                 Self::decode_error(
-                    &path,
+                    path,
                     "decode_failed",
                     "clip_len conversion overflow for decode contract",
                 )
             })?;
         let expected_clip_bytes =
             usize::try_from(self.decode_contract.clip_bytes).map_err(|_| {
-                Self::decode_error(&path, "decode_failed", "clip_bytes conversion overflow")
+                Self::decode_error(path, "decode_failed", "clip_bytes conversion overflow")
             })?;
-        let start_seconds = (clip.clip_start as f64) / f64::from(self.decode_fps);
         let seek_arg = format!("{start_seconds:.6}");
         let scale_arg = format!("scale={side}:{side}:flags=bilinear");
         let ffmpeg_bin = std::env::var("MX8_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
@@ -1453,7 +1452,7 @@ impl VideoDataLoader {
             .arg("-ss")
             .arg(seek_arg)
             .arg("-i")
-            .arg(&path)
+            .arg(path)
             .arg("-an")
             .arg("-sn")
             .arg("-dn")
@@ -1469,11 +1468,11 @@ impl VideoDataLoader {
             .output()
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => Self::decode_error(
-                    &path,
+                    path,
                     "decode_backend_unavailable",
                     &format!("ffmpeg binary not found: {ffmpeg_bin}"),
                 ),
-                _ => Self::decode_error(&path, "io_read_failed", &e.to_string()),
+                _ => Self::decode_error(path, "io_read_failed", &e.to_string()),
             })?;
 
         if !output.status.success() {
@@ -1484,13 +1483,13 @@ impl VideoDataLoader {
                 .find(|line| !line.trim().is_empty())
                 .map(str::trim)
                 .unwrap_or("ffmpeg decode failed");
-            return Err(Self::decode_error(&path, class, detail));
+            return Err(Self::decode_error(path, class, detail));
         }
 
         let mut decoded = output.stdout;
         if decoded.len() < expected_clip_bytes {
             return Err(Self::decode_error(
-                &path,
+                path,
                 "short_media",
                 &format!(
                     "decoded bytes {} below expected {}",
@@ -1503,6 +1502,293 @@ impl VideoDataLoader {
             decoded.truncate(expected_clip_bytes);
         }
         Ok(decoded)
+    }
+
+    fn stage2d_sidecar_key(media_uri: &str, stream_id: u32) -> String {
+        format!("{media_uri}#{stream_id}")
+    }
+
+    fn s3_fetch_ranges_bytes(
+        &mut self,
+        clip: &VideoClipRecord,
+        bucket: &str,
+        key: &str,
+        ranges: &[ByteRange],
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        let client = self
+            .rt
+            .block_on(mx8_runtime::s3::client_from_env())
+            .map_err(|e| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!("init s3 client failed: {e}"),
+                )
+            })?;
+
+        let mut payload = Vec::<u8>::new();
+        for range in ranges {
+            let end_inclusive = range.end_byte.checked_sub(1).ok_or_else(|| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "decode_failed",
+                    "invalid empty stage2d byte range",
+                )
+            })?;
+            let range_header = format!("bytes={}-{}", range.start_byte, end_inclusive);
+            let out = self
+                .rt
+                .block_on(async {
+                    client
+                        .get_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .range(range_header)
+                        .send()
+                        .await
+                })
+                .map_err(|e| {
+                    Self::decode_error(
+                        std::path::Path::new(&clip.media_uri),
+                        "io_read_failed",
+                        &format!("s3 range get failed: {e:?}"),
+                    )
+                })?;
+            let bytes = self
+                .rt
+                .block_on(async {
+                    out.body
+                        .collect()
+                        .await
+                        .map(|c| c.into_bytes().to_vec())
+                        .map_err(|e| e.to_string())
+                })
+                .map_err(|e| {
+                    Self::decode_error(
+                        std::path::Path::new(&clip.media_uri),
+                        "io_read_failed",
+                        &format!("s3 range body collect failed: {e}"),
+                    )
+                })?;
+            let expected = usize::try_from(range.end_byte.saturating_sub(range.start_byte))
+                .map_err(|_| {
+                    Self::decode_error(
+                        std::path::Path::new(&clip.media_uri),
+                        "decode_failed",
+                        "stage2d range size conversion overflow",
+                    )
+                })?;
+            if bytes.len() != expected {
+                return Err(Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!(
+                        "s3 range returned {} bytes, expected {}",
+                        bytes.len(),
+                        expected
+                    ),
+                ));
+            }
+            payload.extend_from_slice(&bytes);
+            self.s3_range_requests_total = self.s3_range_requests_total.saturating_add(1);
+            self.s3_range_bytes_fetched_total = self
+                .s3_range_bytes_fetched_total
+                .saturating_add(bytes.len() as u64);
+        }
+        tracing::info!(
+            target: "mx8_proof",
+            event = "video_range_fetch",
+            media_uri = %clip.media_uri,
+            clip_id = %clip.clip_id,
+            request_count = ranges.len() as u64,
+            fetched_bytes = payload.len() as u64,
+            "fetched s3 ranges for video clip"
+        );
+        Ok(payload)
+    }
+
+    fn clip_payload_bytes_s3(
+        &mut self,
+        clip: &VideoClipRecord,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        let (bucket, key) = parse_s3_bucket_key_local(&clip.media_uri).map_err(|e| {
+            Self::decode_error(
+                std::path::Path::new(&clip.media_uri),
+                "decode_failed",
+                &format!("invalid s3 uri: {e}"),
+            )
+        })?;
+        let sidecar_key = Self::stage2d_sidecar_key(&clip.media_uri, clip.stream_id);
+        let clip_start_ms = clip
+            .clip_start
+            .saturating_mul(1000)
+            .saturating_div(u64::from(self.decode_fps.max(1)));
+        let clip_len_ms = u64::from(clip.clip_len.max(1))
+            .saturating_mul(1000)
+            .saturating_div(u64::from(self.decode_fps.max(1)));
+
+        let planner_cfg = RangePlannerConfig {
+            max_ranges: env_usize("MX8_VIDEO_STAGE2D_MAX_RANGES", 8).max(1),
+            merge_gap_bytes: env_u64("MX8_VIDEO_STAGE2D_MERGE_GAP_BYTES").unwrap_or(0),
+        };
+
+        if let Some(sidecar) = self.stage2d_sidecars.get(&sidecar_key) {
+            match plan_video_ranges(sidecar, clip_start_ms, clip_len_ms.max(1), planner_cfg) {
+                Ok(plan) => {
+                    self.s3_stage2d_plan_used_total =
+                        self.s3_stage2d_plan_used_total.saturating_add(1);
+                    tracing::info!(
+                        target: "mx8_proof",
+                        event = "video_range_plan",
+                        media_uri = %clip.media_uri,
+                        clip_id = %clip.clip_id,
+                        range_count = plan.ranges.len() as u64,
+                        planned_bytes = plan.planned_bytes,
+                        anchor_ms = plan.anchor_ms,
+                        clip_start_ms = clip_start_ms,
+                        clip_len_ms = clip_len_ms,
+                        "planned stage2d s3 ranges for video clip"
+                    );
+                    if let Ok(bytes) = self.s3_fetch_ranges_bytes(clip, &bucket, &key, &plan.ranges)
+                    {
+                        let tmp_path = std::env::temp_dir().join(format!(
+                            "mx8-video-stage2d-{}-{}-{}.mp4",
+                            std::process::id(),
+                            unix_time_ms(),
+                            clip.sample_id
+                        ));
+                        std::fs::write(&tmp_path, &bytes).map_err(|e| {
+                            Self::decode_error(
+                                std::path::Path::new(&clip.media_uri),
+                                "io_read_failed",
+                                &format!("write stage2d temp file failed: {e}"),
+                            )
+                        })?;
+                        let seek_seconds =
+                            clip_start_ms.saturating_sub(plan.anchor_ms) as f64 / 1000.0;
+                        let decoded = self.decode_clip_from_path(&tmp_path, seek_seconds);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        if decoded.is_ok() {
+                            return decoded;
+                        }
+                        self.s3_stage2d_plan_fallback_total =
+                            self.s3_stage2d_plan_fallback_total.saturating_add(1);
+                        tracing::warn!(
+                            target: "mx8_proof",
+                            event = "video_range_fallback",
+                            reason = "stage2d_decode_failed",
+                            media_uri = %clip.media_uri,
+                            clip_id = %clip.clip_id,
+                            "stage2d range decode failed; falling back to full-object range"
+                        );
+                    } else {
+                        self.s3_stage2d_plan_fallback_total =
+                            self.s3_stage2d_plan_fallback_total.saturating_add(1);
+                        tracing::warn!(
+                            target: "mx8_proof",
+                            event = "video_range_fallback",
+                            reason = "stage2d_fetch_failed",
+                            media_uri = %clip.media_uri,
+                            clip_id = %clip.clip_id,
+                            "stage2d range fetch failed; falling back to full-object range"
+                        );
+                    }
+                }
+                Err(err) => {
+                    self.s3_stage2d_plan_fallback_total =
+                        self.s3_stage2d_plan_fallback_total.saturating_add(1);
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "video_range_fallback",
+                        reason = "stage2d_plan_failed",
+                        media_uri = %clip.media_uri,
+                        clip_id = %clip.clip_id,
+                        detail = %err,
+                        "stage2d range planning failed; falling back to full-object range"
+                    );
+                }
+            }
+        }
+
+        self.s3_full_object_range_fallback_total =
+            self.s3_full_object_range_fallback_total.saturating_add(1);
+        let client = self
+            .rt
+            .block_on(mx8_runtime::s3::client_from_env())
+            .map_err(|e| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!("init s3 client failed: {e}"),
+                )
+            })?;
+        let object_len = self
+            .rt
+            .block_on(async { client.head_object().bucket(&bucket).key(&key).send().await })
+            .map_err(|e| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!("s3 head_object failed: {e:?}"),
+                )
+            })?
+            .content_length()
+            .unwrap_or(0);
+        if object_len <= 0 {
+            return Err(Self::decode_error(
+                std::path::Path::new(&clip.media_uri),
+                "io_read_failed",
+                "s3 object has unknown/zero size",
+            ));
+        }
+        let full_range = vec![ByteRange {
+            start_byte: 0,
+            end_byte: object_len as u64,
+        }];
+        tracing::info!(
+            target: "mx8_proof",
+            event = "video_range_plan",
+            media_uri = %clip.media_uri,
+            clip_id = %clip.clip_id,
+            range_count = 1u64,
+            planned_bytes = object_len as u64,
+            reason = "full_object_range_fallback",
+            "using full-object s3 range fallback for video clip"
+        );
+        let bytes = self.s3_fetch_ranges_bytes(clip, &bucket, &key, &full_range)?;
+        let tmp_path = std::env::temp_dir().join(format!(
+            "mx8-video-s3-full-{}-{}-{}.mp4",
+            std::process::id(),
+            unix_time_ms(),
+            clip.sample_id
+        ));
+        std::fs::write(&tmp_path, &bytes).map_err(|e| {
+            Self::decode_error(
+                std::path::Path::new(&clip.media_uri),
+                "io_read_failed",
+                &format!("write s3 temp file failed: {e}"),
+            )
+        })?;
+        let seek_seconds = (clip.clip_start as f64) / f64::from(self.decode_fps.max(1));
+        let decoded = self.decode_clip_from_path(&tmp_path, seek_seconds);
+        let _ = std::fs::remove_file(&tmp_path);
+        decoded
+    }
+
+    fn clip_payload_bytes(&mut self, clip: &VideoClipRecord) -> Result<Vec<u8>, VideoDecodeError> {
+        if clip.media_uri.starts_with("s3://") {
+            return self.clip_payload_bytes_s3(clip);
+        }
+        let path = std::path::PathBuf::from(&clip.media_uri);
+        if !path.exists() {
+            return Err(Self::decode_error(
+                &path,
+                "io_read_failed",
+                "input path does not exist",
+            ));
+        }
+        let seek_seconds = (clip.clip_start as f64) / f64::from(self.decode_fps.max(1));
+        self.decode_clip_from_path(&path, seek_seconds)
     }
 }
 
@@ -1542,18 +1828,14 @@ impl VideoDataLoader {
         let mut payload = Vec::<u8>::new();
 
         for idx in self.next_idx..end_idx {
-            let (sample_id, clip_id_for_log, media_uri_for_log, clip_start_for_log) = {
-                let clip = &self.clips[idx];
-                (
-                    clip.sample_id,
-                    clip.clip_id.clone(),
-                    clip.media_uri.clone(),
-                    clip.clip_start,
-                )
-            };
+            let clip_record = self.clips[idx].clone();
+            let sample_id = clip_record.sample_id;
+            let clip_id_for_log = clip_record.clip_id.clone();
+            let media_uri_for_log = clip_record.media_uri.clone();
+            let clip_start_for_log = clip_record.clip_start;
             self.decode_attempted_clips = self.decode_attempted_clips.saturating_add(1);
             let decode_started = Instant::now();
-            let clip_payload = match self.clip_payload_bytes(&self.clips[idx]) {
+            let clip_payload = match self.clip_payload_bytes(&clip_record) {
                 Ok(v) => v,
                 Err(err) => {
                     self.bump_decode_failure(err.class);
@@ -1710,6 +1992,30 @@ impl VideoDataLoader {
         let decode_failed_total = self.decode_failed_total();
         out.set_item("video_decode_failed_total", decode_failed_total)?;
         out.set_item("video_decode_ms_total", self.decode_ms_total)?;
+        out.set_item(
+            "video_stage2d_sidecars_total",
+            self.stage2d_sidecars.len() as u64,
+        )?;
+        out.set_item(
+            "video_s3_range_requests_total",
+            self.s3_range_requests_total,
+        )?;
+        out.set_item(
+            "video_s3_range_bytes_fetched_total",
+            self.s3_range_bytes_fetched_total,
+        )?;
+        out.set_item(
+            "video_s3_stage2d_plan_used_total",
+            self.s3_stage2d_plan_used_total,
+        )?;
+        out.set_item(
+            "video_s3_stage2d_plan_fallback_total",
+            self.s3_stage2d_plan_fallback_total,
+        )?;
+        out.set_item(
+            "video_s3_full_object_range_fallback_total",
+            self.s3_full_object_range_fallback_total,
+        )?;
         Ok(out.into_any())
     }
 }
@@ -2683,6 +2989,12 @@ fn video(
         &cfg,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+    let stage2d_sidecars = build_stage2d_sidecar_map(&snapshot.manifest_bytes)
+        .map_err(|e| PyRuntimeError::new_err(format!("build stage2d sidecar map failed: {e}")))?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}")))?;
 
     let max_inflight_bytes = constraints
         .as_ref()
@@ -2711,6 +3023,7 @@ fn video(
         fps = fps as u64,
         batch_size_samples = batch_size_samples as u64,
         clips_total = index.summary.clip_count,
+        stage2d_sidecars = stage2d_sidecars.len() as u64,
         max_inflight_bytes = max_inflight_bytes,
         bytes_per_clip = bytes_per_clip as u64,
         seed = seed,
@@ -2723,6 +3036,8 @@ fn video(
         VideoDataLoader {
             manifest_hash: snapshot.manifest_hash.0,
             clips: index.clips,
+            stage2d_sidecars,
+            rt,
             next_idx: 0,
             batch_size_samples,
             max_inflight_bytes,
@@ -2747,6 +3062,11 @@ fn video(
             decode_failed_backend_unavailable: 0,
             decode_failed_decode_failed: 0,
             decode_ms_total: 0,
+            s3_range_requests_total: 0,
+            s3_range_bytes_fetched_total: 0,
+            s3_stage2d_plan_used_total: 0,
+            s3_stage2d_plan_fallback_total: 0,
+            s3_full_object_range_fallback_total: 0,
         },
     )
 }
@@ -2942,6 +3262,148 @@ fn should_use_zero_manifest_scan(parsed: &mx8_core::dataset_link::DatasetLink, b
 
 fn parse_u64_ascii(raw: &str) -> Option<u64> {
     raw.trim().parse::<u64>().ok()
+}
+
+fn parse_s3_bucket_key_local(location: &str) -> Result<(String, String)> {
+    let Some(rest) = location.trim().strip_prefix("s3://") else {
+        anyhow::bail!("not an s3 uri: {location}");
+    };
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((bucket, key)) = rest.split_once('/') else {
+        anyhow::bail!("invalid s3 uri (missing key): {location}");
+    };
+    let bucket = bucket.trim();
+    let key = key.trim();
+    anyhow::ensure!(
+        !bucket.is_empty(),
+        "invalid s3 uri (empty bucket): {location}"
+    );
+    anyhow::ensure!(!key.is_empty(), "invalid s3 uri (empty key): {location}");
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+fn parse_decode_hint_fields_local(raw_hint: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if !raw_hint.starts_with("mx8:video") {
+        return out;
+    }
+    for token in raw_hint.split(';').skip(1) {
+        let Some((k, v)) = token.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let value = v.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
+fn parse_stage2d_sidecar_from_hint(
+    record: &mx8_core::types::ManifestRecord,
+) -> Result<Option<VideoRangeSidecar>> {
+    let Some(raw_hint) = record.decode_hint.as_deref() else {
+        return Ok(None);
+    };
+    let fields = parse_decode_hint_fields_local(raw_hint);
+    let Some(raw_chunks) = fields.get("stage2d_chunks") else {
+        return Ok(None);
+    };
+    let stream_id = fields
+        .get("stream_id")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let codec = fields
+        .get("codec")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let schema_version = fields
+        .get("stage2d_schema")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(VIDEO_RANGE_SCHEMA_VERSION);
+    let mut chunks = Vec::<VideoRangeChunk>::new();
+    for (idx, chunk_raw) in raw_chunks.split('|').enumerate() {
+        let part = chunk_raw.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = part.split(',').collect();
+        if cols.len() != 6 {
+            anyhow::bail!(
+                "invalid stage2d_chunks entry for sample_id {} at index {}",
+                record.sample_id,
+                idx
+            );
+        }
+        let chunk = VideoRangeChunk {
+            chunk_index: cols[0]
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("invalid chunk_index"))?,
+            start_ms: cols[1]
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid start_ms"))?,
+            end_ms: cols[2]
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid end_ms"))?,
+            start_byte: cols[3]
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid start_byte"))?,
+            end_byte: cols[4]
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid end_byte"))?,
+            keyframe: matches!(cols[5].trim(), "1" | "true" | "yes" | "on"),
+        };
+        chunks.push(chunk);
+    }
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+    let sidecar = VideoRangeSidecar {
+        sample_id: record.sample_id,
+        media_uri: record.location.clone(),
+        stream_id,
+        codec,
+        schema_version,
+        chunks,
+    };
+    sidecar
+        .validate()
+        .map_err(|e| anyhow::anyhow!("stage2d sidecar validation failed: {e}"))?;
+    Ok(Some(sidecar))
+}
+
+fn build_stage2d_sidecar_map(manifest_bytes: &[u8]) -> Result<HashMap<String, VideoRangeSidecar>> {
+    let records = mx8_runtime::pipeline::load_manifest_records_from_read(std::io::Cursor::new(
+        manifest_bytes,
+    ))?;
+    let mut out = HashMap::<String, VideoRangeSidecar>::new();
+    for record in &records {
+        match parse_stage2d_sidecar_from_hint(record) {
+            Ok(Some(sidecar)) => {
+                let k = VideoDataLoader::stage2d_sidecar_key(&sidecar.media_uri, sidecar.stream_id);
+                out.insert(k, sidecar);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "mx8_proof",
+                    event = "video_stage2d_sidecar_parse_failed",
+                    sample_id = record.sample_id,
+                    media_uri = %record.location,
+                    detail = %err,
+                    "failed to parse stage2d sidecar hint"
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn detect_cgroup_memory_limit_bytes() -> Option<u64> {

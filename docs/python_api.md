@@ -157,6 +157,12 @@ Current staged contract:
 - init rejects invalid cap combinations (`batch_size_samples * bytes_per_clip > max_inflight_bytes`)
 - current CPU decode backend uses local `ffmpeg` CLI (`MX8_FFMPEG_BIN` override, default `ffmpeg`)
 
+Virtual Seek status:
+
+- shipped now: deterministic Stage 2D range sidecar/planner contract + gate
+- not yet shipped: end-to-end S3 `Range` execution + decode from remote range segments
+- until Stage 2D executor lands, treat video path as CPU decode correctness + boundedness rails (not no-download S3 clip decode)
+
 `loader.stats()` also includes video decode contract + reliability counters:
 
 - contract: `video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_stride_t/h/w/c`, `video_clip_bytes`

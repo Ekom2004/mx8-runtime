@@ -118,6 +118,22 @@ for images, labels in loader:
     pass
 ```
 
+### Video “Virtual Seek” Status (Shipped vs Target)
+
+**What ships today**
+
+- Clip-oriented video API and decode contract gates are live (v1.8 Stage 2A/2B).
+- Deterministic Stage 2D range-planning contract is live (`video_range_schema_version=1` + planner gate).
+- Current decode path is CPU (`ffmpeg` CLI), with bounded runtime caps.
+
+**What is next (Virtual Seek target)**
+
+- Execute S3 `Range` GETs directly from Stage 2D plans.
+- Decode clips from fetched segments without full-object temp download on supported datasets.
+- Emit proof logs/counters for plan/fetch/fallback so no-download claims are measurable.
+
+Determinism contract for this path is pinned by `manifest_hash + sidecar schema/hash + sampling seed`.
+
 ## Current Docs
 
 - Python API: `docs/python_api.md`
