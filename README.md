@@ -20,7 +20,7 @@ It focuses on one hard contract: keep data delivery fast, deterministic, and mem
 - Zero-manifest direct-stream ingest path in `mx8d-agent`.
 - Autotune preview (`safe|balanced|throughput`) for `want`, `prefetch_batches`, `max_queue_batches`.
 - Vision loader (`mx8.vision.ImageFolderLoader`) + packers (`mx8.pack`, `mx8.pack_dir`).
-- Video loader scaffold (`mx8.video`) with Stage 2A/2B/2D contracts.
+- Video loader (`mx8.video`) with locked decode/delivery contracts.
 - Video Stage 3A backend rails: `MX8_VIDEO_DECODE_BACKEND=cli|ffi` with fallback proof log (`video_decode_backend_fallback`).
 
 ## 60-Second Quickstart
@@ -64,12 +64,13 @@ Install:
 - DDP autotune A/B: `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
 - Autotune pressure simulation: `./scripts/autotune_memory_pressure_sim.sh`
 - Video Stage 3A backend parity: `./scripts/video_stage3a_backend_gate.sh`
+- Video GA checklist (fast/full): `./scripts/video_ga_gate.sh --quick|--full`
 
-## Video (Preview)
+## Video (GA)
 
-- `mx8.video(...)` is available as a preview API for clip-oriented delivery.
-- Current default decode backend is `ffmpeg` CLI.
-- Video S3 range-streaming is in progress; use image/ETL paths for production-critical workloads today.
+- `mx8.video(...)` is GA for the current clip decode/delivery contract.
+- Default decode backend is `ffmpeg` CLI; optional backend selector rails are available.
+- S3 range-streaming optimization is still roadmap work, not required for current GA contract.
 
 ## Docs Map
 
@@ -79,6 +80,7 @@ Install:
 - Memory model/caps: `docs/memory_contract.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
 - Troubleshooting: `docs/troubleshooting.md`
+- Video GA checklist: `docs/video_ga_checklist.md`
 
 ## Near-Term Roadmap
 

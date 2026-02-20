@@ -126,9 +126,9 @@ Decode backend behavior:
 - optional Rust JPEG codec: set `MX8_RUST_JPEG_CODEC=zune|image|turbo` (default: `zune`)
 - optional Rust resize backend: set `MX8_RUST_RESIZE_BACKEND=fast|image` (default: `fast`)
 
-## Video loader (v1.8 scaffold)
+## Video loader (GA current contract)
 
-Use `mx8.video(...)` for clip-oriented delivery scaffolding while CPU decode contract work is in progress.
+Use `mx8.video(...)` for clip-oriented delivery with bounded decode/runtime rails.
 
 ```python
 import mx8
@@ -149,7 +149,7 @@ for batch in loader:
     offsets = batch.offsets
 ```
 
-Current staged contract:
+Current contract:
 
 - `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offsets`, `payload`
 - batch metadata: `frames_per_clip`, `frame_height`, `frame_width`, `channels`, `layout`, `dtype`, `colorspace`, `strides`
@@ -171,11 +171,10 @@ Native FFI build notes:
   - default build path: `./scripts/video_stage3a_backend_gate.sh`
   - FFI-compiled path: `RUSTFLAGS="--cfg mx8_video_ffi" ./scripts/video_stage3a_backend_gate.sh`
 
-Virtual Seek status:
+S3 range-streaming status:
 
 - shipped now: deterministic Stage 2D range sidecar/planner contract + gate
-- not yet shipped: end-to-end S3 `Range` execution + decode from remote range segments
-- until Stage 2D executor lands, treat video path as CPU decode correctness + boundedness rails (not no-download S3 clip decode)
+- roadmap: end-to-end S3 `Range` execution + decode from remote range segments
 
 `loader.stats()` also includes video decode contract + reliability counters:
 
@@ -195,6 +194,7 @@ Internal contract and gate checklist:
 - `docs/release_stage2c_runbook.md`
 - `./scripts/video_stage3a_backend_gate.sh`
 - `docs/release_stage3a_backend_runbook.md`
+- `docs/video_ga_checklist.md`
 
 Runtime proof logs (target: `mx8_proof`) now include:
 

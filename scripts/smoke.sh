@@ -165,4 +165,14 @@ if [[ "${MX8_SMOKE_VIDEO_STAGE2D_RANGE:-0}" == "1" ]]; then
   ./scripts/video_stage2d_range_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_VIDEO_STAGE3A:-0}" == "1" ]]; then
+  echo "[mx8] video_stage3a_backend_gate (v1.8 stage-3a decode backend parity gate)"
+  ./scripts/video_stage3a_backend_gate.sh
+fi
+
+if [[ "${MX8_SMOKE_VIDEO_GA:-0}" == "1" ]]; then
+  echo "[mx8] video_ga_gate (video go/no-go checklist)"
+  ./scripts/video_ga_gate.sh "${MX8_SMOKE_VIDEO_GA_MODE:---quick}"
+fi
+
 echo "[mx8] smoke OK"
