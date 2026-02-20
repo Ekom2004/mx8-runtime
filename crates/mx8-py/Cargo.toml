@@ -25,6 +25,6 @@ pyo3 = { workspace = true, features = ["extension-module"] }
 rayon = "1"
 tokio.workspace = true
 tonic.workspace = true
-turbojpeg = "1.4"
+turbojpeg = { version = "1.4", default-features = false, features = ["cmake", "pkg-config"] }
 tracing.workspace = true
 zune-jpeg = "0.5"
