@@ -52,6 +52,11 @@ use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 use mx8_wire::TryToCore;
 use tonic::transport::Channel;
 
+#[cfg(mx8_video_ffi)]
+use ffmpeg_next as ffmpeg;
+#[cfg(mx8_video_ffi)]
+use std::sync::OnceLock;
+
 type TorchBatch3<'py> = (Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>);
 type TorchBatch4<'py> = (
     Bound<'py, PyAny>,
@@ -63,6 +68,12 @@ type TorchBatch4<'py> = (
 const VIDEO_LAYOUT: &str = "thwc";
 const VIDEO_DTYPE: &str = "u8";
 const VIDEO_COLORSPACE: &str = "rgb24";
+
+#[derive(Debug, Clone, Copy)]
+enum VideoDecodeBackend {
+    Cli,
+    Ffi,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum DecodeBackend {
@@ -166,6 +177,7 @@ struct VideoDataLoader {
     clips: Vec<VideoClipRecord>,
     stage2d_sidecars: HashMap<String, VideoRangeSidecar>,
     rt: tokio::runtime::Runtime,
+    decode_backend: VideoDecodeBackend,
     next_idx: usize,
     batch_size_samples: usize,
     max_inflight_bytes: u64,
@@ -481,6 +493,25 @@ fn decode_threads_from_env() -> PyResult<usize> {
         ));
     }
     Ok(parsed)
+}
+
+fn video_decode_backend_from_env() -> PyResult<VideoDecodeBackend> {
+    let raw = std::env::var("MX8_VIDEO_DECODE_BACKEND").unwrap_or_else(|_| "cli".to_string());
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "cli" | "ffmpeg" => Ok(VideoDecodeBackend::Cli),
+        "ffi" | "ffmpeg_next" => Ok(VideoDecodeBackend::Ffi),
+        _ => Err(PyValueError::new_err(format!(
+            "invalid MX8_VIDEO_DECODE_BACKEND={raw:?} (expected: cli|ffi)"
+        ))),
+    }
+}
+
+fn video_decode_backend_name(backend: VideoDecodeBackend) -> &'static str {
+    match backend {
+        VideoDecodeBackend::Cli => "cli",
+        VideoDecodeBackend::Ffi => "ffi",
+    }
 }
 
 fn labels_to_torch_i64<'py>(py: Python<'py>, labels: &[u64]) -> PyResult<Bound<'py, PyAny>> {
@@ -1422,7 +1453,7 @@ impl VideoDataLoader {
         }
     }
 
-    fn decode_clip_from_path(
+    fn decode_clip_from_path_cli(
         &self,
         path: &std::path::Path,
         start_seconds: f64,
@@ -1502,6 +1533,205 @@ impl VideoDataLoader {
             decoded.truncate(expected_clip_bytes);
         }
         Ok(decoded)
+    }
+
+    #[cfg(mx8_video_ffi)]
+    fn decode_clip_from_path_ffi(
+        &self,
+        path: &std::path::Path,
+        start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        static FFMPEG_INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+        let init = FFMPEG_INIT.get_or_init(|| ffmpeg::init().map_err(|e| e.to_string()));
+        if let Err(err) = init {
+            return Err(Self::decode_error(
+                path,
+                "decode_backend_unavailable",
+                &format!("ffmpeg-next init failed: {err}"),
+            ));
+        }
+
+        let mut input_ctx = ffmpeg::format::input(path).map_err(|e| {
+            Self::decode_error(path, "io_read_failed", &format!("open input failed: {e}"))
+        })?;
+        let stream = input_ctx
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .ok_or_else(|| Self::decode_error(path, "missing_stream", "no video stream found"))?;
+        let stream_index = stream.index();
+        let codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| {
+                Self::decode_error(path, "decode_failed", &format!("codec context failed: {e}"))
+            })?;
+        let mut decoder = codec_ctx.decoder().video().map_err(|e| {
+            Self::decode_error(
+                path,
+                "unsupported_codec",
+                &format!("video decoder init failed: {e}"),
+            )
+        })?;
+
+        let side = self.decode_contract.frame_width;
+        let side_usize = usize::try_from(side).map_err(|_| {
+            Self::decode_error(path, "decode_failed", "frame width conversion overflow")
+        })?;
+        let clip_len_usize =
+            usize::try_from(self.decode_contract.frames_per_clip).map_err(|_| {
+                Self::decode_error(
+                    path,
+                    "decode_failed",
+                    "clip_len conversion overflow for decode contract",
+                )
+            })?;
+        let expected_clip_bytes =
+            usize::try_from(self.decode_contract.clip_bytes).map_err(|_| {
+                Self::decode_error(path, "decode_failed", "clip_bytes conversion overflow")
+            })?;
+        let start_frame_index = if start_seconds <= 0.0 {
+            0usize
+        } else {
+            (start_seconds * f64::from(self.decode_fps.max(1))).floor() as usize
+        };
+
+        let mut scaler = ffmpeg::software::scaling::context::Context::get(
+            decoder.format(),
+            decoder.width(),
+            decoder.height(),
+            ffmpeg::format::Pixel::RGB24,
+            side,
+            side,
+            ffmpeg::software::scaling::flag::Flags::BILINEAR,
+        )
+        .map_err(|e| {
+            Self::decode_error(
+                path,
+                "decode_failed",
+                &format!("scale context init failed: {e}"),
+            )
+        })?;
+
+        let mut out = Vec::<u8>::with_capacity(expected_clip_bytes);
+        let mut decoded = ffmpeg::util::frame::video::Video::empty();
+        let mut rgb = ffmpeg::util::frame::video::Video::empty();
+        let mut seen_frames: usize = 0;
+        let mut kept_frames: usize = 0;
+
+        let mut push_frame = |src: &ffmpeg::util::frame::video::Video,
+                              seen_frames: &mut usize,
+                              kept_frames: &mut usize,
+                              out: &mut Vec<u8>|
+         -> Result<()> {
+            if *seen_frames < start_frame_index {
+                *seen_frames = seen_frames.saturating_add(1);
+                return Ok(());
+            }
+            if *kept_frames >= clip_len_usize {
+                return Ok(());
+            }
+            scaler
+                .run(src, &mut rgb)
+                .map_err(|e| anyhow::anyhow!("scale frame failed: {e}"))?;
+            let stride = rgb.stride(0);
+            let data = rgb.data(0);
+            let row_bytes = side_usize.saturating_mul(3);
+            for row in 0..side_usize {
+                let start = row
+                    .checked_mul(stride)
+                    .ok_or_else(|| anyhow::anyhow!("rgb row offset overflow"))?;
+                let end = start
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("rgb row end overflow"))?;
+                if end > data.len() {
+                    anyhow::bail!("scaled frame buffer too small");
+                }
+                out.extend_from_slice(&data[start..end]);
+            }
+            *seen_frames = seen_frames.saturating_add(1);
+            *kept_frames = kept_frames.saturating_add(1);
+            Ok(())
+        };
+
+        for (pkt_stream, packet) in input_ctx.packets() {
+            if pkt_stream.index() != stream_index {
+                continue;
+            }
+            decoder.send_packet(&packet).map_err(|e| {
+                Self::decode_error(path, "decode_failed", &format!("send packet failed: {e}"))
+            })?;
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                push_frame(&decoded, &mut seen_frames, &mut kept_frames, &mut out)
+                    .map_err(|e| Self::decode_error(path, "decode_failed", &e.to_string()))?;
+                if kept_frames >= clip_len_usize {
+                    break;
+                }
+            }
+            if kept_frames >= clip_len_usize {
+                break;
+            }
+        }
+
+        decoder.send_eof().map_err(|e| {
+            Self::decode_error(path, "decode_failed", &format!("send eof failed: {e}"))
+        })?;
+        while kept_frames < clip_len_usize && decoder.receive_frame(&mut decoded).is_ok() {
+            push_frame(&decoded, &mut seen_frames, &mut kept_frames, &mut out)
+                .map_err(|e| Self::decode_error(path, "decode_failed", &e.to_string()))?;
+        }
+
+        if out.len() < expected_clip_bytes {
+            return Err(Self::decode_error(
+                path,
+                "short_media",
+                &format!(
+                    "decoded bytes {} below expected {}",
+                    out.len(),
+                    expected_clip_bytes
+                ),
+            ));
+        }
+        if out.len() > expected_clip_bytes {
+            out.truncate(expected_clip_bytes);
+        }
+        Ok(out)
+    }
+
+    #[cfg(not(mx8_video_ffi))]
+    fn decode_clip_from_path_ffi(
+        &self,
+        path: &std::path::Path,
+        _start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        Err(Self::decode_error(
+            path,
+            "decode_backend_unavailable",
+            "ffi backend not compiled (rebuild with RUSTFLAGS='--cfg mx8_video_ffi')",
+        ))
+    }
+
+    fn decode_clip_from_path(
+        &self,
+        path: &std::path::Path,
+        start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        match self.decode_backend {
+            VideoDecodeBackend::Cli => self.decode_clip_from_path_cli(path, start_seconds),
+            VideoDecodeBackend::Ffi => match self.decode_clip_from_path_ffi(path, start_seconds) {
+                Ok(v) => Ok(v),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "video_decode_backend_fallback",
+                        from_backend = "ffi",
+                        to_backend = "cli",
+                        class = err.class,
+                        path = %path.display(),
+                        detail = %err.detail,
+                        "ffi decode failed; falling back to cli backend"
+                    );
+                    self.decode_clip_from_path_cli(path, start_seconds)
+                }
+            },
+        }
     }
 
     fn stage2d_sidecar_key(media_uri: &str, stream_id: u32) -> String {
@@ -1889,6 +2119,7 @@ impl VideoDataLoader {
         tracing::info!(
             target: "mx8_proof",
             event = "video_decode_batch",
+            decode_backend = video_decode_backend_name(self.decode_backend),
             batch_samples = sample_ids.len() as u64,
             payload_bytes = payload_bytes,
             batch_decode_ms = batch_decode_ms,
@@ -1931,6 +2162,10 @@ impl VideoDataLoader {
         out.set_item("video_layout", VIDEO_LAYOUT)?;
         out.set_item("video_dtype", VIDEO_DTYPE)?;
         out.set_item("video_colorspace", VIDEO_COLORSPACE)?;
+        out.set_item(
+            "video_decode_backend",
+            video_decode_backend_name(self.decode_backend),
+        )?;
         out.set_item(
             "video_frames_per_clip",
             self.decode_contract.frames_per_clip,
@@ -3001,6 +3236,7 @@ fn video(
         .and_then(|c| c.max_inflight_bytes)
         .unwrap_or(128 * 1024 * 1024)
         .max(1);
+    let decode_backend = video_decode_backend_from_env()?;
     let bytes_per_clip = env_usize("MX8_VIDEO_STAGE2_BYTES_PER_CLIP", 4096).max(1);
     let decode_contract = VideoDataLoader::derive_decode_contract(clip_len, bytes_per_clip)?;
     if batch_size_samples == 0 {
@@ -3024,6 +3260,7 @@ fn video(
         batch_size_samples = batch_size_samples as u64,
         clips_total = index.summary.clip_count,
         stage2d_sidecars = stage2d_sidecars.len() as u64,
+        decode_backend = video_decode_backend_name(decode_backend),
         max_inflight_bytes = max_inflight_bytes,
         bytes_per_clip = bytes_per_clip as u64,
         seed = seed,
@@ -3038,6 +3275,7 @@ fn video(
             clips: index.clips,
             stage2d_sidecars,
             rt,
+            decode_backend,
             next_idx: 0,
             batch_size_samples,
             max_inflight_bytes,
