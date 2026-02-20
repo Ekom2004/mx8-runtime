@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "mx8-py"
-version = "1.0.0"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "fast_image_resize",

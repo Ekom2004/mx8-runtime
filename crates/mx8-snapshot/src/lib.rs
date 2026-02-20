@@ -14,6 +14,7 @@ use tracing::{info, warn};
 pub mod labels;
 pub mod pack_dir;
 pub mod video_stage1;
+pub mod video_stage2d;
 
 #[cfg(feature = "s3")]
 pub mod pack_s3;

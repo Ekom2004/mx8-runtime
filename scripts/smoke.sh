@@ -160,4 +160,9 @@ if [[ "${MX8_SMOKE_VIDEO_STAGE2C_PERF:-0}" == "1" ]]; then
   ./scripts/video_stage2c_perf_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_VIDEO_STAGE2D_RANGE:-0}" == "1" ]]; then
+  echo "[mx8] video_stage2d_range_gate (v1.8 stage-2d S3 range planner contract gate)"
+  ./scripts/video_stage2d_range_gate.sh
+fi
+
 echo "[mx8] smoke OK"
