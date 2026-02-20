@@ -19,6 +19,7 @@ It focuses on one hard contract: keep data delivery fast, deterministic, and mem
 - Snapshot resolver (`plain`, `@refresh`, `@sha256:`).
 - Zero-manifest direct-stream ingest path in `mx8d-agent`.
 - Autotune preview (`safe|balanced|throughput`) for `want`, `prefetch_batches`, `max_queue_batches`.
+- `mx8.mix(...)` deterministic weighted blending with shared caps and explicit source-exhaustion policy (`error|allow`).
 - Vision loader (`mx8.vision.ImageFolderLoader`) + packers (`mx8.pack`, `mx8.pack_dir`).
 - Video loader (`mx8.video`) with locked decode/delivery contracts.
 - Video Stage 3A backend rails: `MX8_VIDEO_DECODE_BACKEND=cli|ffi` with fallback proof log (`video_decode_backend_fallback`).
@@ -79,7 +80,7 @@ Install:
 
 - Product architecture: `ARCHITECTURE.MD`
 - Python API reference: `docs/python_api.md`
-- `mx8.mix` v1.7 contract draft: `docs/mix_v17_contract.md`
+- `mx8.mix` v1.7 contract: `docs/mix_v17_contract.md`
 - `mx8.mix` gate runbook: `docs/mix_gate_runbook.md`
 - Memory model/caps: `docs/memory_contract.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
@@ -88,5 +89,5 @@ Install:
 
 ## Near-Term Roadmap
 
-- **Dataset mixing (`mx8.mix`)** for multi-source training/inference pipelines (contract drafted; implementation next).
+- **`mx8.mix` ergonomics pass** (profile-level defaults and richer diagnostics for production jobs).
 - **Video-native hardening** for range-streaming and decode reliability at scale.

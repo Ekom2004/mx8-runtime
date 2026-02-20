@@ -12,7 +12,8 @@ Default checks:
 - deterministic replay digest for 3 same-seed/epoch runs,
 - weighted ratio tolerance check,
 - shared inflight + process RSS cap checks,
-- epoch+1 replay determinism check.
+- epoch+1 replay determinism check,
+- source-exhaustion policy check (`error` fails fast, `allow` drains with counters).
 
 ## Strict (CI-Oriented) Gate
 

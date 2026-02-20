@@ -1,6 +1,6 @@
-# MX8 `mx8.mix` Contract Draft (v1.7)
+# MX8 `mx8.mix` Contract (v1.7)
 
-This document defines the proposed contract for `mx8.mix(...)` before implementation.
+This document defines the current contract for `mx8.mix(...)`.
 
 ## Goal
 
@@ -15,16 +15,15 @@ mixed = mx8.mix(
     loaders=[loader_a, loader_b],
     weights=[0.7, 0.3],
     seed=1234,
-    profile="balanced",
-    autotune=True,
-    constraints=mx8.Constraints(max_inflight_bytes=512 * 1024 * 1024),
+    epoch=0,
+    on_source_exhausted="error",
 )
 ```
 
 - `loaders`: list of existing MX8 loaders (initial scope: byte-oriented `mx8.load(...)` loaders).
 - `weights`: positive floats, same length as `loaders`, normalized internally.
 - `seed`: deterministic source-selection seed.
-- `profile|autotune|constraints|runtime`: same meaning as existing loader API.
+- `on_source_exhausted`: `error|allow` (default: `error`).
 
 ## Determinism Contract (failure-free)
 
@@ -47,13 +46,14 @@ the mixed stream order is deterministic and replayable.
 
 - Deterministic weighted round-robin source selection.
 - Delivery remains per-batch; no global reorder inside a delivered batch.
-- Source-level exhaustion policy for initial release: fail fast with explicit error (no silent source drop).
+- Source-level exhaustion defaults to fail fast with explicit error (no silent source drop).
 
 ## Planned Acceptance Gates
 
 - Determinism gate: 3 repeated runs must produce identical digest of `(source_id, sample_id)` sequence.
-- Ratio gate: observed source contribution must be within ±2% of target weights over the gate window.
+- Ratio gate: observed source contribution must be within tolerance of target weights (default ±2%; strict ±1%).
 - Memory gate: inflight/process bounds remain within configured caps during mixed run.
+- Exhaustion gate: `on_source_exhausted=error` fails fast; `allow` drains with explicit counters.
 
 Gate command:
 

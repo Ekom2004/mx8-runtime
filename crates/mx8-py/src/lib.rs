@@ -136,6 +136,7 @@ struct MixedDataLoader {
     loaders: Vec<Py<DataLoader>>,
     scheduler: WeightedRoundRobin,
     active: Vec<bool>,
+    source_exhausted_total: Vec<u64>,
     delivered_batches: Vec<u64>,
     delivered_samples: Vec<u64>,
     delivered_bytes: Vec<u64>,
@@ -151,6 +152,7 @@ struct MixedDataLoader {
     snapshot_enabled: bool,
     snapshot_period_ticks: u64,
     snapshot_emitted_total: u64,
+    source_exhaustion_policy: SourceExhaustionPolicy,
 }
 
 #[pyclass]
@@ -234,6 +236,29 @@ struct WeightedRoundRobin {
     weights: Vec<u64>,
     current: Vec<i128>,
     tie_break_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceExhaustionPolicy {
+    Error,
+    Allow,
+}
+
+impl SourceExhaustionPolicy {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "error" => Ok(Self::Error),
+            "allow" => Ok(Self::Allow),
+            _ => anyhow::bail!("invalid on_source_exhausted={raw:?} (expected: error|allow)"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Allow => "allow",
+        }
+    }
 }
 
 impl WeightedRoundRobin {
@@ -1198,11 +1223,34 @@ impl MixedDataLoader {
                 }
                 Err(err) => {
                     if err.is_instance_of::<PyStopIteration>(py) {
-                        self.active[source_idx] = false;
-                        if !self.active.iter().any(|v| *v) {
-                            return Err(PyStopIteration::new_err(()));
+                        self.source_exhausted_total[source_idx] =
+                            self.source_exhausted_total[source_idx].saturating_add(1);
+                        tracing::info!(
+                            target: "mx8_proof",
+                            event = "mix_source_exhausted",
+                            source_idx = source_idx as u64,
+                            policy = self.source_exhaustion_policy.as_str(),
+                            delivered_batches = self.delivered_batches[source_idx],
+                            delivered_samples = self.delivered_samples[source_idx],
+                            delivered_bytes = self.delivered_bytes[source_idx],
+                            schedule_ticks = self.schedule_ticks,
+                            "mixed loader source exhausted"
+                        );
+                        match self.source_exhaustion_policy {
+                            SourceExhaustionPolicy::Error => {
+                                return Err(PyRuntimeError::new_err(format!(
+                                    "mix source exhausted (source_idx={source_idx}, policy=error, schedule_ticks={}, delivered_samples={})",
+                                    self.schedule_ticks, self.delivered_samples[source_idx]
+                                )));
+                            }
+                            SourceExhaustionPolicy::Allow => {
+                                self.active[source_idx] = false;
+                                if !self.active.iter().any(|v| *v) {
+                                    return Err(PyStopIteration::new_err(()));
+                                }
+                                continue;
+                            }
                         }
-                        continue;
                     }
                     return Err(err);
                 }
@@ -1236,8 +1284,16 @@ impl MixedDataLoader {
             PyList::new_bound(py, self.starvation_total.iter().copied()),
         )?;
         out.set_item(
+            "mix_source_exhausted_total",
+            PyList::new_bound(py, self.source_exhausted_total.iter().copied()),
+        )?;
+        out.set_item(
             "mix_normalized_weights",
             PyList::new_bound(py, self.normalized_weights.iter().copied()),
+        )?;
+        out.set_item(
+            "mix_source_exhaustion_policy",
+            self.source_exhaustion_policy.as_str(),
         )?;
         let total_inflight_bytes = self.total_inflight_bytes(py);
         out.set_item("mix_total_inflight_bytes", total_inflight_bytes)?;
@@ -3310,7 +3366,7 @@ fn video(
 }
 
 #[pyfunction]
-#[pyo3(signature = (loaders, *, weights, seed=0, epoch=0, starvation_window=10_000))]
+#[pyo3(signature = (loaders, *, weights, seed=0, epoch=0, starvation_window=10_000, on_source_exhausted="error"))]
 fn mix(
     py: Python<'_>,
     loaders: Vec<Py<DataLoader>>,
@@ -3318,6 +3374,7 @@ fn mix(
     seed: u64,
     epoch: u64,
     starvation_window: u64,
+    on_source_exhausted: &str,
 ) -> PyResult<Py<MixedDataLoader>> {
     if loaders.is_empty() {
         return Err(PyValueError::new_err(
@@ -3354,6 +3411,8 @@ fn mix(
         }
     }
     let scheduler = WeightedRoundRobin::new(normalized.clone(), seed, epoch);
+    let source_exhaustion_policy = SourceExhaustionPolicy::parse(on_source_exhausted)
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let n = loaders.len();
     let snapshot_enabled = env_bool("MX8_MIX_SNAPSHOT", false);
     let snapshot_period_ticks = env_u64("MX8_MIX_SNAPSHOT_PERIOD_TICKS")
@@ -3367,6 +3426,7 @@ fn mix(
         epoch = epoch,
         shared_max_inflight_bytes = shared_max_inflight_bytes,
         normalized_weights = ?normalized,
+        source_exhaustion_policy = source_exhaustion_policy.as_str(),
         snapshot_enabled = snapshot_enabled,
         snapshot_period_ticks = snapshot_period_ticks,
         max_queue_batches = ?queue_caps,
@@ -3377,6 +3437,7 @@ fn mix(
         loaders,
         scheduler,
         active: vec![true; n],
+        source_exhausted_total: vec![0; n],
         delivered_batches: vec![0; n],
         delivered_samples: vec![0; n],
         delivered_bytes: vec![0; n],
@@ -3392,6 +3453,7 @@ fn mix(
         snapshot_enabled,
         snapshot_period_ticks,
         snapshot_emitted_total: 0,
+        source_exhaustion_policy,
     };
     Py::new(py, out)
 }
@@ -4814,7 +4876,8 @@ mod autotune_tests {
 #[cfg(test)]
 mod mix_scheduler_tests {
     use super::{
-        compute_shared_mix_cap, normalize_mix_weights, should_emit_mix_snapshot, WeightedRoundRobin,
+        compute_shared_mix_cap, normalize_mix_weights, should_emit_mix_snapshot,
+        SourceExhaustionPolicy, WeightedRoundRobin,
     };
 
     #[test]
@@ -4824,6 +4887,19 @@ mod mix_scheduler_tests {
         assert!(normalize_mix_weights(&[-1.0, 1.0]).is_err());
         assert!(normalize_mix_weights(&[f64::NAN, 1.0]).is_err());
         assert!(normalize_mix_weights(&[f64::INFINITY, 1.0]).is_err());
+    }
+
+    #[test]
+    fn mix_source_exhaustion_policy_parsing() {
+        assert_eq!(
+            SourceExhaustionPolicy::parse("error").expect("parse"),
+            SourceExhaustionPolicy::Error
+        );
+        assert_eq!(
+            SourceExhaustionPolicy::parse("allow").expect("parse"),
+            SourceExhaustionPolicy::Allow
+        );
+        assert!(SourceExhaustionPolicy::parse("noop").is_err());
     }
 
     #[test]

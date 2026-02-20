@@ -34,6 +34,7 @@ def _run_once(
     weights: list[float],
     max_inflight_bytes: int,
     max_process_rss_bytes: int,
+    on_source_exhausted: str = "allow",
 ):
     loader_a = mx8.load(
         link_a,
@@ -66,6 +67,7 @@ def _run_once(
         seed=seed,
         epoch=epoch,
         starvation_window=10_000,
+        on_source_exhausted=on_source_exhausted,
     )
 
     seq: list[tuple[str, int]] = []
@@ -99,6 +101,101 @@ def _run_once(
 
     stats = mixed.stats()
     return seq, stats, max_total_inflight, max_process_rss
+
+
+def _run_source_exhaustion_policy_checks(
+    *,
+    store_root: str,
+    link_a: str,
+    link_b: str,
+    manifest_a: str,
+    manifest_b: str,
+    max_inflight_bytes: int,
+    max_process_rss_bytes: int,
+) -> None:
+    loader_a = mx8.load(
+        link_a,
+        manifest_store_root=store_root,
+        dev_manifest_path=manifest_a,
+        batch_size_samples=1,
+        constraints=mx8.Constraints(
+            max_inflight_bytes=max_inflight_bytes,
+            max_process_rss_bytes=max_process_rss_bytes,
+        ),
+    )
+    loader_b = mx8.load(
+        link_b,
+        manifest_store_root=store_root,
+        dev_manifest_path=manifest_b,
+        batch_size_samples=1,
+        constraints=mx8.Constraints(
+            max_inflight_bytes=max_inflight_bytes,
+            max_process_rss_bytes=max_process_rss_bytes,
+        ),
+    )
+    mixed_error = mx8.mix(
+        [loader_a, loader_b],
+        weights=[1.0, 1.0],
+        seed=19,
+        epoch=5,
+        on_source_exhausted="error",
+    )
+    seen = 0
+    try:
+        for _batch in mixed_error:
+            seen += 1
+    except RuntimeError as err:
+        message = str(err)
+        if "source exhausted" not in message:
+            raise RuntimeError(f"unexpected exhaustion error message: {message}") from err
+    else:
+        raise RuntimeError("expected RuntimeError for on_source_exhausted=error")
+    if seen == 0:
+        raise RuntimeError("source exhaustion error fired before any progress")
+
+    loader_a_allow = mx8.load(
+        link_a,
+        manifest_store_root=store_root,
+        dev_manifest_path=manifest_a,
+        batch_size_samples=1,
+        constraints=mx8.Constraints(
+            max_inflight_bytes=max_inflight_bytes,
+            max_process_rss_bytes=max_process_rss_bytes,
+        ),
+    )
+    loader_b_allow = mx8.load(
+        link_b,
+        manifest_store_root=store_root,
+        dev_manifest_path=manifest_b,
+        batch_size_samples=1,
+        constraints=mx8.Constraints(
+            max_inflight_bytes=max_inflight_bytes,
+            max_process_rss_bytes=max_process_rss_bytes,
+        ),
+    )
+    mixed_allow = mx8.mix(
+        [loader_a_allow, loader_b_allow],
+        weights=[1.0, 1.0],
+        seed=19,
+        epoch=5,
+        on_source_exhausted="allow",
+    )
+    seen_allow = 0
+    for _batch in mixed_allow:
+        seen_allow += 1
+    if seen_allow == 0:
+        raise RuntimeError("expected progress for on_source_exhausted=allow")
+    allow_stats = mixed_allow.stats()
+    policy = str(allow_stats.get("mix_source_exhaustion_policy", ""))
+    if policy != "allow":
+        raise RuntimeError(f"unexpected allow policy stat: {policy}")
+    exhausted_total = list(allow_stats.get("mix_source_exhausted_total", []))
+    if len(exhausted_total) != 2:
+        raise RuntimeError(f"unexpected exhausted_total shape: {exhausted_total}")
+    if sum(int(v) for v in exhausted_total) < 2:
+        raise RuntimeError(
+            f"expected exhausted counters for both sources, got={exhausted_total}"
+        )
 
 
 def _digest_seq(seq: list[tuple[str, int]]) -> str:
@@ -153,6 +250,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
+        on_source_exhausted="allow",
     )
     seq2, _stats2, max_inflight_2, max_rss_2 = _run_once(
         store_root=store_root,
@@ -166,6 +264,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
+        on_source_exhausted="allow",
     )
     seq3, _stats3, max_inflight_3, max_rss_3 = _run_once(
         store_root=store_root,
@@ -179,6 +278,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
+        on_source_exhausted="allow",
     )
     digest1 = _digest_seq(seq1)
     digest2 = _digest_seq(seq2)
@@ -201,6 +301,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
+        on_source_exhausted="allow",
     )
     seq_epoch_plus_one_b, _stats4b, _max_inflight_4b, _max_rss_4b = _run_once(
         store_root=store_root,
@@ -214,6 +315,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
+        on_source_exhausted="allow",
     )
     digest_epoch_plus_one_a = _digest_seq(seq_epoch_plus_one_a)
     digest_epoch_plus_one_b = _digest_seq(seq_epoch_plus_one_b)
@@ -269,6 +371,30 @@ def main() -> None:
             f"max_observed_rss={max_observed_rss} max_process_rss_bytes={max_process_rss_bytes}"
         )
 
+    exhaustion_policy = str(stats1.get("mix_source_exhaustion_policy", ""))
+    if exhaustion_policy != "allow":
+        raise RuntimeError(
+            f"unexpected source exhaustion policy in stats: {exhaustion_policy}"
+        )
+    exhausted_total = list(stats1.get("mix_source_exhausted_total", []))
+    if len(exhausted_total) != 2:
+        raise RuntimeError(f"unexpected mix_source_exhausted_total shape: {exhausted_total}")
+    if any(int(v) != 0 for v in exhausted_total):
+        raise RuntimeError(
+            f"mix_source_exhausted_total should remain zero in non-exhaustion run: {exhausted_total}"
+        )
+
+    if os.environ.get("MX8_MIX_GATE_CHECK_EXHAUSTION", "1") == "1":
+        _run_source_exhaustion_policy_checks(
+            store_root=store_root,
+            link_a=link_a,
+            link_b=link_b,
+            manifest_a=manifest_a,
+            manifest_b=manifest_b,
+            max_inflight_bytes=max_inflight_bytes,
+            max_process_rss_bytes=max_process_rss_bytes,
+        )
+
     print("mix_gate_summary")
     print("  strict_mode:", strict_mode)
     print("  steps:", steps)
@@ -292,6 +418,9 @@ def main() -> None:
     )
     print("  replay_determinism_runs=3: ok")
     print("  epoch_plus_one_replay_determinism: ok")
+    print("  source_exhaustion_policy_allow_stats: ok")
+    if os.environ.get("MX8_MIX_GATE_CHECK_EXHAUSTION", "1") == "1":
+        print("  source_exhaustion_policy_error_vs_allow: ok")
     if expect_epoch_drift:
         print("  epoch_drift_digest_change: ok")
 

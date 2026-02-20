@@ -228,19 +228,38 @@ Important fields:
 
 v0 training note: distributed data delivery is supported, but v0 is non-elastic (DDP rank death terminates training).
 
-## Planned: `mx8.mix(...)` (v1.7 contract draft)
+## `mx8.mix(...)` (v1.7)
 
-`mx8.mix` is the next API surface for deterministic weighted blending of multiple loaders under one bounded runtime envelope.
+`mx8.mix` provides deterministic weighted blending of multiple loaders under one shared bounded runtime envelope.
 
-Contract draft is tracked in `docs/mix_v17_contract.md`.
+```python
+import mx8
 
-Design targets:
-- deterministic replay of mixed order for fixed manifests/weights/seed/epoch/membership,
-- shared global backpressure and memory caps (no per-source unbounded queues),
-- explicit failure on source exhaustion in initial release (no silent source drop),
-- acceptance gates for determinism digest, ratio tolerance, and memory bounds.
+loader_a = mx8.load("s3://bucket/a@refresh", batch_size_samples=32)
+loader_b = mx8.load("s3://bucket/b@refresh", batch_size_samples=32)
 
-Current gate scaffold commands:
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=17,
+    epoch=3,
+    on_source_exhausted="error",  # default: fail fast
+)
+```
+
+Arguments:
+- `loaders`: list of `mx8.load(...)` loader instances.
+- `weights`: positive list, same length as `loaders`.
+- `seed`, `epoch`: deterministic scheduling inputs.
+- `starvation_window`: scheduler starvation accounting window.
+- `on_source_exhausted`: `error|allow` (default `error`).
+
+Behavior:
+- deterministic replay for fixed manifests/weights/seed/epoch/membership,
+- shared inflight cap safety via global mixed guard,
+- fail-fast source exhaustion by default (`error`) to avoid silent source drop.
+
+Gate commands:
 - `./scripts/mix_gate.sh`
 - strict mode: `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
 - smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
