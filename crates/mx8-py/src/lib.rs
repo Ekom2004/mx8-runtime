@@ -279,7 +279,7 @@ fn should_emit_mix_snapshot(schedule_ticks: u64, snapshot_period_ticks: u64) -> 
     if snapshot_period_ticks == 0 || schedule_ticks == 0 {
         return false;
     }
-    schedule_ticks % snapshot_period_ticks == 0
+    schedule_ticks.is_multiple_of(snapshot_period_ticks)
 }
 
 #[pyclass]
@@ -1211,7 +1211,10 @@ impl VideoDataLoader {
         }
         let path = std::path::PathBuf::from(&clip.media_uri);
         let bytes = std::fs::read(&path).map_err(|e| {
-            PyRuntimeError::new_err(format!("video decode read failed for {}: {e}", path.display()))
+            PyRuntimeError::new_err(format!(
+                "video decode read failed for {}: {e}",
+                path.display()
+            ))
         })?;
         if bytes.is_empty() {
             return Ok(Vec::new());
@@ -1240,7 +1243,8 @@ impl VideoDataLoader {
         let mut clip_ids = Vec::with_capacity(end_idx.saturating_sub(self.next_idx));
         let mut media_uris = Vec::with_capacity(end_idx.saturating_sub(self.next_idx));
         let mut clip_starts = Vec::with_capacity(end_idx.saturating_sub(self.next_idx));
-        let mut offsets = Vec::with_capacity(end_idx.saturating_sub(self.next_idx).saturating_add(1));
+        let mut offsets =
+            Vec::with_capacity(end_idx.saturating_sub(self.next_idx).saturating_add(1));
         offsets.push(0);
         let mut payload = Vec::<u8>::new();
 
@@ -1265,7 +1269,9 @@ impl VideoDataLoader {
 
         self.next_idx = end_idx;
         self.delivered_batches = self.delivered_batches.saturating_add(1);
-        self.delivered_samples = self.delivered_samples.saturating_add(sample_ids.len() as u64);
+        self.delivered_samples = self
+            .delivered_samples
+            .saturating_add(sample_ids.len() as u64);
         self.delivered_bytes = self.delivered_bytes.saturating_add(payload_bytes);
 
         let out = Py::new(
@@ -1293,7 +1299,10 @@ impl VideoDataLoader {
         out.set_item("bytes_per_clip", self.bytes_per_clip as u64)?;
         out.set_item("max_inflight_bytes", self.max_inflight_bytes)?;
         out.set_item("clips_total", self.clips.len() as u64)?;
-        out.set_item("clips_remaining", (self.clips.len().saturating_sub(self.next_idx)) as u64)?;
+        out.set_item(
+            "clips_remaining",
+            (self.clips.len().saturating_sub(self.next_idx)) as u64,
+        )?;
         out.set_item("video_delivered_batches_total", self.delivered_batches)?;
         out.set_item("video_delivered_samples_total", self.delivered_samples)?;
         out.set_item("video_delivered_bytes_total", self.delivered_bytes)?;
@@ -1838,9 +1847,12 @@ fn internal_video_index_build<'py>(
         epoch,
         max_clips_in_memory,
     };
-    let index =
-        build_video_stage1_index_from_manifest_bytes(&snapshot.manifest_hash, &snapshot.manifest_bytes, &cfg)
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+    let index = build_video_stage1_index_from_manifest_bytes(
+        &snapshot.manifest_hash,
+        &snapshot.manifest_bytes,
+        &cfg,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
     let index_tsv = canonicalize_video_stage1_tsv(&index.clips);
     let clip_index_hash = mx8_manifest_store::sha256_hex(&index_tsv);
 
@@ -1848,7 +1860,10 @@ fn internal_video_index_build<'py>(
     out.set_item("manifest_hash", snapshot.manifest_hash.0)?;
     out.set_item("video_schema_version", 1u64)?;
     out.set_item("clip_count", index.summary.clip_count)?;
-    out.set_item("tail_clips_dropped_total", index.summary.tail_clips_dropped_total)?;
+    out.set_item(
+        "tail_clips_dropped_total",
+        index.summary.tail_clips_dropped_total,
+    )?;
     out.set_item("clip_index_hash", clip_index_hash)?;
     out.set_item(
         "clip_ids_head",
@@ -1863,10 +1878,7 @@ fn internal_video_index_build<'py>(
         ),
     )?;
     let failure = PyDict::new_bound(py);
-    failure.set_item(
-        "corrupt_media",
-        index.summary.failure_counts.corrupt_media,
-    )?;
+    failure.set_item("corrupt_media", index.summary.failure_counts.corrupt_media)?;
     failure.set_item("short_media", index.summary.failure_counts.short_media)?;
     failure.set_item(
         "unsupported_codec",
@@ -2258,9 +2270,12 @@ fn video(
         epoch,
         max_clips_in_memory: env_usize("MX8_VIDEO_STAGE2_MAX_CLIPS_IN_MEMORY", 2_000_000),
     };
-    let index =
-        build_video_stage1_index_from_manifest_bytes(&snapshot.manifest_hash, &snapshot.manifest_bytes, &cfg)
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+    let index = build_video_stage1_index_from_manifest_bytes(
+        &snapshot.manifest_hash,
+        &snapshot.manifest_bytes,
+        &cfg,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
     let max_inflight_bytes = constraints
         .as_ref()
@@ -2412,7 +2427,10 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.setattr("vision", &vision)?;
     let internal = PyModule::new_bound(py, "_internal")?;
     internal.add_function(wrap_pyfunction!(internal_video_index_build, &internal)?)?;
-    internal.add_function(wrap_pyfunction!(internal_video_index_replay_check, &internal)?)?;
+    internal.add_function(wrap_pyfunction!(
+        internal_video_index_replay_check,
+        &internal
+    )?)?;
     m.add_submodule(&internal)?;
     m.setattr("_internal", &internal)?;
 
@@ -3676,8 +3694,7 @@ mod autotune_tests {
 #[cfg(test)]
 mod mix_scheduler_tests {
     use super::{
-        compute_shared_mix_cap, normalize_mix_weights, should_emit_mix_snapshot,
-        WeightedRoundRobin,
+        compute_shared_mix_cap, normalize_mix_weights, should_emit_mix_snapshot, WeightedRoundRobin,
     };
 
     #[test]
@@ -3773,7 +3790,9 @@ mod mix_scheduler_tests {
         let single_source_cap = 128u64;
         let single_source_inflight = [16u64, 40, 72, 96, 128, 92, 48, 0];
         let single_high_water = single_source_inflight.iter().copied().max().unwrap_or(0);
-        assert!(single_source_inflight.iter().all(|v| *v <= single_source_cap));
+        assert!(single_source_inflight
+            .iter()
+            .all(|v| *v <= single_source_cap));
         assert!(single_high_water <= single_source_cap);
 
         // Mixed mode uses shared cap = min(source caps), which should match baseline cap.
@@ -3814,23 +3833,20 @@ mod mix_scheduler_tests {
         // When total inflight exceeds shared cap, scheduler should be considered blocked.
         let shared_cap = compute_shared_mix_cap(&[128, 256]).expect("shared cap");
         let inflight_pairs = [
-            (40u64, 30u64),  // below cap
-            (90, 50),        // above cap -> block
-            (80, 60),        // above cap -> block
-            (64, 32),        // below cap
-            (110, 30),       // above cap -> block
-            (48, 16),        // below cap
+            (40u64, 30u64), // below cap
+            (90, 50),       // above cap -> block
+            (80, 60),       // above cap -> block
+            (64, 32),       // below cap
+            (110, 30),      // above cap -> block
+            (48, 16),       // below cap
         ];
 
         let mut blocked_ticks = 0u64;
         let mut delivered_ticks = 0u64;
         let mut source_a_deliveries = 0u64;
         let mut source_b_deliveries = 0u64;
-        let mut rr = WeightedRoundRobin::new(
-            normalize_mix_weights(&[1.0, 1.0]).expect("weights"),
-            0,
-            0,
-        );
+        let mut rr =
+            WeightedRoundRobin::new(normalize_mix_weights(&[1.0, 1.0]).expect("weights"), 0, 0);
         let active = vec![true, true];
 
         for (a, b) in inflight_pairs {
@@ -3848,7 +3864,10 @@ mod mix_scheduler_tests {
             }
         }
 
-        assert_eq!(blocked_ticks, 3, "expected pressure to block exactly 3 ticks");
+        assert_eq!(
+            blocked_ticks, 3,
+            "expected pressure to block exactly 3 ticks"
+        );
         assert_eq!(delivered_ticks, 3);
         assert!(source_a_deliveries > 0 && source_b_deliveries > 0);
     }

@@ -301,7 +301,9 @@ pub fn parse_video_stage1_tsv(bytes: &[u8]) -> Result<Vec<VideoClipRecord>, Vide
     Ok(records)
 }
 
-fn parse_canonical_manifest_tsv_bytes(bytes: &[u8]) -> Result<Vec<ManifestRecord>, VideoStage1Error> {
+fn parse_canonical_manifest_tsv_bytes(
+    bytes: &[u8],
+) -> Result<Vec<ManifestRecord>, VideoStage1Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| VideoStage1Error::ManifestParse(format!("manifest is not utf-8: {e}")))?;
     let mut lines = text.lines();
@@ -374,7 +376,9 @@ fn parse_canonical_manifest_tsv_bytes(bytes: &[u8]) -> Result<Vec<ManifestRecord
     Ok(records)
 }
 
-fn parse_video_hint(fields: &BTreeMap<String, String>) -> Result<ParsedVideoHint, VideoStage1Error> {
+fn parse_video_hint(
+    fields: &BTreeMap<String, String>,
+) -> Result<ParsedVideoHint, VideoStage1Error> {
     let frames = fields
         .get("frames")
         .ok_or_else(|| VideoStage1Error::ManifestParse("decode_hint missing frames".to_string()))?
@@ -386,7 +390,9 @@ fn parse_video_hint(fields: &BTreeMap<String, String>) -> Result<ParsedVideoHint
             VideoStage1Error::ManifestParse("decode_hint missing stream_id".to_string())
         })?
         .parse::<u32>()
-        .map_err(|_| VideoStage1Error::ManifestParse("decode_hint stream_id invalid".to_string()))?;
+        .map_err(|_| {
+            VideoStage1Error::ManifestParse("decode_hint stream_id invalid".to_string())
+        })?;
     Ok(ParsedVideoHint { frames, stream_id })
 }
 
@@ -470,7 +476,11 @@ mod tests {
         )];
         let first = build_video_stage1_index(&hash, &records, &cfg()).expect("index");
         let second = build_video_stage1_index(&hash, &records, &cfg()).expect("index");
-        let first_ids = first.clips.iter().map(|r| r.clip_id.clone()).collect::<Vec<_>>();
+        let first_ids = first
+            .clips
+            .iter()
+            .map(|r| r.clip_id.clone())
+            .collect::<Vec<_>>();
         let second_ids = second
             .clips
             .iter()
@@ -488,11 +498,7 @@ mod tests {
                 "s3://bucket/corrupt.mp4",
                 "mx8:video;frames=20;stream_id=0;corrupt=true",
             ),
-            record(
-                1,
-                "s3://bucket/short.mp4",
-                "mx8:video;frames=2;stream_id=0",
-            ),
+            record(1, "s3://bucket/short.mp4", "mx8:video;frames=2;stream_id=0"),
             record(
                 2,
                 "s3://bucket/codec.mp4",

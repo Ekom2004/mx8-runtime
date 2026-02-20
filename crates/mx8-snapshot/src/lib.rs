@@ -564,7 +564,9 @@ fn is_supported_video_codec(codec: &str) -> bool {
     )
 }
 
-fn probe_video_with_ffprobe(path: &std::path::Path) -> Result<Option<(u64, String)>, SnapshotError> {
+fn probe_video_with_ffprobe(
+    path: &std::path::Path,
+) -> Result<Option<(u64, String)>, SnapshotError> {
     let out = std::process::Command::new("ffprobe")
         .arg("-v")
         .arg("error")
@@ -599,14 +601,20 @@ fn probe_video_with_ffprobe(path: &std::path::Path) -> Result<Option<(u64, Strin
     let mut parts = line.split(',');
     let codec = parts.next().unwrap_or("").trim().to_ascii_lowercase();
     let frames_raw = parts.next().unwrap_or("").trim();
-    let frames = frames_raw.parse::<u64>().ok().filter(|v| *v > 0).unwrap_or(1);
+    let frames = frames_raw
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v > 0)
+        .unwrap_or(1);
     if codec.is_empty() {
         return Ok(Some((frames, "corrupt".to_string())));
     }
     Ok(Some((frames, codec)))
 }
 
-fn stage1_video_decode_hint_for_local(path: &std::path::Path) -> Result<Option<String>, SnapshotError> {
+fn stage1_video_decode_hint_for_local(
+    path: &std::path::Path,
+) -> Result<Option<String>, SnapshotError> {
     if !snapshot_env_bool("MX8_VIDEO_STAGE1_INDEX", false) {
         return Ok(None);
     }
@@ -628,15 +636,21 @@ fn stage1_video_decode_hint_for_local(path: &std::path::Path) -> Result<Option<S
         }
         Some((frames, codec)) => (frames, codec),
         None => {
-            let bytes_per_frame_estimate = std::env::var("MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(50_000);
+            let bytes_per_frame_estimate =
+                std::env::var("MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(50_000);
             let file_len = std::fs::metadata(path)
-                .map_err(|e| SnapshotError::IndexIo(format!("stat {} failed: {e}", path.display())))?
+                .map_err(|e| {
+                    SnapshotError::IndexIo(format!("stat {} failed: {e}", path.display()))
+                })?
                 .len();
-            let est_frames = file_len.max(1).saturating_div(bytes_per_frame_estimate).max(1);
+            let est_frames = file_len
+                .max(1)
+                .saturating_div(bytes_per_frame_estimate)
+                .max(1);
             (est_frames, codec_from_extension(path).to_string())
         }
     };
@@ -652,7 +666,10 @@ fn stage1_video_decode_hint_for_local(path: &std::path::Path) -> Result<Option<S
 }
 
 #[cfg(feature = "s3")]
-fn stage1_video_decode_hint_for_s3_key(key: &str, object_size_bytes: Option<i64>) -> Option<String> {
+fn stage1_video_decode_hint_for_s3_key(
+    key: &str,
+    object_size_bytes: Option<i64>,
+) -> Option<String> {
     if !snapshot_env_bool("MX8_VIDEO_STAGE1_INDEX", false) {
         return None;
     }
@@ -665,8 +682,13 @@ fn stage1_video_decode_hint_for_s3_key(key: &str, object_size_bytes: Option<i64>
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(50_000);
-    let size_u64 = object_size_bytes.and_then(|v| u64::try_from(v).ok()).unwrap_or(1);
-    let est_frames = size_u64.max(1).saturating_div(bytes_per_frame_estimate).max(1);
+    let size_u64 = object_size_bytes
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(1);
+    let est_frames = size_u64
+        .max(1)
+        .saturating_div(bytes_per_frame_estimate)
+        .max(1);
     let codec = codec_from_extension(path);
     let codec_field = if is_supported_video_codec(codec) {
         codec.to_string()
@@ -1365,24 +1387,24 @@ fn index_s3_prefix(
                     sample_id, location
                 )));
             }
-            let decode_hint = if let Some(video_hint) = stage1_video_decode_hint_for_s3_key(&key, None)
-            {
-                Some(video_hint)
-            } else if use_imagefolder_labels {
-                let label = imagefolder_label_for_key(&prefix, &key).ok_or_else(|| {
-                    SnapshotError::S3Index(format!(
+            let decode_hint =
+                if let Some(video_hint) = stage1_video_decode_hint_for_s3_key(&key, None) {
+                    Some(video_hint)
+                } else if use_imagefolder_labels {
+                    let label = imagefolder_label_for_key(&prefix, &key).ok_or_else(|| {
+                        SnapshotError::S3Index(format!(
                         "label missing under imagefolder mode (sample_id={sample_id}, key={key})"
                     ))
-                })?;
-                let label_id = *label_map.get(&label).ok_or_else(|| {
-                    SnapshotError::S3Index(format!(
+                    })?;
+                    let label_id = *label_map.get(&label).ok_or_else(|| {
+                        SnapshotError::S3Index(format!(
                         "label not present in label map (sample_id={sample_id}, label={label:?})"
                     ))
-                })?;
-                Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
-            } else {
-                None
-            };
+                    })?;
+                    Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
+                } else {
+                    None
+                };
             if let Some(hint) = decode_hint.as_deref() {
                 if hint.starts_with("mx8:video;") {
                     video_hints_emitted_total = video_hints_emitted_total.saturating_add(1);
@@ -1624,25 +1646,25 @@ fn index_s3_prefix(
                             sample_id, location
                         )));
                     }
-                    let decode_hint =
-                        if let Some(video_hint) = stage1_video_decode_hint_for_s3_key(&k, key_size)
-                        {
-                            Some(video_hint)
-                        } else if use_imagefolder_labels {
-                            let label = imagefolder_label_for_key(&prefix, &k).ok_or_else(|| {
+                    let decode_hint = if let Some(video_hint) =
+                        stage1_video_decode_hint_for_s3_key(&k, key_size)
+                    {
+                        Some(video_hint)
+                    } else if use_imagefolder_labels {
+                        let label = imagefolder_label_for_key(&prefix, &k).ok_or_else(|| {
                                 SnapshotError::S3Index(format!(
                                     "label missing under imagefolder mode (sample_id={sample_id}, key={k})"
                                 ))
                             })?;
-                            let label_id = *label_map.get(&label).ok_or_else(|| {
+                        let label_id = *label_map.get(&label).ok_or_else(|| {
                                 SnapshotError::S3Index(format!(
                                     "label not present in label map (sample_id={sample_id}, label={label:?})"
                                 ))
                             })?;
-                            Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
-                        } else {
-                            None
-                        };
+                        Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
+                    } else {
+                        None
+                    };
                     if let Some(hint) = decode_hint.as_deref() {
                         if hint.starts_with("mx8:video;") {
                             video_hints_emitted_total = video_hints_emitted_total.saturating_add(1);
