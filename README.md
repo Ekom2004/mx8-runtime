@@ -1,21 +1,29 @@
-# MX8 Runtime (v0)
+# MX8 Runtime
 
-MX8 is a bounded, high-performance Rust data runtime (with Python bindings) plus a tiny per-job coordinator/agent layer for multi-node correctness.
+MX8 is a bounded Rust data runtime with Python bindings for ML data loading at S3 scale.
 
-It is optimized for inference/ETL/preprocessing today, with training support under v0 non-elastic semantics.
+It focuses on one hard contract: keep data delivery fast, deterministic, and memory-bounded across single-node and distributed jobs.
 
-## What Works Today (Front-page status)
+## Why MX8
 
-- **Zero-manifest path is live:** `mx8d-agent` runs direct-stream manifest ingest for lease execution.
-- **Distributed lease flow is live:** membership barrier, lease grant/progress, expiry, and requeue/reassignment are exercised by demos/gates.
-- **Bounded memory runtime is live:** inflight byte caps + queue backpressure are enforced.
-- **Pinned snapshot semantics are live:** `plain`, `@refresh`, and `@sha256:` resolve to `manifest_hash`.
-- **S3-compatible path is live:** MinIO gates verify resolver + runtime behavior.
-- **Python path is live:** PyO3 package + smoke scripts are available.
-- **Autotune preview is live:** hybrid AIMD + PID-like control adjusts `want`, `prefetch_batches`, and `max_queue_batches` within profile rails (`safe|balanced|throughput`).
-- **Video Stage 3A rails are live:** `MX8_VIDEO_DECODE_BACKEND=cli|ffi` selection exists with proof-log fallback to CLI when FFI is unavailable/fails.
+- **Bounded memory by design:** hard inflight caps + queue backpressure.
+- **Deterministic snapshots:** dataset links resolve to pinned `manifest_hash`.
+- **Distributed correctness rails:** lease grant/progress/expiry/requeue with proof logs.
+- **S3-native workflows:** MinIO/S3-compatible gates and packing path for many-small-object datasets.
+- **Simple Python surface:** `pip install mx8` and start with `mx8.load(...)`.
 
-## Quickstart (current API)
+## Shipped Today (Main Branch)
+
+- `mx8.load(...)` byte-oriented runtime for ETL/inference/preprocess.
+- `mx8.DistributedDataLoader` for multi-rank data delivery.
+- Snapshot resolver (`plain`, `@refresh`, `@sha256:`).
+- Zero-manifest direct-stream ingest path in `mx8d-agent`.
+- Autotune preview (`safe|balanced|throughput`) for `want`, `prefetch_batches`, `max_queue_batches`.
+- Vision loader (`mx8.vision.ImageFolderLoader`) + packers (`mx8.pack`, `mx8.pack_dir`).
+- Video loader scaffold (`mx8.video`) with Stage 2A/2B/2D contracts.
+- Video Stage 3A backend rails: `MX8_VIDEO_DECODE_BACKEND=cli|ffi` with fallback proof log (`video_decode_backend_fallback`).
+
+## 60-Second Quickstart
 
 ```python
 import mx8
@@ -25,133 +33,54 @@ loader = mx8.load(
     recursive=True,
     profile="balanced",
     autotune=True,
+    constraints=mx8.Constraints(
+        max_inflight_bytes=256 * 1024 * 1024,
+    ),
 )
 
 for batch in loader:
-    # consume batch.payload / batch.offsets / batch.sample_ids
-    pass
+    payload = batch.payload
+    offsets = batch.offsets
+    sample_ids = batch.sample_ids
 ```
 
-## Current v0 Constraints
+Install:
 
-- Training is **non-elastic** in v0: rank/node failure will terminate DDP jobs.
-- Cursor semantics are at-least-once at boundaries for inference/ETL (no exactly-once guarantee in v0).
-- Refresh is job-start only (no mid-run pickup).
+- `pip install mx8`
+- For vision/training helpers: `pip install pillow numpy torch`
 
-## Quick Verify Commands
+## v0 Boundaries (Explicit)
 
-- **Main smoke gate:** `./scripts/smoke.sh`
-- **Zero-manifest accelerated burn-in:** `MX8_BURNIN_RUNS=3 ./scripts/direct_stream_burnin.sh`
-- **Autotune A/B DDP gate:** `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
-- **Autotune pressure simulation:** `./scripts/autotune_memory_pressure_sim.sh`
-- **Python smoke:** `./scripts/py_smoke.sh`
-- **Wheel + pip smoke:** `./scripts/build_wheel.sh && ./scripts/pip_wheel_smoke.sh`
-- **MinIO/S3-compatible gates:** `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
-- **Video Stage 3A backend parity gate:** `./scripts/video_stage3a_backend_gate.sh`
+- Training is **non-elastic** in v0 (rank/node loss ends DDP training run).
+- Inference/ETL cursor semantics are at-least-once at boundaries (not exactly-once).
+- `@refresh` resolution is job-start scoped (no mid-run dataset refresh).
 
-## Key Capability Areas
+## Operational Gates
 
-### Bounded Memory Runtime
+- Main smoke: `./scripts/smoke.sh`
+- Python smoke: `./scripts/py_smoke.sh`
+- Wheel smoke: `./scripts/build_wheel.sh && ./scripts/pip_wheel_smoke.sh`
+- Zero-manifest burn-in: `MX8_BURNIN_RUNS=3 ./scripts/direct_stream_burnin.sh`
+- DDP autotune A/B: `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
+- Autotune pressure simulation: `./scripts/autotune_memory_pressure_sim.sh`
+- Video Stage 3A backend parity: `./scripts/video_stage3a_backend_gate.sh`
 
-MX8 is designed to be hard-capped by config (backpressure via inflight permits).
+## Video (Preview)
 
-Need explicit memory rails? Use:
+- `mx8.video(...)` is available as a preview API for clip-oriented delivery.
+- Current default decode backend is `ffmpeg` CLI.
+- Video S3 range-streaming is in progress; use image/ETL paths for production-critical workloads today.
 
-```python
-loader = mx8.load(
-    "s3://bucket/prefix/@refresh",
-    profile="balanced",
-    autotune=True,
-    constraints=mx8.Constraints(
-        max_inflight_bytes=256 * 1024 * 1024,
-        max_process_rss_bytes=24 * 1024 * 1024 * 1024,
-    ),
-)
-```
+## Docs Map
 
-Note: `max_inflight_bytes` caps loader-path memory. Total process RSS includes model/framework/user allocations.
-
-### Autotune (AIMD + PID-like rails)
-
-Autotune is available as a preview path in v0 and is exposed through the Python loader API and distributed gate scripts.
-
-- Profiles: `safe`, `balanced`, `throughput`
-- Controller intent: increase throughput while staying inside explicit memory/safety constraints
-- Runtime knobs adjusted by autotune:
-  - `want` (distributed lease demand)
-  - `prefetch_batches`
-  - `max_queue_batches`
-- Env controls (distributed path):
-  - `MX8_AUTOTUNE=1`
-  - `MX8_AUTOTUNE_PROFILE=safe|balanced|throughput` (default `balanced`)
-
-### Packing (Many Small Objects)
-
-For many-small-object S3 datasets, pack once into tar shards + byte-range manifest:
-
-- Input: `s3://bucket/raw/train/`
-- Output: `s3://bucket/mx8/train/`
-  - `shards/shard-00000.tar`
-  - `_mx8/manifest.tsv`
-  - optional `_mx8/labels.tsv`
-
-CLI example:
-
-- `MX8_PACK_IN=s3://bucket/raw/train/ MX8_PACK_OUT=s3://bucket/mx8/train/ cargo run -p mx8-snapshot --features s3 --bin mx8-pack-s3`
-
-Python example:
-
-- `python -c "import mx8; mx8.pack('s3://bucket/raw/train/', out='s3://bucket/mx8/train/', shard_mb=512, label_mode='auto')"`
-
-### Vision (ImageFolder -> Torch tensors)
-
-```python
-import mx8
-
-loader = mx8.vision.ImageFolderLoader(
-    "s3://bucket/mx8/train/@refresh",
-    batch_size_samples=64,
-    resize_hw=(224, 224),
-)
-
-for images, labels in loader:
-    # images: [B,C,H,W] float32 in [0,1]
-    # labels: [B] int64
-    pass
-```
-
-### Video “Virtual Seek” Status (Shipped vs Target)
-
-**What ships today**
-
-- Clip-oriented video API and decode contract gates are live (v1.8 Stage 2A/2B).
-- Deterministic Stage 2D range-planning contract is live (`video_range_schema_version=1` + planner gate).
-- Current decode path is CPU (`ffmpeg` CLI), with bounded runtime caps.
-- Stage 3A backend selection rails are live:
-  - default: `MX8_VIDEO_DECODE_BACKEND=cli`
-  - opt-in: `MX8_VIDEO_DECODE_BACKEND=ffi` (requires native ffmpeg bindings at build-time)
-  - safety: automatic fallback to CLI with proof logs (`event="video_decode_backend_fallback"`)
-
-**What is next (Virtual Seek target)**
-
-- Execute S3 `Range` GETs directly from Stage 2D plans.
-- Decode clips from fetched segments without full-object temp download on supported datasets.
-- Emit proof logs/counters for plan/fetch/fallback so no-download claims are measurable.
-
-Determinism contract for this path is pinned by `manifest_hash + sidecar schema/hash + sampling seed`.
-
-## Current Docs
-
-- Python API: `docs/python_api.md`
-- Vision labels/layouts: `docs/vision_labels.md`
+- Product architecture: `ARCHITECTURE.MD`
+- Implementation plan + milestones: `implementation.md`
+- Python API reference: `docs/python_api.md`
+- Memory model/caps: `docs/memory_contract.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
-- Memory contract: `docs/memory_contract.md`
 - Troubleshooting: `docs/troubleshooting.md`
-- AI agent guide: `docs/ai_agent_guide.md`
-- AI agent context: `docs/ai_agent_context.json`
-- Video Stage 3A release notes: `docs/release_stage3a_backend_runbook.md`
 
-## Roadmap Next (after v1.6)
+## Near-Term Roadmap
 
-- **v1.7 `mx8.mix`:** deterministic weighted mixing across multiple loaders with shared global memory/backpressure caps.
-- **v1.8 video-native path:** clip-level indexing/decode hardening on top of current bounded runtime.
+- **Dataset mixing (`mx8.mix`)** for multi-source training/inference pipelines.
+- **Video-native hardening** for range-streaming and decode reliability at scale.
