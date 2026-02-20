@@ -155,7 +155,21 @@ Current staged contract:
 - batch metadata: `frames_per_clip`, `frame_height`, `frame_width`, `channels`, `layout`, `dtype`, `colorspace`, `strides`
 - offsets are monotonic and `offsets[-1] == len(payload)`
 - init rejects invalid cap combinations (`batch_size_samples * bytes_per_clip > max_inflight_bytes`)
-- current CPU decode backend uses local `ffmpeg` CLI (`MX8_FFMPEG_BIN` override, default `ffmpeg`)
+- default decode backend uses local `ffmpeg` CLI (`MX8_FFMPEG_BIN` override, default `ffmpeg`)
+
+Video decode backend selection (Stage 3A):
+
+- `MX8_VIDEO_DECODE_BACKEND=cli` (default): CLI decode path
+- `MX8_VIDEO_DECODE_BACKEND=ffi`: native-FFI decode path (compile-time gated)
+- if `ffi` is requested but not compiled/available, MX8 falls back to `cli` and emits proof log `event="video_decode_backend_fallback"`
+
+Native FFI build notes:
+
+- native ffmpeg backend is only compiled when built with: `RUSTFLAGS="--cfg mx8_video_ffi"`
+- typical prerequisites include `pkg-config` plus ffmpeg development libs
+- Stage 3A parity gate command:
+  - default build path: `./scripts/video_stage3a_backend_gate.sh`
+  - FFI-compiled path: `RUSTFLAGS="--cfg mx8_video_ffi" ./scripts/video_stage3a_backend_gate.sh`
 
 Virtual Seek status:
 
@@ -166,6 +180,7 @@ Virtual Seek status:
 `loader.stats()` also includes video decode contract + reliability counters:
 
 - contract: `video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_stride_t/h/w/c`, `video_clip_bytes`
+- backend: `video_decode_backend` (`cli|ffi`)
 - runtime decode counters: `video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_*_total`, `video_decode_failed_total`, `video_decode_ms_total`
 
 Internal contract and gate checklist:
@@ -178,6 +193,8 @@ Internal contract and gate checklist:
 - `./scripts/video_stage2c_perf_gate.sh`
 - `docs/video_stage2c_perf_baseline.md`
 - `docs/release_stage2c_runbook.md`
+- `./scripts/video_stage3a_backend_gate.sh`
+- `docs/release_stage3a_backend_runbook.md`
 
 Runtime proof logs (target: `mx8_proof`) now include:
 

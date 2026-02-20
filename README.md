@@ -13,6 +13,7 @@ It is optimized for inference/ETL/preprocessing today, with training support und
 - **S3-compatible path is live:** MinIO gates verify resolver + runtime behavior.
 - **Python path is live:** PyO3 package + smoke scripts are available.
 - **Autotune preview is live:** hybrid AIMD + PID-like control adjusts `want`, `prefetch_batches`, and `max_queue_batches` within profile rails (`safe|balanced|throughput`).
+- **Video Stage 3A rails are live:** `MX8_VIDEO_DECODE_BACKEND=cli|ffi` selection exists with proof-log fallback to CLI when FFI is unavailable/fails.
 
 ## Quickstart (current API)
 
@@ -46,6 +47,7 @@ for batch in loader:
 - **Python smoke:** `./scripts/py_smoke.sh`
 - **Wheel + pip smoke:** `./scripts/build_wheel.sh && ./scripts/pip_wheel_smoke.sh`
 - **MinIO/S3-compatible gates:** `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
+- **Video Stage 3A backend parity gate:** `./scripts/video_stage3a_backend_gate.sh`
 
 ## Key Capability Areas
 
@@ -125,6 +127,10 @@ for images, labels in loader:
 - Clip-oriented video API and decode contract gates are live (v1.8 Stage 2A/2B).
 - Deterministic Stage 2D range-planning contract is live (`video_range_schema_version=1` + planner gate).
 - Current decode path is CPU (`ffmpeg` CLI), with bounded runtime caps.
+- Stage 3A backend selection rails are live:
+  - default: `MX8_VIDEO_DECODE_BACKEND=cli`
+  - opt-in: `MX8_VIDEO_DECODE_BACKEND=ffi` (requires native ffmpeg bindings at build-time)
+  - safety: automatic fallback to CLI with proof logs (`event="video_decode_backend_fallback"`)
 
 **What is next (Virtual Seek target)**
 
@@ -143,6 +149,7 @@ Determinism contract for this path is pinned by `manifest_hash + sidecar schema/
 - Troubleshooting: `docs/troubleshooting.md`
 - AI agent guide: `docs/ai_agent_guide.md`
 - AI agent context: `docs/ai_agent_context.json`
+- Video Stage 3A release notes: `docs/release_stage3a_backend_runbook.md`
 
 ## Roadmap Next (after v1.6)
 
