@@ -167,6 +167,8 @@ Internal contract and gate checklist:
 - `docs/internal_video_stage2b_contract.md`
 - `./scripts/video_stage2b_gate.sh`
 - `./scripts/video_stage2b_stress_gate.sh`
+- `./scripts/video_stage2b_clean_env_gate.sh`
+- `docs/video_stage2b_clean_env_runbook.md`
 
 Runtime proof logs (target: `mx8_proof`) now include:
 

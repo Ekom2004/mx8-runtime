@@ -150,4 +150,9 @@ if [[ "${MX8_SMOKE_VIDEO_STAGE2B_STRESS:-0}" == "1" ]]; then
   ./scripts/video_stage2b_stress_gate.sh
 fi
 
+if [[ "${MX8_SMOKE_VIDEO_STAGE2B_CLEAN_ENV:-0}" == "1" ]]; then
+  echo "[mx8] video_stage2b_clean_env_gate (v1.8 stage-2b clean-environment reproducibility gate)"
+  ./scripts/video_stage2b_clean_env_gate.sh
+fi
+
 echo "[mx8] smoke OK"
