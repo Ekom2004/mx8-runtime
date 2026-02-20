@@ -127,7 +127,11 @@ fi
 
 if [[ "${MX8_SMOKE_MIX:-0}" == "1" ]]; then
   echo "[mx8] mix_gate (v1.7 weighted round-robin scheduler gate)"
-  ./scripts/mix_gate.sh
+  if [[ "${MX8_SMOKE_MIX_STRICT:-0}" == "1" ]]; then
+    MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh
+  else
+    ./scripts/mix_gate.sh
+  fi
 fi
 
 if [[ "${MX8_SMOKE_VIDEO_STAGE1:-0}" == "1" ]]; then

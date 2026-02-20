@@ -240,7 +240,10 @@ Design targets:
 - explicit failure on source exhaustion in initial release (no silent source drop),
 - acceptance gates for determinism digest, ratio tolerance, and memory bounds.
 
-Current gate scaffold command: `./scripts/mix_gate.sh`
+Current gate scaffold commands:
+- `./scripts/mix_gate.sh`
+- strict mode: `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
+- smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
 
 ## API shape (v0 vs v1 direction)
 

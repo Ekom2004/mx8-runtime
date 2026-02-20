@@ -62,6 +62,8 @@ Install:
 - Wheel smoke: `./scripts/build_wheel.sh && ./scripts/pip_wheel_smoke.sh`
 - Zero-manifest burn-in: `MX8_BURNIN_RUNS=3 ./scripts/direct_stream_burnin.sh`
 - Mix gate: `./scripts/mix_gate.sh`
+- Mix gate strict (CI profile): `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
+- Mix gate via smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
 - DDP autotune A/B: `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
 - Autotune pressure simulation: `./scripts/autotune_memory_pressure_sim.sh`
 - Video Stage 3A backend parity: `./scripts/video_stage3a_backend_gate.sh`
@@ -78,6 +80,7 @@ Install:
 - Product architecture: `ARCHITECTURE.MD`
 - Python API reference: `docs/python_api.md`
 - `mx8.mix` v1.7 contract draft: `docs/mix_v17_contract.md`
+- `mx8.mix` gate runbook: `docs/mix_gate_runbook.md`
 - Memory model/caps: `docs/memory_contract.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
 - Troubleshooting: `docs/troubleshooting.md`

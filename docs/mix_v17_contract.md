@@ -58,3 +58,7 @@ the mixed stream order is deterministic and replayable.
 Gate command:
 
 - `./scripts/mix_gate.sh`
+- strict mode: `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
+- smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
+- smoke strict toggle: `MX8_SMOKE_MIX=1 MX8_SMOKE_MIX_STRICT=1 ./scripts/smoke.sh`
+- runbook: `docs/mix_gate_runbook.md`

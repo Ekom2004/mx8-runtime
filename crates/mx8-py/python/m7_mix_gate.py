@@ -122,6 +122,11 @@ def main() -> None:
     seed = int(os.environ.get("MX8_MIX_GATE_SEED", "17"))
     epoch = int(os.environ.get("MX8_MIX_GATE_EPOCH", "3"))
     ratio_tol = float(os.environ.get("MX8_MIX_GATE_RATIO_TOL", "0.02"))
+    strict_mode = os.environ.get("MX8_MIX_GATE_STRICT", "0") == "1"
+    expect_epoch_drift = os.environ.get(
+        "MX8_MIX_GATE_EXPECT_EPOCH_DRIFT",
+        "1" if strict_mode else "0",
+    ) == "1"
     max_inflight_bytes = int(os.environ.get("MX8_MIX_GATE_MAX_INFLIGHT_BYTES", str(8 * 1024 * 1024)))
     max_process_rss_bytes = int(
         os.environ.get("MX8_MIX_GATE_MAX_PROCESS_RSS_BYTES", str(2 * 1024 * 1024 * 1024))
@@ -214,6 +219,10 @@ def main() -> None:
     digest_epoch_plus_one_b = _digest_seq(seq_epoch_plus_one_b)
     if digest_epoch_plus_one_a != digest_epoch_plus_one_b:
         raise RuntimeError("mix replay mismatch for repeated epoch+1 run")
+    if expect_epoch_drift and digest_epoch_plus_one_a == digest1:
+        raise RuntimeError(
+            "mix epoch drift expectation failed: epoch+1 digest matched base epoch digest"
+        )
 
     realized = list(stats1.get("mix_realized_ratio", []))
     if len(realized) != 2:
@@ -261,6 +270,7 @@ def main() -> None:
         )
 
     print("mix_gate_summary")
+    print("  strict_mode:", strict_mode)
     print("  steps:", steps)
     print("  weights:", weights)
     print("  target_ratio:", target_ratio)
@@ -282,6 +292,8 @@ def main() -> None:
     )
     print("  replay_determinism_runs=3: ok")
     print("  epoch_plus_one_replay_determinism: ok")
+    if expect_epoch_drift:
+        print("  epoch_drift_digest_change: ok")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ set -euo pipefail
 # Optional tuning:
 #   MX8_MIX_GATE_STEPS=400 MX8_MIX_GATE_RATIO_TOL=0.02 ./scripts/mix_gate.sh
 #   MX8_MIX_GATE_WEIGHTS=0.8,0.2 ./scripts/mix_gate.sh
+# Strict mode (CI-oriented):
+#   MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
@@ -18,6 +20,18 @@ cd "${ROOT}"
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[mx8] python3 not found on PATH" >&2
   exit 1
+fi
+
+STRICT_MODE="${MX8_MIX_GATE_STRICT:-0}"
+if [[ "${STRICT_MODE}" == "1" ]]; then
+  export MX8_TOTAL_SAMPLES="${MX8_TOTAL_SAMPLES:-4096}"
+  export MX8_MIX_GATE_STEPS="${MX8_MIX_GATE_STEPS:-600}"
+  export MX8_MIX_GATE_RATIO_TOL="${MX8_MIX_GATE_RATIO_TOL:-0.01}"
+  export MX8_MIX_GATE_EXPECT_EPOCH_DRIFT="${MX8_MIX_GATE_EXPECT_EPOCH_DRIFT:-0}"
+  export MX8_MIX_SNAPSHOT_PERIOD_TICKS="${MX8_MIX_SNAPSHOT_PERIOD_TICKS:-16}"
+  echo "[mx8] mix gate strict mode enabled (total_samples=${MX8_TOTAL_SAMPLES} steps=${MX8_MIX_GATE_STEPS} ratio_tol=${MX8_MIX_GATE_RATIO_TOL})"
+else
+  export MX8_MIX_GATE_EXPECT_EPOCH_DRIFT="${MX8_MIX_GATE_EXPECT_EPOCH_DRIFT:-0}"
 fi
 
 echo "[mx8] mix gate: cargo test -p mx8-py mix_"
