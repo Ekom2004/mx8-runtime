@@ -55,6 +55,10 @@ type TorchBatch4<'py> = (
     Bound<'py, PyAny>,
 );
 
+const VIDEO_LAYOUT: &str = "thwc";
+const VIDEO_DTYPE: &str = "u8";
+const VIDEO_COLORSPACE: &str = "rgb24";
+
 #[derive(Debug, Clone, Copy)]
 enum DecodeBackend {
     Rust,
@@ -141,6 +145,14 @@ struct VideoBatch {
     clip_starts: Vec<u64>,
     offsets: Vec<u64>,
     payload: Vec<u8>,
+    frames_per_clip: u32,
+    frame_height: u32,
+    frame_width: u32,
+    channels: u32,
+    stride_t: u64,
+    stride_h: u64,
+    stride_w: u64,
+    stride_c: u64,
 }
 
 #[pyclass]
@@ -151,6 +163,7 @@ struct VideoDataLoader {
     batch_size_samples: usize,
     max_inflight_bytes: u64,
     bytes_per_clip: usize,
+    decode_contract: VideoDecodeContract,
     seed: u64,
     epoch: u64,
     clip_len: u32,
@@ -160,6 +173,36 @@ struct VideoDataLoader {
     delivered_batches: u64,
     delivered_samples: u64,
     delivered_bytes: u64,
+    decode_attempted_clips: u64,
+    decode_succeeded_clips: u64,
+    decode_failed_io_read_failed: u64,
+    decode_failed_corrupt_media: u64,
+    decode_failed_short_media: u64,
+    decode_failed_unsupported_codec: u64,
+    decode_failed_missing_stream: u64,
+    decode_failed_backend_unavailable: u64,
+    decode_failed_decode_failed: u64,
+    decode_ms_total: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VideoDecodeContract {
+    frames_per_clip: u32,
+    frame_height: u32,
+    frame_width: u32,
+    channels: u32,
+    stride_t: u64,
+    stride_h: u64,
+    stride_w: u64,
+    stride_c: u64,
+    clip_bytes: u64,
+}
+
+#[derive(Debug)]
+struct VideoDecodeError {
+    class: &'static str,
+    path: PathBuf,
+    detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1202,29 +1245,98 @@ impl VideoBatch {
     fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         Ok(PyBytes::new_bound(py, &self.payload))
     }
+
+    #[getter]
+    fn frames_per_clip(&self) -> u32 {
+        self.frames_per_clip
+    }
+
+    #[getter]
+    fn frame_height(&self) -> u32 {
+        self.frame_height
+    }
+
+    #[getter]
+    fn frame_width(&self) -> u32 {
+        self.frame_width
+    }
+
+    #[getter]
+    fn channels(&self) -> u32 {
+        self.channels
+    }
+
+    #[getter]
+    fn layout(&self) -> &'static str {
+        VIDEO_LAYOUT
+    }
+
+    #[getter]
+    fn dtype(&self) -> &'static str {
+        VIDEO_DTYPE
+    }
+
+    #[getter]
+    fn colorspace(&self) -> &'static str {
+        VIDEO_COLORSPACE
+    }
+
+    #[getter]
+    fn strides<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Ok(PyList::new_bound(
+            py,
+            [self.stride_t, self.stride_h, self.stride_w, self.stride_c],
+        ))
+    }
 }
 
 impl VideoDataLoader {
-    fn decode_target_side(&self, clip_len: u32) -> PyResult<usize> {
-        let clip_len = usize::try_from(clip_len).map_err(|_| {
+    fn derive_decode_contract(
+        clip_len: u32,
+        bytes_per_clip: usize,
+    ) -> PyResult<VideoDecodeContract> {
+        let clip_len_usize = usize::try_from(clip_len).map_err(|_| {
             PyRuntimeError::new_err(format!("clip_len conversion overflow: {clip_len}"))
         })?;
-        if clip_len == 0 {
+        if clip_len_usize == 0 {
             return Err(PyRuntimeError::new_err(
                 "clip_len must be > 0 for decode sizing",
             ));
         }
-        let bytes_per_frame = std::cmp::max(1, self.bytes_per_clip / clip_len);
+        let bytes_per_frame = std::cmp::max(1, bytes_per_clip / clip_len_usize);
         let pixels_per_frame = std::cmp::max(1, bytes_per_frame / 3);
-        let side = (pixels_per_frame as f64).sqrt().floor() as usize;
-        Ok(std::cmp::max(1, side))
+        let side = std::cmp::max(1, (pixels_per_frame as f64).sqrt().floor() as usize);
+        let side_u32 = u32::try_from(side)
+            .map_err(|_| PyRuntimeError::new_err(format!("video decode side too large: {side}")))?;
+        let frame_bytes = u64::from(side_u32)
+            .checked_mul(u64::from(side_u32))
+            .and_then(|v| v.checked_mul(3))
+            .ok_or_else(|| PyRuntimeError::new_err("video decode frame byte size overflow"))?;
+        let clip_bytes = frame_bytes
+            .checked_mul(u64::from(clip_len))
+            .ok_or_else(|| PyRuntimeError::new_err("video decode clip byte size overflow"))?;
+        let stride_h = u64::from(side_u32)
+            .checked_mul(3)
+            .ok_or_else(|| PyRuntimeError::new_err("video decode stride_h overflow"))?;
+        Ok(VideoDecodeContract {
+            frames_per_clip: clip_len,
+            frame_height: side_u32,
+            frame_width: side_u32,
+            channels: 3,
+            stride_t: frame_bytes,
+            stride_h,
+            stride_w: 3,
+            stride_c: 1,
+            clip_bytes,
+        })
     }
 
-    fn decode_error(path: &std::path::Path, class: &str, detail: &str) -> PyErr {
-        PyRuntimeError::new_err(format!(
-            "video decode {class} for {}: {detail}",
-            path.display()
-        ))
+    fn decode_error(path: &std::path::Path, class: &'static str, detail: &str) -> VideoDecodeError {
+        VideoDecodeError {
+            class,
+            path: path.to_path_buf(),
+            detail: detail.to_string(),
+        }
     }
 
     fn classify_ffmpeg_failure(stderr: &str) -> &'static str {
@@ -1256,9 +1368,43 @@ impl VideoDataLoader {
         "decode_failed"
     }
 
-    fn clip_payload_bytes(&self, clip: &VideoClipRecord) -> PyResult<Vec<u8>> {
+    fn bump_decode_failure(&mut self, class: &str) {
+        match class {
+            "io_read_failed" => {
+                self.decode_failed_io_read_failed =
+                    self.decode_failed_io_read_failed.saturating_add(1);
+            }
+            "corrupt_media" => {
+                self.decode_failed_corrupt_media =
+                    self.decode_failed_corrupt_media.saturating_add(1);
+            }
+            "short_media" => {
+                self.decode_failed_short_media = self.decode_failed_short_media.saturating_add(1);
+            }
+            "unsupported_codec" => {
+                self.decode_failed_unsupported_codec =
+                    self.decode_failed_unsupported_codec.saturating_add(1);
+            }
+            "missing_stream" => {
+                self.decode_failed_missing_stream =
+                    self.decode_failed_missing_stream.saturating_add(1);
+            }
+            "decode_backend_unavailable" => {
+                self.decode_failed_backend_unavailable =
+                    self.decode_failed_backend_unavailable.saturating_add(1);
+            }
+            _ => {
+                self.decode_failed_decode_failed =
+                    self.decode_failed_decode_failed.saturating_add(1);
+            }
+        }
+    }
+
+    fn clip_payload_bytes(&self, clip: &VideoClipRecord) -> Result<Vec<u8>, VideoDecodeError> {
         if clip.media_uri.starts_with("s3://") {
-            return Err(PyRuntimeError::new_err(
+            return Err(Self::decode_error(
+                std::path::Path::new(&clip.media_uri),
+                "decode_failed",
                 "mx8.video stage2b currently supports local media paths only",
             ));
         }
@@ -1271,17 +1417,19 @@ impl VideoDataLoader {
             ));
         }
 
-        let side = self.decode_target_side(clip.clip_len)?;
-        let frame_bytes = side
-            .checked_mul(side)
-            .and_then(|v| v.checked_mul(3))
-            .ok_or_else(|| PyRuntimeError::new_err("video decode frame byte size overflow"))?;
-        let clip_len_usize = usize::try_from(clip.clip_len).map_err(|_| {
-            PyRuntimeError::new_err(format!("clip_len conversion overflow: {}", clip.clip_len))
-        })?;
-        let expected_clip_bytes = frame_bytes
-            .checked_mul(clip_len_usize)
-            .ok_or_else(|| PyRuntimeError::new_err("video decode clip byte size overflow"))?;
+        let side = self.decode_contract.frame_width;
+        let clip_len_usize =
+            usize::try_from(self.decode_contract.frames_per_clip).map_err(|_| {
+                Self::decode_error(
+                    &path,
+                    "decode_failed",
+                    "clip_len conversion overflow for decode contract",
+                )
+            })?;
+        let expected_clip_bytes =
+            usize::try_from(self.decode_contract.clip_bytes).map_err(|_| {
+                Self::decode_error(&path, "decode_failed", "clip_bytes conversion overflow")
+            })?;
         let start_seconds = (clip.clip_start as f64) / f64::from(self.decode_fps);
         let seek_arg = format!("{start_seconds:.6}");
         let scale_arg = format!("scale={side}:{side}:flags=bilinear");
@@ -1348,6 +1496,17 @@ impl VideoDataLoader {
     }
 }
 
+impl VideoDecodeError {
+    fn into_pyerr(self) -> PyErr {
+        PyRuntimeError::new_err(format!(
+            "video decode {} for {}: {}",
+            self.class,
+            self.path.display(),
+            self.detail
+        ))
+    }
+}
+
 #[pymethods]
 impl VideoDataLoader {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1373,7 +1532,21 @@ impl VideoDataLoader {
 
         for idx in self.next_idx..end_idx {
             let clip = &self.clips[idx];
-            let clip_payload = self.clip_payload_bytes(clip)?;
+            self.decode_attempted_clips = self.decode_attempted_clips.saturating_add(1);
+            let decode_started = Instant::now();
+            let clip_payload = match self.clip_payload_bytes(clip) {
+                Ok(v) => v,
+                Err(err) => {
+                    self.bump_decode_failure(err.class);
+                    return Err(err.into_pyerr());
+                }
+            };
+            let decode_ms = decode_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            self.decode_ms_total = self.decode_ms_total.saturating_add(decode_ms);
+            self.decode_succeeded_clips = self.decode_succeeded_clips.saturating_add(1);
             payload.extend_from_slice(&clip_payload);
             offsets.push(payload.len() as u64);
             sample_ids.push(clip.sample_id);
@@ -1406,6 +1579,14 @@ impl VideoDataLoader {
                 clip_starts,
                 offsets,
                 payload,
+                frames_per_clip: self.decode_contract.frames_per_clip,
+                frame_height: self.decode_contract.frame_height,
+                frame_width: self.decode_contract.frame_width,
+                channels: self.decode_contract.channels,
+                stride_t: self.decode_contract.stride_t,
+                stride_h: self.decode_contract.stride_h,
+                stride_w: self.decode_contract.stride_w,
+                stride_c: self.decode_contract.stride_c,
             },
         )?;
         Ok(out.into_bound(py).into_any())
@@ -1419,6 +1600,21 @@ impl VideoDataLoader {
         out.set_item("clip_len", self.clip_len)?;
         out.set_item("stride", self.stride)?;
         out.set_item("fps_policy", &self.fps_policy)?;
+        out.set_item("video_layout", VIDEO_LAYOUT)?;
+        out.set_item("video_dtype", VIDEO_DTYPE)?;
+        out.set_item("video_colorspace", VIDEO_COLORSPACE)?;
+        out.set_item(
+            "video_frames_per_clip",
+            self.decode_contract.frames_per_clip,
+        )?;
+        out.set_item("video_frame_height", self.decode_contract.frame_height)?;
+        out.set_item("video_frame_width", self.decode_contract.frame_width)?;
+        out.set_item("video_channels", self.decode_contract.channels)?;
+        out.set_item("video_stride_t", self.decode_contract.stride_t)?;
+        out.set_item("video_stride_h", self.decode_contract.stride_h)?;
+        out.set_item("video_stride_w", self.decode_contract.stride_w)?;
+        out.set_item("video_stride_c", self.decode_contract.stride_c)?;
+        out.set_item("video_clip_bytes", self.decode_contract.clip_bytes)?;
         out.set_item("bytes_per_clip", self.bytes_per_clip as u64)?;
         out.set_item("max_inflight_bytes", self.max_inflight_bytes)?;
         out.set_item("clips_total", self.clips.len() as u64)?;
@@ -1429,6 +1625,52 @@ impl VideoDataLoader {
         out.set_item("video_delivered_batches_total", self.delivered_batches)?;
         out.set_item("video_delivered_samples_total", self.delivered_samples)?;
         out.set_item("video_delivered_bytes_total", self.delivered_bytes)?;
+        out.set_item(
+            "video_decode_attempted_clips_total",
+            self.decode_attempted_clips,
+        )?;
+        out.set_item(
+            "video_decode_succeeded_clips_total",
+            self.decode_succeeded_clips,
+        )?;
+        out.set_item(
+            "video_decode_failed_io_read_failed_total",
+            self.decode_failed_io_read_failed,
+        )?;
+        out.set_item(
+            "video_decode_failed_corrupt_media_total",
+            self.decode_failed_corrupt_media,
+        )?;
+        out.set_item(
+            "video_decode_failed_short_media_total",
+            self.decode_failed_short_media,
+        )?;
+        out.set_item(
+            "video_decode_failed_unsupported_codec_total",
+            self.decode_failed_unsupported_codec,
+        )?;
+        out.set_item(
+            "video_decode_failed_missing_stream_total",
+            self.decode_failed_missing_stream,
+        )?;
+        out.set_item(
+            "video_decode_failed_backend_unavailable_total",
+            self.decode_failed_backend_unavailable,
+        )?;
+        out.set_item(
+            "video_decode_failed_decode_failed_total",
+            self.decode_failed_decode_failed,
+        )?;
+        let decode_failed_total = self
+            .decode_failed_io_read_failed
+            .saturating_add(self.decode_failed_corrupt_media)
+            .saturating_add(self.decode_failed_short_media)
+            .saturating_add(self.decode_failed_unsupported_codec)
+            .saturating_add(self.decode_failed_missing_stream)
+            .saturating_add(self.decode_failed_backend_unavailable)
+            .saturating_add(self.decode_failed_decode_failed);
+        out.set_item("video_decode_failed_total", decode_failed_total)?;
+        out.set_item("video_decode_ms_total", self.decode_ms_total)?;
         Ok(out.into_any())
     }
 }
@@ -2409,6 +2651,7 @@ fn video(
         .unwrap_or(128 * 1024 * 1024)
         .max(1);
     let bytes_per_clip = env_usize("MX8_VIDEO_STAGE2_BYTES_PER_CLIP", 4096).max(1);
+    let decode_contract = VideoDataLoader::derive_decode_contract(clip_len, bytes_per_clip)?;
     if batch_size_samples == 0 {
         return Err(PyValueError::new_err(
             "video batch_size_samples must be > 0",
@@ -2433,7 +2676,7 @@ fn video(
         bytes_per_clip = bytes_per_clip as u64,
         seed = seed,
         epoch = epoch,
-        "initialized stage2a video loader"
+        "initialized stage2b video loader"
     );
 
     Py::new(
@@ -2445,6 +2688,7 @@ fn video(
             batch_size_samples,
             max_inflight_bytes,
             bytes_per_clip,
+            decode_contract,
             seed,
             epoch,
             clip_len,
@@ -2454,6 +2698,16 @@ fn video(
             delivered_batches: 0,
             delivered_samples: 0,
             delivered_bytes: 0,
+            decode_attempted_clips: 0,
+            decode_succeeded_clips: 0,
+            decode_failed_io_read_failed: 0,
+            decode_failed_corrupt_media: 0,
+            decode_failed_short_media: 0,
+            decode_failed_unsupported_codec: 0,
+            decode_failed_missing_stream: 0,
+            decode_failed_backend_unavailable: 0,
+            decode_failed_decode_failed: 0,
+            decode_ms_total: 0,
         },
     )
 }

@@ -152,9 +152,15 @@ for batch in loader:
 Current staged contract:
 
 - `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offsets`, `payload`
+- batch metadata: `frames_per_clip`, `frame_height`, `frame_width`, `channels`, `layout`, `dtype`, `colorspace`, `strides`
 - offsets are monotonic and `offsets[-1] == len(payload)`
 - init rejects invalid cap combinations (`batch_size_samples * bytes_per_clip > max_inflight_bytes`)
 - current CPU decode backend uses local `ffmpeg` CLI (`MX8_FFMPEG_BIN` override, default `ffmpeg`)
+
+`loader.stats()` also includes video decode contract + reliability counters:
+
+- contract: `video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_stride_t/h/w/c`, `video_clip_bytes`
+- runtime decode counters: `video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_*_total`, `video_decode_failed_total`, `video_decode_ms_total`
 
 Internal contract and gate checklist:
 

@@ -83,6 +83,30 @@ def _check_video_batch_contract(batch) -> None:
     for i in range(len(offsets) - 1):
         if offsets[i] > offsets[i + 1]:
             raise RuntimeError("video batch offsets must be monotonic")
+    frames = int(batch.frames_per_clip)
+    height = int(batch.frame_height)
+    width = int(batch.frame_width)
+    channels = int(batch.channels)
+    if frames <= 0 or height <= 0 or width <= 0 or channels <= 0:
+        raise RuntimeError("video contract dimensions must be > 0")
+    if batch.layout != "thwc":
+        raise RuntimeError(f"unexpected layout: {batch.layout!r}")
+    if batch.dtype != "u8":
+        raise RuntimeError(f"unexpected dtype: {batch.dtype!r}")
+    if batch.colorspace != "rgb24":
+        raise RuntimeError(f"unexpected colorspace: {batch.colorspace!r}")
+    expected_strides = [height * width * channels, width * channels, channels, 1]
+    got_strides = [int(x) for x in batch.strides]
+    if got_strides != expected_strides:
+        raise RuntimeError(
+            f"video strides mismatch: got={got_strides} want={expected_strides}"
+        )
+    expected_clip_bytes = frames * height * width * channels
+    for i in range(len(offsets) - 1):
+        if offsets[i + 1] - offsets[i] != expected_clip_bytes:
+            raise RuntimeError(
+                f"clip payload byte size mismatch for clip[{i}] got={offsets[i + 1] - offsets[i]} want={expected_clip_bytes}"
+            )
 
 
 def _collect_sequence(loader, max_batches: int) -> list[str]:
@@ -231,6 +255,21 @@ def main() -> None:
         raise RuntimeError(f"unexpected stats: {stats1}")
     if int(stats1.get("video_delivered_bytes_total", 0)) <= 0:
         raise RuntimeError(f"unexpected stats: {stats1}")
+    expected_stats = {
+        "video_layout": "thwc",
+        "video_dtype": "u8",
+        "video_colorspace": "rgb24",
+    }
+    for key, want in expected_stats.items():
+        got = str(stats1.get(key, ""))
+        if got != want:
+            raise RuntimeError(f"unexpected stat {key}: got={got!r} want={want!r}")
+    if int(stats1.get("video_decode_attempted_clips_total", 0)) <= 0:
+        raise RuntimeError(f"missing decode attempted clips stat: {stats1}")
+    if int(stats1.get("video_decode_succeeded_clips_total", 0)) <= 0:
+        raise RuntimeError(f"missing decode succeeded clips stat: {stats1}")
+    if int(stats1.get("video_decode_ms_total", 0)) <= 0:
+        raise RuntimeError(f"missing decode timing stat: {stats1}")
 
     try:
         mx8.video(
