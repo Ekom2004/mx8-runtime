@@ -6,7 +6,7 @@ This document defines the current contract for `mx8.mix(...)`.
 
 Enable deterministic weighted mixing across multiple MX8 loaders while preserving one shared bounded-memory runtime contract.
 
-## Proposed API
+## API
 
 ```python
 import mx8
@@ -17,6 +17,10 @@ mixed = mx8.mix(
     seed=1234,
     epoch=0,
     on_source_exhausted="error",
+    profile="balanced",
+    autotune=True,
+    constraints=mx8.Constraints(max_inflight_bytes=256 * 1024 * 1024),
+    runtime=mx8.RuntimeConfig(prefetch_batches=1, max_queue_batches=8),
 )
 ```
 
@@ -24,6 +28,10 @@ mixed = mx8.mix(
 - `weights`: positive floats, same length as `loaders`, normalized internally.
 - `seed`: deterministic source-selection seed.
 - `on_source_exhausted`: `error|allow` (default: `error`).
+- `profile` / `autotune`: mix-level startup rails (`safe|balanced|throughput`) plus opt-out.
+- `constraints`: optional shared cap override (`max_inflight_bytes`, `max_process_rss_bytes` clamp).
+- `runtime`: optional startup overrides for `prefetch_batches` / `max_queue_batches`.
+  - `runtime.want` is rejected for `mx8.mix` (lease parallelism belongs to distributed loader flow).
 
 ## Determinism Contract (failure-free)
 
@@ -39,6 +47,7 @@ the mixed stream order is deterministic and replayable.
 ## Memory + Backpressure Contract
 
 - Mixed execution uses one shared cap envelope (`max_inflight_bytes`, queue caps).
+- Shared inflight cap is `min(source_caps, mix_overrides)`.
 - No per-source unbounded buffering.
 - Backpressure is global: if sink slows, all sources are throttled through one bounded scheduler.
 
@@ -47,6 +56,7 @@ the mixed stream order is deterministic and replayable.
 - Deterministic weighted round-robin source selection.
 - Delivery remains per-batch; no global reorder inside a delivered batch.
 - Source-level exhaustion defaults to fail fast with explicit error (no silent source drop).
+- `mixed.stats()` includes per-source diagnostics (`mix_sources`) with manifest IDs, per-source counters, configured knobs, and source metrics.
 
 ## Planned Acceptance Gates
 
@@ -59,6 +69,8 @@ Gate command:
 
 - `./scripts/mix_gate.sh`
 - strict mode: `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
+- `./scripts/mix_multirank_gate.sh`
 - smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
+- smoke multi-rank toggle: `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
 - smoke strict toggle: `MX8_SMOKE_MIX=1 MX8_SMOKE_MIX_STRICT=1 ./scripts/smoke.sh`
 - runbook: `docs/mix_gate_runbook.md`

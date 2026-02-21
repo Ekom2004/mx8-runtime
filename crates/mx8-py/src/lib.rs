@@ -125,6 +125,7 @@ struct DataLoader {
     max_inflight_bytes: u64,
     max_queue_batches: usize,
     prefetch_batches: usize,
+    pipeline: Pipeline,
     metrics: Arc<RuntimeMetrics>,
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -153,6 +154,10 @@ struct MixedDataLoader {
     snapshot_period_ticks: u64,
     snapshot_emitted_total: u64,
     source_exhaustion_policy: SourceExhaustionPolicy,
+    mix_profile: Option<String>,
+    mix_autotune_enabled: bool,
+    mix_effective_prefetch_batches: usize,
+    mix_effective_max_queue_batches: usize,
 }
 
 #[pyclass]
@@ -982,6 +987,7 @@ impl DataLoader {
                         max_inflight_bytes,
                         max_queue_batches,
                         prefetch_batches,
+                        pipeline,
                         metrics,
                         rx,
                         task: Some(task),
@@ -1037,17 +1043,19 @@ impl DataLoader {
             snapshot.manifest_bytes_materialized = true;
         }
 
+        let pipeline_for_stream = pipeline.clone();
+        let manifest_bytes = snapshot.manifest_bytes;
         let (rx, task) = rt
             .block_on(async move {
                 match (start_id, end_id) {
                     (Some(s), Some(e)) => {
-                        pipeline
-                            .spawn_manifest_bytes_range_stream(snapshot.manifest_bytes, s, e)
+                        pipeline_for_stream
+                            .spawn_manifest_bytes_range_stream(manifest_bytes, s, e)
                             .await
                     }
                     (None, None) => {
-                        pipeline
-                            .spawn_manifest_bytes_stream(snapshot.manifest_bytes)
+                        pipeline_for_stream
+                            .spawn_manifest_bytes_stream(manifest_bytes)
                             .await
                     }
                     _ => anyhow::bail!("start_id and end_id must be set together"),
@@ -1062,6 +1070,7 @@ impl DataLoader {
             max_inflight_bytes,
             max_queue_batches,
             prefetch_batches,
+            pipeline,
             metrics,
             rx,
             task: Some(task),
@@ -1075,7 +1084,20 @@ impl DataLoader {
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(metrics_to_dict(py, self.metrics.as_ref())?.into_any())
+        let out = metrics_to_dict(py, self.metrics.as_ref())?;
+        out.set_item("batch_size_samples", self.batch_size_samples)?;
+        out.set_item("max_inflight_bytes", self.max_inflight_bytes)?;
+        out.set_item("max_queue_batches", self.max_queue_batches)?;
+        out.set_item("prefetch_batches", self.prefetch_batches)?;
+        out.set_item(
+            "effective_prefetch_batches",
+            self.pipeline.effective_prefetch_batches(),
+        )?;
+        out.set_item(
+            "effective_max_queue_batches",
+            self.pipeline.effective_max_queue_batches(),
+        )?;
+        Ok(out.into_any())
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1152,6 +1174,25 @@ impl MixedDataLoader {
             realized_ratio = ?realized_ratio,
             "periodic mix proof snapshot"
         );
+    }
+}
+
+impl DataLoader {
+    fn apply_runtime_overrides(
+        &mut self,
+        prefetch_batches: Option<usize>,
+        max_queue_batches: Option<usize>,
+    ) {
+        if let Some(prefetch) = prefetch_batches {
+            let clamped = prefetch.max(1);
+            self.prefetch_batches = clamped;
+            self.pipeline.set_prefetch_batches(clamped);
+        }
+        if let Some(max_queue) = max_queue_batches {
+            let clamped = max_queue.max(1);
+            self.max_queue_batches = clamped;
+            self.pipeline.set_max_queue_batches(clamped);
+        }
     }
 }
 
@@ -1262,6 +1303,16 @@ impl MixedDataLoader {
         let out = PyDict::new_bound(py);
         out.set_item("seed", self.seed)?;
         out.set_item("epoch", self.epoch)?;
+        out.set_item("mix_profile", self.mix_profile.as_deref())?;
+        out.set_item("mix_autotune_enabled", self.mix_autotune_enabled)?;
+        out.set_item(
+            "mix_effective_prefetch_batches",
+            self.mix_effective_prefetch_batches,
+        )?;
+        out.set_item(
+            "mix_effective_max_queue_batches",
+            self.mix_effective_max_queue_batches,
+        )?;
         out.set_item("mix_schedule_ticks", self.schedule_ticks)?;
         out.set_item("mix_snapshot_enabled", self.snapshot_enabled)?;
         out.set_item("mix_snapshot_period_ticks", self.snapshot_period_ticks)?;
@@ -1309,6 +1360,46 @@ impl MixedDataLoader {
             "mix_realized_ratio",
             PyList::new_bound(py, self.realized_ratio()),
         )?;
+
+        let source_stats = PyList::empty_bound(py);
+        let realized = self.realized_ratio();
+        for (source_idx, loader) in self.loaders.iter().enumerate() {
+            let guard = loader.borrow(py);
+            let source = PyDict::new_bound(py);
+            source.set_item("source_idx", source_idx)?;
+            source.set_item("active", self.active[source_idx])?;
+            source.set_item(
+                "source_weight_normalized",
+                self.normalized_weights[source_idx],
+            )?;
+            source.set_item("source_realized_ratio", realized[source_idx])?;
+            source.set_item(
+                "source_delivered_batches_total",
+                self.delivered_batches[source_idx],
+            )?;
+            source.set_item(
+                "source_delivered_samples_total",
+                self.delivered_samples[source_idx],
+            )?;
+            source.set_item(
+                "source_delivered_bytes_total",
+                self.delivered_bytes[source_idx],
+            )?;
+            source.set_item("source_starvation_total", self.starvation_total[source_idx])?;
+            source.set_item(
+                "source_exhausted_total",
+                self.source_exhausted_total[source_idx],
+            )?;
+            source.set_item("dataset_base", guard.dataset_base.as_str())?;
+            source.set_item("manifest_hash", guard.manifest_hash.as_str())?;
+            source.set_item("batch_size_samples", guard.batch_size_samples)?;
+            source.set_item("max_inflight_bytes", guard.max_inflight_bytes)?;
+            source.set_item("max_queue_batches", guard.max_queue_batches)?;
+            source.set_item("prefetch_batches", guard.prefetch_batches)?;
+            source.set_item("metrics", metrics_to_dict(py, guard.metrics.as_ref())?)?;
+            source_stats.append(source)?;
+        }
+        out.set_item("mix_sources", source_stats)?;
         Ok(out.into_any())
     }
 }
@@ -3366,7 +3457,20 @@ fn video(
 }
 
 #[pyfunction]
-#[pyo3(signature = (loaders, *, weights, seed=0, epoch=0, starvation_window=10_000, on_source_exhausted="error"))]
+#[pyo3(signature = (
+    loaders,
+    *,
+    weights,
+    seed=0,
+    epoch=0,
+    starvation_window=10_000,
+    on_source_exhausted="error",
+    profile=None,
+    autotune=None,
+    constraints=None,
+    runtime=None,
+))]
+#[allow(clippy::too_many_arguments)]
 fn mix(
     py: Python<'_>,
     loaders: Vec<Py<DataLoader>>,
@@ -3375,6 +3479,10 @@ fn mix(
     epoch: u64,
     starvation_window: u64,
     on_source_exhausted: &str,
+    profile: Option<String>,
+    autotune: Option<bool>,
+    constraints: Option<Py<Constraints>>,
+    runtime: Option<Py<RuntimeConfig>>,
 ) -> PyResult<Py<MixedDataLoader>> {
     if loaders.is_empty() {
         return Err(PyValueError::new_err(
@@ -3390,19 +3498,22 @@ fn mix(
     }
     let normalized =
         normalize_mix_weights(&weights).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+
+    let has_v1_args =
+        profile.is_some() || autotune.is_some() || constraints.is_some() || runtime.is_some();
+    let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
+    let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+
     let mut inflight_caps = Vec::with_capacity(loaders.len());
     let mut batch_sizes = Vec::with_capacity(loaders.len());
-    let mut queue_caps = Vec::with_capacity(loaders.len());
-    let mut prefetch_caps = Vec::with_capacity(loaders.len());
     for loader in &loaders {
         let guard = loader.borrow(py);
         inflight_caps.push(guard.max_inflight_bytes);
         batch_sizes.push(guard.batch_size_samples);
-        queue_caps.push(guard.max_queue_batches);
-        prefetch_caps.push(guard.prefetch_batches);
     }
-    let shared_max_inflight_bytes = compute_shared_mix_cap(&inflight_caps)
+    let loader_shared_max_inflight_bytes = compute_shared_mix_cap(&inflight_caps)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+
     if let Some(&first_batch_size) = batch_sizes.first() {
         if batch_sizes.iter().any(|v| *v != first_batch_size) {
             return Err(PyValueError::new_err(
@@ -3410,6 +3521,91 @@ fn mix(
             ));
         }
     }
+
+    let mut mix_profile = None;
+    let mut mix_autotune_enabled = false;
+    let mut runtime_prefetch_override: Option<usize> = None;
+    let mut runtime_max_queue_override: Option<usize> = None;
+    let mut shared_max_inflight_override: Option<u64> = None;
+
+    if has_v1_args {
+        let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+        mix_profile = Some(
+            match selected_profile {
+                AutotuneProfile::Safe => "safe",
+                AutotuneProfile::Balanced => "balanced",
+                AutotuneProfile::Throughput => "throughput",
+            }
+            .to_string(),
+        );
+        mix_autotune_enabled = autotune.unwrap_or(true);
+
+        if mix_autotune_enabled {
+            let defaults = ProfileDefaults::for_profile(selected_profile);
+            runtime_prefetch_override = Some(defaults.prefetch_batches.max(1));
+            runtime_max_queue_override = Some(defaults.max_queue_batches.max(1));
+            shared_max_inflight_override = Some(defaults.max_inflight_bytes.max(1));
+        }
+
+        if let Some(runtime_cfg) = &runtime_cfg {
+            if runtime_cfg.want.is_some() {
+                return Err(PyValueError::new_err(
+                    "mx8.mix runtime.want is unsupported (use DataLoader/DistributedDataLoader for lease parallelism)",
+                ));
+            }
+            if let Some(prefetch) = runtime_cfg.prefetch_batches {
+                runtime_prefetch_override = Some(prefetch.max(1));
+            }
+            if let Some(max_queue) = runtime_cfg.max_queue_batches {
+                runtime_max_queue_override = Some(max_queue.max(1));
+            }
+        }
+
+        if let Some(constraints_cfg) = &constraints_cfg {
+            if let Some(max_inflight) = constraints_cfg.max_inflight_bytes {
+                shared_max_inflight_override = Some(max_inflight.max(1));
+            }
+            if let (Some(max_process_rss), Some(candidate_cap)) = (
+                constraints_cfg.max_process_rss_bytes,
+                shared_max_inflight_override,
+            ) {
+                if candidate_cap > max_process_rss {
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "mix_cap_clamped",
+                        requested_max_inflight_bytes = candidate_cap,
+                        clamped_max_inflight_bytes = max_process_rss,
+                        max_process_rss_bytes = max_process_rss,
+                        "clamped mix max_inflight_bytes to max_process_rss_bytes"
+                    );
+                    shared_max_inflight_override = Some(max_process_rss);
+                }
+            }
+        }
+    }
+
+    for loader in &loaders {
+        let mut guard = loader.borrow_mut(py);
+        guard.apply_runtime_overrides(runtime_prefetch_override, runtime_max_queue_override);
+    }
+
+    let mut queue_caps = Vec::with_capacity(loaders.len());
+    let mut prefetch_caps = Vec::with_capacity(loaders.len());
+    for loader in &loaders {
+        let guard = loader.borrow(py);
+        queue_caps.push(guard.max_queue_batches);
+        prefetch_caps.push(guard.prefetch_batches);
+    }
+
+    let shared_max_inflight_bytes = shared_max_inflight_override
+        .map(|v| v.min(loader_shared_max_inflight_bytes))
+        .unwrap_or(loader_shared_max_inflight_bytes);
+
+    let mix_effective_prefetch_batches = runtime_prefetch_override
+        .unwrap_or_else(|| prefetch_caps.iter().copied().min().unwrap_or(1usize).max(1));
+    let mix_effective_max_queue_batches = runtime_max_queue_override
+        .unwrap_or_else(|| queue_caps.iter().copied().min().unwrap_or(1usize).max(1));
+
     let scheduler = WeightedRoundRobin::new(normalized.clone(), seed, epoch);
     let source_exhaustion_policy = SourceExhaustionPolicy::parse(on_source_exhausted)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
@@ -3427,6 +3623,10 @@ fn mix(
         shared_max_inflight_bytes = shared_max_inflight_bytes,
         normalized_weights = ?normalized,
         source_exhaustion_policy = source_exhaustion_policy.as_str(),
+        profile = mix_profile.as_deref().unwrap_or("legacy"),
+        autotune_enabled = mix_autotune_enabled,
+        mix_effective_prefetch_batches = mix_effective_prefetch_batches as u64,
+        mix_effective_max_queue_batches = mix_effective_max_queue_batches as u64,
         snapshot_enabled = snapshot_enabled,
         snapshot_period_ticks = snapshot_period_ticks,
         max_queue_batches = ?queue_caps,
@@ -3454,6 +3654,10 @@ fn mix(
         snapshot_period_ticks,
         snapshot_emitted_total: 0,
         source_exhaustion_policy,
+        mix_profile,
+        mix_autotune_enabled,
+        mix_effective_prefetch_batches,
+        mix_effective_max_queue_batches,
     };
     Py::new(py, out)
 }

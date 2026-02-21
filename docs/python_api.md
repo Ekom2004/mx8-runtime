@@ -244,6 +244,10 @@ mixed = mx8.mix(
     seed=17,
     epoch=3,
     on_source_exhausted="error",  # default: fail fast
+    profile="balanced",
+    autotune=True,
+    constraints=mx8.Constraints(max_inflight_bytes=256 * 1024 * 1024),
+    runtime=mx8.RuntimeConfig(prefetch_batches=1, max_queue_batches=8),
 )
 ```
 
@@ -253,16 +257,23 @@ Arguments:
 - `seed`, `epoch`: deterministic scheduling inputs.
 - `starvation_window`: scheduler starvation accounting window.
 - `on_source_exhausted`: `error|allow` (default `error`).
+- `profile`: `safe|balanced|throughput` profile rails for shared mix defaults.
+- `autotune`: when `True`, applies profile defaults before explicit overrides.
+- `constraints`: optional `mx8.Constraints` override for shared mix cap.
+- `runtime`: optional `mx8.RuntimeConfig` startup overrides (`prefetch_batches`, `max_queue_batches`; `want` is unsupported for `mx8.mix`).
 
 Behavior:
 - deterministic replay for fixed manifests/weights/seed/epoch/membership,
 - shared inflight cap safety via global mixed guard,
-- fail-fast source exhaustion by default (`error`) to avoid silent source drop.
+- fail-fast source exhaustion by default (`error`) to avoid silent source drop,
+- per-source diagnostics in `mixed.stats()["mix_sources"]` (manifest, delivery counters, configured knobs, and source metrics).
 
 Gate commands:
 - `./scripts/mix_gate.sh`
 - strict mode: `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
+- multi-rank no-overlap gate: `./scripts/mix_multirank_gate.sh`
 - smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
+- smoke multi-rank toggle: `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
 
 ## API shape (v0 vs v1 direction)
 

@@ -134,6 +134,11 @@ if [[ "${MX8_SMOKE_MIX:-0}" == "1" ]]; then
   fi
 fi
 
+if [[ "${MX8_SMOKE_MIX_MULTIRANK:-0}" == "1" ]]; then
+  echo "[mx8] mix_multirank_gate (multi-rank deterministic no-overlap gate)"
+  ./scripts/mix_multirank_gate.sh
+fi
+
 if [[ "${MX8_SMOKE_VIDEO_STAGE1:-0}" == "1" ]]; then
   echo "[mx8] video_stage1_gate (v1.8 stage-1 clip-index contract gate)"
   ./scripts/video_stage1_gate.sh

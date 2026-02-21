@@ -13,7 +13,9 @@ Default checks:
 - weighted ratio tolerance check,
 - shared inflight + process RSS cap checks,
 - epoch+1 replay determinism check,
-- source-exhaustion policy check (`error` fails fast, `allow` drains with counters).
+- source-exhaustion policy check (`error` fails fast, `allow` drains with counters),
+- profile/autotune + runtime override checks (`profile`, `constraints`, `runtime` rails),
+- per-source diagnostics checks (`mix_sources` payload shape + metrics visibility).
 
 ## Strict (CI-Oriented) Gate
 
@@ -40,6 +42,22 @@ Enable mix gate inside smoke:
 Enable strict mix mode inside smoke:
 
 - `MX8_SMOKE_MIX=1 MX8_SMOKE_MIX_STRICT=1 ./scripts/smoke.sh`
+
+## Multi-Rank Gate
+
+Run deterministic no-overlap checks across local spawned ranks:
+
+- `./scripts/mix_multirank_gate.sh`
+
+Checks:
+- no duplicates within each rank stream,
+- no overlap across ranks for `(source_tag, sample_id)`,
+- replay determinism for same seed/epoch,
+- epoch drift digest change (configurable).
+
+Smoke toggle:
+
+- `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
 
 ## Useful Overrides
 

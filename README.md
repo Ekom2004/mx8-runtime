@@ -64,7 +64,9 @@ Install:
 - Zero-manifest burn-in: `MX8_BURNIN_RUNS=3 ./scripts/direct_stream_burnin.sh`
 - Mix gate: `./scripts/mix_gate.sh`
 - Mix gate strict (CI profile): `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
+- Mix multi-rank gate: `./scripts/mix_multirank_gate.sh`
 - Mix gate via smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
+- Mix multi-rank via smoke toggle: `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
 - DDP autotune A/B: `MX8_TORCH_DDP_AUTOTUNE_AB=1 ./scripts/torch_ddp_gate.sh`
 - Autotune pressure simulation: `./scripts/autotune_memory_pressure_sim.sh`
 - Video Stage 3A backend parity: `./scripts/video_stage3a_backend_gate.sh`
@@ -89,5 +91,5 @@ Install:
 
 ## Near-Term Roadmap
 
-- **`mx8.mix` ergonomics pass** (profile-level defaults and richer diagnostics for production jobs).
 - **Video-native hardening** for range-streaming and decode reliability at scale.
+- **Training elasticity milestones** (post-v0 DDP survivability and restart semantics).
