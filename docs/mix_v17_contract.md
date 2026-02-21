@@ -16,7 +16,7 @@ mixed = mx8.mix(
     weights=[0.7, 0.3],
     seed=1234,
     epoch=0,
-    on_source_exhausted="error",
+    source_exhausted="error",
     profile="balanced",
     autotune=True,
     constraints=mx8.Constraints(max_inflight_bytes=256 * 1024 * 1024),
@@ -27,9 +27,9 @@ mixed = mx8.mix(
 - `loaders`: list of existing MX8 loaders (initial scope: byte-oriented `mx8.load(...)` loaders).
 - `weights`: positive floats, same length as `loaders`, normalized internally.
 - `seed`: deterministic source-selection seed.
-- `on_source_exhausted`: `error|allow` (default: `error`).
+- `source_exhausted`: `error|allow` (default: `error`).
 - `profile` / `autotune`: mix-level startup rails (`safe|balanced|throughput`) plus opt-out.
-- `constraints`: optional shared cap override (`max_inflight_bytes`, `max_process_rss_bytes` clamp).
+- `constraints`: optional shared cap override (`max_inflight_bytes`, `max_ram_bytes` clamp).
 - `runtime`: optional startup overrides for `prefetch_batches` / `max_queue_batches`.
   - `runtime.want` is rejected for `mx8.mix` (lease parallelism belongs to distributed loader flow).
 
@@ -63,7 +63,7 @@ the mixed stream order is deterministic and replayable.
 - Determinism gate: 3 repeated runs must produce identical digest of `(source_id, sample_id)` sequence.
 - Ratio gate: observed source contribution must be within tolerance of target weights (default ±2%; strict ±1%).
 - Memory gate: inflight/process bounds remain within configured caps during mixed run.
-- Exhaustion gate: `on_source_exhausted=error` fails fast; `allow` drains with explicit counters.
+- Exhaustion gate: `source_exhausted=error` fails fast; `allow` drains with explicit counters.
 
 Gate command:
 

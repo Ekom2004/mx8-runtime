@@ -18,9 +18,9 @@ def main() -> None:
     batch_size = int(os.environ.get("MX8_BATCH_SIZE_SAMPLES", "4"))
     steps = int(os.environ.get("MX8_TRAIN_STEPS", "8"))
 
-    loader = mx8.vision.ImageFolderLoader(
+    loader = mx8.image(
         link,
-        manifest_store_root=root,
+        manifest_store=root,
         batch_size_samples=batch_size,
         max_inflight_bytes=128 * 1024 * 1024,
         max_queue_batches=32,

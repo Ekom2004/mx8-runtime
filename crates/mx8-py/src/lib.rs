@@ -105,7 +105,7 @@ struct DecodeBatchResult {
 }
 
 #[pyclass]
-struct ImageFolderLoader {
+struct ImageLoader {
     loader: DataLoader,
     resize_hw: Option<(u32, u32)>,
     to_float: bool,
@@ -127,8 +127,10 @@ struct DataLoader {
     prefetch_batches: usize,
     pipeline: Pipeline,
     metrics: Arc<RuntimeMetrics>,
+    autotune: Arc<AutotuneShared>,
     rx: tokio::sync::mpsc::Receiver<BatchLease>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
+    autotune_task: Option<tokio::task::JoinHandle<()>>,
     rt: tokio::runtime::Runtime,
 }
 
@@ -158,6 +160,15 @@ struct MixedDataLoader {
     mix_autotune_enabled: bool,
     mix_effective_prefetch_batches: usize,
     mix_effective_max_queue_batches: usize,
+    mix_runtime_autotune_enabled: bool,
+    mix_autotune_rails: Option<AutotuneRails>,
+    mix_autotune_controller: AutotuneController,
+    mix_autotune_current: AutotuneUpdate,
+    mix_runtime_autotune_period_ticks: u64,
+    mix_runtime_autotune_last_tick: u64,
+    mix_runtime_autotune_adjustments_total: u64,
+    mix_runtime_autotune_pressure_milli: u64,
+    mix_max_process_rss_bytes: Option<u64>,
 }
 
 #[pyclass]
@@ -254,7 +265,7 @@ impl SourceExhaustionPolicy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "error" => Ok(Self::Error),
             "allow" => Ok(Self::Allow),
-            _ => anyhow::bail!("invalid on_source_exhausted={raw:?} (expected: error|allow)"),
+            _ => anyhow::bail!("invalid source_exhausted={raw:?} (expected: error|allow)"),
         }
     }
 
@@ -272,7 +283,10 @@ impl WeightedRoundRobin {
         let tie_break_offset = if n == 0 {
             0
         } else {
-            ((seed ^ epoch.rotate_left(17)) as usize) % n
+            // Keep tie-break deterministic, and ensure epoch shifts the tie order when n > 1.
+            let seed_component = (seed as usize) % n;
+            let epoch_component = (epoch as usize) % n;
+            (seed_component + epoch_component) % n
         };
         Self {
             current: vec![0; n],
@@ -393,12 +407,22 @@ struct Constraints {
 #[pymethods]
 impl Constraints {
     #[new]
-    #[pyo3(signature = (max_inflight_bytes=None, max_process_rss_bytes=None))]
-    fn new(max_inflight_bytes: Option<u64>, max_process_rss_bytes: Option<u64>) -> Self {
+    #[pyo3(signature = (max_inflight_bytes=None, max_ram_bytes=None))]
+    fn new(max_inflight_bytes: Option<u64>, max_ram_bytes: Option<u64>) -> Self {
         Self {
             max_inflight_bytes,
-            max_process_rss_bytes,
+            max_process_rss_bytes: max_ram_bytes,
         }
+    }
+
+    #[getter]
+    fn max_ram_bytes(&self) -> Option<u64> {
+        self.max_process_rss_bytes
+    }
+
+    #[setter]
+    fn set_max_ram_bytes(&mut self, value: Option<u64>) {
+        self.max_process_rss_bytes = value;
     }
 }
 
@@ -547,7 +571,7 @@ fn video_decode_backend_name(backend: VideoDecodeBackend) -> &'static str {
 fn labels_to_torch_i64<'py>(py: Python<'py>, labels: &[u64]) -> PyResult<Bound<'py, PyAny>> {
     let torch = py.import_bound("torch").map_err(|e| {
         PyRuntimeError::new_err(format!(
-            "failed to import torch (install PyTorch to use ImageFolderLoader): {e}"
+            "failed to import torch (install PyTorch to use ImageLoader): {e}"
         ))
     })?;
     let torch_int64 = torch.getattr("int64")?;
@@ -895,8 +919,8 @@ impl DataLoader {
     #[pyo3(signature = (
         dataset_link,
         *,
-        manifest_store_root=None,
-        dev_manifest_path=None,
+        manifest_store=None,
+        manifest_path=None,
         recursive=true,
         batch_size_samples=512,
         max_inflight_bytes=128*1024*1024,
@@ -904,7 +928,7 @@ impl DataLoader {
         prefetch_batches=1,
         target_batch_bytes=None,
         max_batch_bytes=None,
-        max_process_rss_bytes=None,
+        max_ram_bytes=None,
         start_id=None,
         end_id=None,
         node_id=None,
@@ -912,8 +936,8 @@ impl DataLoader {
     #[allow(clippy::too_many_arguments)]
     fn new(
         dataset_link: String,
-        manifest_store_root: Option<PathBuf>,
-        dev_manifest_path: Option<PathBuf>,
+        manifest_store: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
         recursive: bool,
         batch_size_samples: usize,
         max_inflight_bytes: u64,
@@ -921,7 +945,7 @@ impl DataLoader {
         prefetch_batches: usize,
         target_batch_bytes: Option<u64>,
         max_batch_bytes: Option<u64>,
-        max_process_rss_bytes: Option<u64>,
+        max_ram_bytes: Option<u64>,
         start_id: Option<u64>,
         end_id: Option<u64>,
         node_id: Option<String>,
@@ -939,14 +963,14 @@ impl DataLoader {
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}")))?;
 
-        let root = manifest_store_root
+        let root = manifest_store
             .or(env_path("MX8_MANIFEST_STORE_ROOT"))
             .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
 
-        let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
+        let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
         let max_process_rss_bytes_cap =
-            max_process_rss_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
+            max_ram_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
         let caps = RuntimeCaps {
             max_inflight_bytes,
             max_queue_batches,
@@ -958,6 +982,63 @@ impl DataLoader {
         };
         let pipeline = Pipeline::new(caps);
         let metrics = pipeline.metrics();
+        let autotune_enabled = env_bool("MX8_LOAD_AUTOTUNE_RUNTIME", false);
+        let autotune_profile = if autotune_enabled {
+            Some(AutotuneProfile::from_env())
+        } else {
+            None
+        };
+        let rails = autotune_profile.map(AutotuneRails::for_profile);
+        let initial_prefetch = rails
+            .map(|r| {
+                prefetch_batches
+                    .max(r.min_prefetch_batches)
+                    .min(r.max_prefetch_batches)
+            })
+            .unwrap_or(prefetch_batches.max(1));
+        let initial_max_queue = rails
+            .map(|r| {
+                max_queue_batches
+                    .max(r.min_max_queue_batches)
+                    .min(r.max_max_queue_batches)
+            })
+            .unwrap_or(max_queue_batches.max(1));
+        pipeline.set_prefetch_batches(initial_prefetch);
+        pipeline.set_max_queue_batches(initial_max_queue);
+        let autotune = Arc::new(AutotuneShared::new(
+            autotune_enabled,
+            1,
+            initial_prefetch,
+            initial_max_queue,
+        ));
+        if autotune_enabled {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "load_runtime_autotune_initialized",
+                profile = match autotune_profile.unwrap_or(AutotuneProfile::Balanced) {
+                    AutotuneProfile::Safe => "safe",
+                    AutotuneProfile::Balanced => "balanced",
+                    AutotuneProfile::Throughput => "throughput",
+                },
+                prefetch_batches = initial_prefetch as u64,
+                max_queue_batches = initial_max_queue as u64,
+                max_inflight_bytes = max_inflight_bytes,
+                max_process_rss_bytes = max_process_rss_bytes_cap.unwrap_or(0),
+                "load runtime autotune initialized"
+            );
+        }
+        let autotune_task = if autotune_enabled {
+            Some(rt.spawn(autotune_loop(
+                Arc::new(pipeline.clone()),
+                metrics.clone(),
+                autotune.clone(),
+                max_inflight_bytes,
+                max_process_rss_bytes_cap,
+                rails.unwrap_or(AutotuneRails::for_profile(AutotuneProfile::Balanced)),
+            )))
+        } else {
+            None
+        };
 
         if should_use_zero_manifest_scan(&parsed, &dataset_base) {
             let reservoir_size = env_usize("MX8_ZERO_MANIFEST_RESERVOIR", 100_000).max(1);
@@ -985,12 +1066,14 @@ impl DataLoader {
                         manifest_hash,
                         batch_size_samples,
                         max_inflight_bytes,
-                        max_queue_batches,
-                        prefetch_batches,
+                        max_queue_batches: initial_max_queue,
+                        prefetch_batches: initial_prefetch,
                         pipeline,
                         metrics,
+                        autotune,
                         rx,
                         task: Some(task),
+                        autotune_task,
                         rt,
                     });
                 }
@@ -1068,12 +1151,14 @@ impl DataLoader {
             manifest_hash: snapshot.manifest_hash.0,
             batch_size_samples,
             max_inflight_bytes,
-            max_queue_batches,
-            prefetch_batches,
+            max_queue_batches: initial_max_queue,
+            prefetch_batches: initial_prefetch,
             pipeline,
             metrics,
+            autotune,
             rx,
             task: Some(task),
+            autotune_task,
             rt,
         })
     }
@@ -1097,6 +1182,27 @@ impl DataLoader {
             "effective_max_queue_batches",
             self.pipeline.effective_max_queue_batches(),
         )?;
+        out.set_item("autotune_enabled", self.autotune.enabled)?;
+        out.set_item(
+            "autotune_pressure",
+            self.autotune.pressure_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_wait_ewma",
+            self.autotune.wait_ewma_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_rss_ewma",
+            self.autotune.rss_ewma_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_integral_rss",
+            self.autotune.integral_rss_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_cooldown_ticks",
+            self.autotune.cooldown_ticks.load(Ordering::Relaxed),
+        )?;
         Ok(out.into_any())
     }
 
@@ -1105,8 +1211,9 @@ impl DataLoader {
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let wait_started = Instant::now();
         let lease = py.allow_threads(|| self.rt.block_on(async { self.rx.recv().await }));
-        match lease {
+        let out = match lease {
             Some(lease) => {
                 let out = Py::new(py, PyBatch { lease })?;
                 Ok(out.into_bound(py).into_any())
@@ -1124,7 +1231,22 @@ impl DataLoader {
                     ))),
                 }
             }
+        };
+        self.autotune.on_wait(wait_started.elapsed());
+        out
+    }
+
+    fn close(&mut self) {
+        if let Some(handle) = self.task.take() {
+            handle.abort();
         }
+        if let Some(handle) = self.autotune_task.take() {
+            handle.abort();
+        }
+    }
+
+    fn __del__(&mut self) {
+        self.close();
     }
 }
 
@@ -1173,6 +1295,95 @@ impl MixedDataLoader {
             starvation_total = ?self.starvation_total,
             realized_ratio = ?realized_ratio,
             "periodic mix proof snapshot"
+        );
+    }
+
+    fn max_process_rss_bytes(&self, py: Python<'_>) -> u64 {
+        self.loaders
+            .iter()
+            .map(|ldr| ldr.borrow(py).metrics.process_rss_bytes.get())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn maybe_run_runtime_autotune(&mut self, py: Python<'_>) {
+        if !self.mix_runtime_autotune_enabled {
+            return;
+        }
+        let Some(rails) = self.mix_autotune_rails else {
+            return;
+        };
+        if self.schedule_ticks == 0 {
+            return;
+        }
+        let period = self.mix_runtime_autotune_period_ticks.max(1);
+        if self
+            .schedule_ticks
+            .saturating_sub(self.mix_runtime_autotune_last_tick)
+            < period
+        {
+            return;
+        }
+        self.mix_runtime_autotune_last_tick = self.schedule_ticks;
+
+        let wait_ratio = self
+            .steps_since_emit
+            .iter()
+            .copied()
+            .max()
+            .map(|v| (v as f64 / self.max_starvation_window.max(1) as f64).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        let inflight_ratio = if self.shared_max_inflight_bytes == 0 {
+            0.0
+        } else {
+            (self.total_inflight_bytes(py) as f64 / self.shared_max_inflight_bytes as f64)
+                .clamp(0.0, 1.5)
+        };
+        let rss_ratio = match self.mix_max_process_rss_bytes {
+            Some(cap) if cap > 0 => {
+                (self.max_process_rss_bytes(py) as f64 / cap as f64).clamp(0.0, 1.5)
+            }
+            _ => 0.0,
+        };
+
+        let tick = autotune_tick(
+            &mut self.mix_autotune_controller,
+            self.mix_autotune_current,
+            rails,
+            wait_ratio,
+            rss_ratio,
+            inflight_ratio,
+            2.0,
+        );
+        self.mix_runtime_autotune_pressure_milli = (tick.pressure * 1000.0).round() as u64;
+        if !tick.changed {
+            return;
+        }
+
+        self.mix_autotune_current = tick.next;
+        self.mix_effective_prefetch_batches = tick.next.prefetch_batches;
+        self.mix_effective_max_queue_batches = tick.next.max_queue_batches;
+        for loader in &self.loaders {
+            let mut guard = loader.borrow_mut(py);
+            guard.apply_runtime_overrides(
+                Some(tick.next.prefetch_batches),
+                Some(tick.next.max_queue_batches),
+            );
+        }
+        self.mix_runtime_autotune_adjustments_total = self
+            .mix_runtime_autotune_adjustments_total
+            .saturating_add(1);
+        tracing::info!(
+            target: "mx8_proof",
+            event = "mix_runtime_autotune_adjustment",
+            reason = tick.reason,
+            wait_ratio = wait_ratio,
+            rss_ratio = rss_ratio,
+            inflight_ratio = inflight_ratio,
+            pressure = tick.pressure,
+            prefetch_batches = tick.next.prefetch_batches as u64,
+            max_queue_batches = tick.next.max_queue_batches as u64,
+            "mix runtime autotune adjusted loader knobs"
         );
     }
 }
@@ -1259,6 +1470,7 @@ impl MixedDataLoader {
                         self.delivered_bytes[source_idx].saturating_add(payload_bytes);
                     self.steps_since_emit[source_idx] = 0;
                     self.schedule_ticks = self.schedule_ticks.saturating_add(1);
+                    self.maybe_run_runtime_autotune(py);
                     self.maybe_emit_snapshot(py);
                     return Ok(item);
                 }
@@ -1305,6 +1517,10 @@ impl MixedDataLoader {
         out.set_item("epoch", self.epoch)?;
         out.set_item("mix_profile", self.mix_profile.as_deref())?;
         out.set_item("mix_autotune_enabled", self.mix_autotune_enabled)?;
+        out.set_item(
+            "mix_runtime_autotune_enabled",
+            self.mix_runtime_autotune_enabled,
+        )?;
         out.set_item(
             "mix_effective_prefetch_batches",
             self.mix_effective_prefetch_batches,
@@ -1355,6 +1571,18 @@ impl MixedDataLoader {
         out.set_item(
             "mix_shared_inflight_violation_total",
             self.shared_inflight_violation_total,
+        )?;
+        out.set_item(
+            "mix_runtime_autotune_adjustments_total",
+            self.mix_runtime_autotune_adjustments_total,
+        )?;
+        out.set_item(
+            "mix_runtime_autotune_period_ticks",
+            self.mix_runtime_autotune_period_ticks,
+        )?;
+        out.set_item(
+            "mix_runtime_autotune_pressure",
+            self.mix_runtime_autotune_pressure_milli as f64 / 1000.0,
         )?;
         out.set_item(
             "mix_realized_ratio",
@@ -2402,7 +2630,7 @@ impl VideoDataLoader {
     }
 }
 
-impl ImageFolderLoader {
+impl ImageLoader {
     fn next_python_decode<'py>(
         &self,
         py: Python<'py>,
@@ -2418,17 +2646,17 @@ impl ImageFolderLoader {
 
         let torch = py.import_bound("torch").map_err(|e| {
             PyRuntimeError::new_err(format!(
-                "failed to import torch (install PyTorch to use ImageFolderLoader): {e}"
+                "failed to import torch (install PyTorch to use ImageLoader): {e}"
             ))
         })?;
         let np = py.import_bound("numpy").map_err(|e| {
             PyRuntimeError::new_err(format!(
-                "failed to import numpy (install numpy to use ImageFolderLoader): {e}"
+                "failed to import numpy (install numpy to use ImageLoader): {e}"
             ))
         })?;
         let pil = py.import_bound("PIL.Image").map_err(|e| {
             PyRuntimeError::new_err(format!(
-                "failed to import PIL.Image (install Pillow to use ImageFolderLoader): {e}"
+                "failed to import PIL.Image (install Pillow to use ImageLoader): {e}"
             ))
         })?;
         let io = py.import_bound("io")?;
@@ -2520,7 +2748,7 @@ impl ImageFolderLoader {
 
         let torch = py.import_bound("torch").map_err(|e| {
             PyRuntimeError::new_err(format!(
-                "failed to import torch (install PyTorch to use ImageFolderLoader): {e}"
+                "failed to import torch (install PyTorch to use ImageLoader): {e}"
             ))
         })?;
         let torch_uint8 = torch.getattr("uint8")?;
@@ -2570,13 +2798,13 @@ impl ImageFolderLoader {
 }
 
 #[pymethods]
-impl ImageFolderLoader {
+impl ImageLoader {
     #[new]
     #[pyo3(signature = (
         dataset_link,
         *,
-        manifest_store_root=None,
-        dev_manifest_path=None,
+        manifest_store=None,
+        manifest_path=None,
         recursive=true,
         batch_size_samples=32,
         max_inflight_bytes=128*1024*1024,
@@ -2593,8 +2821,8 @@ impl ImageFolderLoader {
     #[allow(clippy::too_many_arguments)]
     fn new(
         dataset_link: String,
-        manifest_store_root: Option<PathBuf>,
-        dev_manifest_path: Option<PathBuf>,
+        manifest_store: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
         recursive: bool,
         batch_size_samples: usize,
         max_inflight_bytes: u64,
@@ -2610,8 +2838,8 @@ impl ImageFolderLoader {
     ) -> PyResult<Self> {
         let loader = DataLoader::new(
             dataset_link,
-            manifest_store_root,
-            dev_manifest_path,
+            manifest_store,
+            manifest_path,
             recursive,
             batch_size_samples,
             max_inflight_bytes,
@@ -2841,18 +3069,18 @@ impl PyBatch {
 }
 
 #[pyfunction]
-#[pyo3(signature = (dataset_link, *, manifest_store_root=None, dev_manifest_path=None, recursive=true, node_id=None))]
+#[pyo3(signature = (dataset_link, *, manifest_store=None, manifest_path=None, recursive=true, node_id=None))]
 fn resolve_manifest_hash(
     dataset_link: String,
-    manifest_store_root: Option<PathBuf>,
-    dev_manifest_path: Option<PathBuf>,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
     recursive: bool,
     node_id: Option<String>,
 ) -> PyResult<String> {
-    let root = manifest_store_root
+    let root = manifest_store
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
         .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
-    let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
+    let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
     let store = std::sync::Arc::new(FsManifestStore::new(root));
     let resolver = SnapshotResolver::new(
@@ -2881,8 +3109,8 @@ fn resolve_manifest_hash(
 #[pyo3(signature = (
     dataset_link,
     *,
-    manifest_store_root=None,
-    dev_manifest_path=None,
+    manifest_store=None,
+    manifest_path=None,
     recursive=true,
     clip_len=16,
     stride=8,
@@ -2896,8 +3124,8 @@ fn resolve_manifest_hash(
 fn internal_video_index_build<'py>(
     py: Python<'py>,
     dataset_link: String,
-    manifest_store_root: Option<PathBuf>,
-    dev_manifest_path: Option<PathBuf>,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
     recursive: bool,
     clip_len: u32,
     stride: u32,
@@ -2907,10 +3135,10 @@ fn internal_video_index_build<'py>(
     max_clips_in_memory: usize,
     node_id: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let root = manifest_store_root
+    let root = manifest_store
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
         .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
-    let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
+    let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
     let store = std::sync::Arc::new(FsManifestStore::new(root));
     let resolver = SnapshotResolver::new(
@@ -2988,8 +3216,8 @@ fn internal_video_index_build<'py>(
 #[pyo3(signature = (
     dataset_link,
     *,
-    manifest_store_root=None,
-    dev_manifest_path=None,
+    manifest_store=None,
+    manifest_path=None,
     recursive=true,
     clip_len=16,
     stride=8,
@@ -3003,8 +3231,8 @@ fn internal_video_index_build<'py>(
 fn internal_video_index_replay_check<'py>(
     py: Python<'py>,
     dataset_link: String,
-    manifest_store_root: Option<PathBuf>,
-    dev_manifest_path: Option<PathBuf>,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
     recursive: bool,
     clip_len: u32,
     stride: u32,
@@ -3017,8 +3245,8 @@ fn internal_video_index_replay_check<'py>(
     let first = internal_video_index_build(
         py,
         dataset_link.clone(),
-        manifest_store_root.clone(),
-        dev_manifest_path.clone(),
+        manifest_store.clone(),
+        manifest_path.clone(),
         recursive,
         clip_len,
         stride,
@@ -3031,8 +3259,8 @@ fn internal_video_index_replay_check<'py>(
     let second = internal_video_index_build(
         py,
         dataset_link,
-        manifest_store_root,
-        dev_manifest_path,
+        manifest_store,
+        manifest_path,
         recursive,
         clip_len,
         stride,
@@ -3145,8 +3373,8 @@ fn pack_dir<'py>(
 #[pyo3(signature = (
     dataset_link,
     *,
-    manifest_store_root=None,
-    dev_manifest_path=None,
+    manifest_store=None,
+    manifest_path=None,
     recursive=true,
     batch_size_samples=512,
     max_inflight_bytes=128*1024*1024,
@@ -3166,8 +3394,8 @@ fn pack_dir<'py>(
 fn load(
     py: Python<'_>,
     dataset_link: String,
-    manifest_store_root: Option<PathBuf>,
-    dev_manifest_path: Option<PathBuf>,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
     recursive: bool,
     batch_size_samples: usize,
     max_inflight_bytes: u64,
@@ -3281,8 +3509,8 @@ fn load(
 
     let loader = DataLoader::new(
         dataset_link,
-        manifest_store_root,
-        dev_manifest_path,
+        manifest_store,
+        manifest_path,
         recursive,
         batch_size_samples,
         effective_max_inflight_bytes,
@@ -3302,8 +3530,66 @@ fn load(
 #[pyo3(signature = (
     dataset_link,
     *,
-    manifest_store_root=None,
-    dev_manifest_path=None,
+    manifest_store=None,
+    manifest_path=None,
+    recursive=true,
+    batch_size_samples=32,
+    max_inflight_bytes=128*1024*1024,
+    max_queue_batches=64,
+    prefetch_batches=1,
+    target_batch_bytes=None,
+    max_batch_bytes=None,
+    start_id=None,
+    end_id=None,
+    node_id=None,
+    resize_hw=None,
+    to_float=true,
+))]
+#[allow(clippy::too_many_arguments)]
+fn image(
+    py: Python<'_>,
+    dataset_link: String,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    recursive: bool,
+    batch_size_samples: usize,
+    max_inflight_bytes: u64,
+    max_queue_batches: usize,
+    prefetch_batches: usize,
+    target_batch_bytes: Option<u64>,
+    max_batch_bytes: Option<u64>,
+    start_id: Option<u64>,
+    end_id: Option<u64>,
+    node_id: Option<String>,
+    resize_hw: Option<(u32, u32)>,
+    to_float: bool,
+) -> PyResult<Py<ImageLoader>> {
+    let loader = ImageLoader::new(
+        dataset_link,
+        manifest_store,
+        manifest_path,
+        recursive,
+        batch_size_samples,
+        max_inflight_bytes,
+        max_queue_batches,
+        prefetch_batches,
+        target_batch_bytes,
+        max_batch_bytes,
+        start_id,
+        end_id,
+        node_id,
+        resize_hw,
+        to_float,
+    )?;
+    Py::new(py, loader)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    dataset_link,
+    *,
+    manifest_store=None,
+    manifest_path=None,
     recursive=true,
     clip_len=16,
     stride=8,
@@ -3318,8 +3604,8 @@ fn load(
 fn video(
     py: Python<'_>,
     dataset_link: String,
-    manifest_store_root: Option<PathBuf>,
-    dev_manifest_path: Option<PathBuf>,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
     recursive: bool,
     clip_len: u32,
     stride: u32,
@@ -3333,10 +3619,10 @@ fn video(
     if fps == 0 {
         return Err(PyValueError::new_err("video fps must be > 0"));
     }
-    let root = manifest_store_root
+    let root = manifest_store
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
         .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
-    let dev_manifest_path = dev_manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
+    let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
     let store = std::sync::Arc::new(FsManifestStore::new(root));
     let resolver = SnapshotResolver::new(
         store,
@@ -3464,7 +3750,7 @@ fn video(
     seed=0,
     epoch=0,
     starvation_window=10_000,
-    on_source_exhausted="error",
+    source_exhausted="error",
     profile=None,
     autotune=None,
     constraints=None,
@@ -3478,7 +3764,7 @@ fn mix(
     seed: u64,
     epoch: u64,
     starvation_window: u64,
-    on_source_exhausted: &str,
+    source_exhausted: &str,
     profile: Option<String>,
     autotune: Option<bool>,
     constraints: Option<Py<Constraints>>,
@@ -3527,6 +3813,8 @@ fn mix(
     let mut runtime_prefetch_override: Option<usize> = None;
     let mut runtime_max_queue_override: Option<usize> = None;
     let mut shared_max_inflight_override: Option<u64> = None;
+    let mut mix_autotune_rails: Option<AutotuneRails> = None;
+    let mut mix_max_process_rss_bytes: Option<u64> = None;
 
     if has_v1_args {
         let selected_profile = AutotuneProfile::from_name(profile.as_deref());
@@ -3542,6 +3830,7 @@ fn mix(
 
         if mix_autotune_enabled {
             let defaults = ProfileDefaults::for_profile(selected_profile);
+            mix_autotune_rails = Some(AutotuneRails::for_profile(selected_profile));
             runtime_prefetch_override = Some(defaults.prefetch_batches.max(1));
             runtime_max_queue_override = Some(defaults.max_queue_batches.max(1));
             shared_max_inflight_override = Some(defaults.max_inflight_bytes.max(1));
@@ -3564,6 +3853,9 @@ fn mix(
         if let Some(constraints_cfg) = &constraints_cfg {
             if let Some(max_inflight) = constraints_cfg.max_inflight_bytes {
                 shared_max_inflight_override = Some(max_inflight.max(1));
+            }
+            if let Some(max_process) = constraints_cfg.max_process_rss_bytes {
+                mix_max_process_rss_bytes = Some(max_process.max(1));
             }
             if let (Some(max_process_rss), Some(candidate_cap)) = (
                 constraints_cfg.max_process_rss_bytes,
@@ -3605,9 +3897,14 @@ fn mix(
         .unwrap_or_else(|| prefetch_caps.iter().copied().min().unwrap_or(1usize).max(1));
     let mix_effective_max_queue_batches = runtime_max_queue_override
         .unwrap_or_else(|| queue_caps.iter().copied().min().unwrap_or(1usize).max(1));
+    let mix_runtime_autotune_enabled =
+        mix_autotune_enabled && env_bool("MX8_MIX_AUTOTUNE_RUNTIME", false);
+    let mix_runtime_autotune_period_ticks = env_u64("MX8_MIX_AUTOTUNE_PERIOD_TICKS")
+        .unwrap_or(32)
+        .max(1);
 
     let scheduler = WeightedRoundRobin::new(normalized.clone(), seed, epoch);
-    let source_exhaustion_policy = SourceExhaustionPolicy::parse(on_source_exhausted)
+    let source_exhaustion_policy = SourceExhaustionPolicy::parse(source_exhausted)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let n = loaders.len();
     let snapshot_enabled = env_bool("MX8_MIX_SNAPSHOT", false);
@@ -3625,8 +3922,10 @@ fn mix(
         source_exhaustion_policy = source_exhaustion_policy.as_str(),
         profile = mix_profile.as_deref().unwrap_or("legacy"),
         autotune_enabled = mix_autotune_enabled,
+        runtime_autotune_enabled = mix_runtime_autotune_enabled,
         mix_effective_prefetch_batches = mix_effective_prefetch_batches as u64,
         mix_effective_max_queue_batches = mix_effective_max_queue_batches as u64,
+        mix_runtime_autotune_period_ticks = mix_runtime_autotune_period_ticks,
         snapshot_enabled = snapshot_enabled,
         snapshot_period_ticks = snapshot_period_ticks,
         max_queue_batches = ?queue_caps,
@@ -3658,6 +3957,19 @@ fn mix(
         mix_autotune_enabled,
         mix_effective_prefetch_batches,
         mix_effective_max_queue_batches,
+        mix_runtime_autotune_enabled,
+        mix_autotune_rails,
+        mix_autotune_controller: AutotuneController::new(),
+        mix_autotune_current: AutotuneUpdate {
+            want: 1,
+            prefetch_batches: mix_effective_prefetch_batches,
+            max_queue_batches: mix_effective_max_queue_batches,
+        },
+        mix_runtime_autotune_period_ticks,
+        mix_runtime_autotune_last_tick: 0,
+        mix_runtime_autotune_adjustments_total: 0,
+        mix_runtime_autotune_pressure_milli: 0,
+        mix_max_process_rss_bytes,
     };
     Py::new(py, out)
 }
@@ -3665,10 +3977,6 @@ fn mix(
 #[pymodule]
 fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
-    let vision = PyModule::new_bound(py, "vision")?;
-    vision.add_class::<ImageFolderLoader>()?;
-    m.add_submodule(&vision)?;
-    m.setattr("vision", &vision)?;
     let internal = PyModule::new_bound(py, "_internal")?;
     internal.add_function(wrap_pyfunction!(internal_video_index_build, &internal)?)?;
     internal.add_function(wrap_pyfunction!(
@@ -3679,6 +3987,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.setattr("_internal", &internal)?;
 
     m.add_class::<DataLoader>()?;
+    m.add_class::<ImageLoader>()?;
     m.add_class::<MixedDataLoader>()?;
     m.add_class::<VideoDataLoader>()?;
     m.add_class::<VideoBatch>()?;
@@ -3689,6 +3998,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pack, m)?)?;
     m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(image, m)?)?;
     m.add_function(wrap_pyfunction!(video, m)?)?;
     m.add_function(wrap_pyfunction!(mix, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;

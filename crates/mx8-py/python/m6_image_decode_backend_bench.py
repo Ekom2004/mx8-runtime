@@ -65,9 +65,9 @@ def run_once(
         os.environ.pop("MX8_RUST_JPEG_CODEC", None)
 
     def run_phase(target_steps: int) -> tuple[int, int]:
-        loader = mx8.vision.ImageFolderLoader(
+        loader = mx8.image(
             dataset_link,
-            manifest_store_root=store_root,
+            manifest_store=store_root,
             batch_size_samples=batch_size,
             max_inflight_bytes=256 * 1024 * 1024,
             max_queue_batches=64,

@@ -29,7 +29,7 @@ loader = mx8.load(
     autotune=True,
     constraints=mx8.Constraints(
         max_inflight_bytes=512 * 1024 * 1024,
-        max_process_rss_bytes=24 * 1024 * 1024 * 1024,
+        max_ram_bytes=24 * 1024 * 1024 * 1024,
     ),
 )
 ```
@@ -60,7 +60,7 @@ loader = mx8.load(
 
 - Hard caps remain authoritative:
   - `max_inflight_bytes`
-  - optional `max_process_rss_bytes`
+  - optional `max_ram_bytes`
 - Autotune cannot violate cap invariants.
 - Runtime adaptation uses hysteresis/cooldown to avoid oscillation.
 
@@ -77,7 +77,7 @@ On `mx8.load(..., profile=..., autotune=True)`:
 4. Warm up briefly (small fixed step budget) to estimate:
    - `base_rss_bytes` (model/framework/process baseline before deep buffering).
 5. Set caps:
-   - `max_process_rss_bytes` (unless explicitly overridden in `constraints`).
+   - `max_ram_bytes` (unless explicitly overridden in `constraints`).
    - `max_inflight_bytes` (unless explicitly overridden in `constraints`).
 6. Start adaptive loop for runtime knobs:
    - `prefetch_batches`, `max_queue_batches`, `want`.
@@ -90,18 +90,18 @@ Autotune computes caps from budget, then clamps:
 
 - `node_budget_bytes = profile.node_fraction * node_ram_limit - profile.node_reserve_bytes`
 - `per_rank_budget_bytes = floor(node_budget_bytes / local_ranks)`
-- `derived_max_process_rss_bytes = profile.rss_fraction * per_rank_budget_bytes`
-- `derived_max_inflight_bytes = min(profile.inflight_fraction * derived_max_process_rss_bytes, derived_max_process_rss_bytes - base_rss_bytes - profile.rss_guard_bytes)`
+- `derived_max_ram_bytes = profile.rss_fraction * per_rank_budget_bytes`
+- `derived_max_inflight_bytes = min(profile.inflight_fraction * derived_max_ram_bytes, derived_max_ram_bytes - base_rss_bytes - profile.rss_guard_bytes)`
 
 Then apply:
 
-- explicit `constraints.max_process_rss_bytes` if provided
+- explicit `constraints.max_ram_bytes` if provided
 - explicit `constraints.max_inflight_bytes` if provided
 - hard lower/upper bounds from profile safety rails
 
 Rules:
 
-- `max_inflight_bytes <= max_process_rss_bytes`
+- `max_inflight_bytes <= max_ram_bytes`
 - `max_inflight_bytes >= profile.min_inflight_bytes`
 - If derived values violate rails, clamp and emit warning event.
 
@@ -132,7 +132,7 @@ Increase path (only if all are true):
 
 Decrease path (any true):
 
-- RSS near `max_process_rss_bytes`
+- RSS near `max_ram_bytes`
 - inflight near `max_inflight_bytes`
 - persistent queue saturation without throughput gain
 
@@ -146,7 +146,7 @@ Each change is bounded step-size (%-based) and subject to:
 
 `loader.stats()` (or debug endpoint) must include:
 
-- `effective.max_process_rss_bytes`
+- `effective.max_ram_bytes`
 - `effective.max_inflight_bytes`
 - `effective.prefetch_batches`
 - `effective.max_queue_batches`
@@ -168,7 +168,7 @@ Proof events (structured logs):
 
 ## Failure semantics
 
-- If RSS exceeds `max_process_rss_bytes`, fail fast with explicit error (same safety behavior as v0 watchdog).
+- If RSS exceeds `max_ram_bytes`, fail fast with explicit error (same safety behavior as v0 watchdog).
 - If autotune cannot find valid settings under constraints, fail with actionable configuration error.
 - Manual mode (`autotune=False`) never mutates runtime knobs.
 

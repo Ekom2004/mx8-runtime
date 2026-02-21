@@ -24,8 +24,8 @@ def main() -> None:
 
     out = mx8._internal.video_index_build(
         dataset_link,
-        manifest_store_root=str(store_root),
-        dev_manifest_path=str(dev_manifest),
+        manifest_store=str(store_root),
+        manifest_path=str(dev_manifest),
         recursive=True,
         clip_len=4,
         stride=2,
@@ -58,8 +58,8 @@ def main() -> None:
 
     replay = mx8._internal.video_index_replay_check(
         dataset_link,
-        manifest_store_root=str(store_root),
-        dev_manifest_path=str(dev_manifest),
+        manifest_store=str(store_root),
+        manifest_path=str(dev_manifest),
         recursive=True,
         clip_len=4,
         stride=2,
@@ -74,8 +74,8 @@ def main() -> None:
     try:
         mx8._internal.video_index_build(
             dataset_link,
-            manifest_store_root=str(store_root),
-            dev_manifest_path=str(dev_manifest),
+            manifest_store=str(store_root),
+            manifest_path=str(dev_manifest),
             recursive=True,
             clip_len=4,
             stride=2,
@@ -107,7 +107,7 @@ def main() -> None:
     local_mp4.write_bytes(b"\x00" * 400_000)
     local_out = mx8._internal.video_index_build(
         str(local_dir),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=4,
         stride=2,

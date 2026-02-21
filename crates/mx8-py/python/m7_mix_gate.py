@@ -34,32 +34,32 @@ def _run_once(
     weights: list[float],
     max_inflight_bytes: int,
     max_process_rss_bytes: int,
-    on_source_exhausted: str = "allow",
+    source_exhausted: str = "allow",
     mix_profile: str = "balanced",
     mix_autotune: bool = True,
 ):
     loader_a = mx8.load(
         link_a,
-        manifest_store_root=store_root,
-        dev_manifest_path=manifest_a,
+        manifest_store=store_root,
+        manifest_path=manifest_a,
         batch_size_samples=1,
         max_queue_batches=8,
         prefetch_batches=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
     )
     loader_b = mx8.load(
         link_b,
-        manifest_store_root=store_root,
-        dev_manifest_path=manifest_b,
+        manifest_store=store_root,
+        manifest_path=manifest_b,
         batch_size_samples=1,
         max_queue_batches=8,
         prefetch_batches=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
     )
 
@@ -69,12 +69,12 @@ def _run_once(
         seed=seed,
         epoch=epoch,
         starvation_window=10_000,
-        on_source_exhausted=on_source_exhausted,
+        source_exhausted=source_exhausted,
         profile=mix_profile,
         autotune=mix_autotune,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
         runtime=mx8.RuntimeConfig(
             prefetch_batches=1,
@@ -127,22 +127,22 @@ def _run_source_exhaustion_policy_checks(
 ) -> None:
     loader_a = mx8.load(
         link_a,
-        manifest_store_root=store_root,
-        dev_manifest_path=manifest_a,
+        manifest_store=store_root,
+        manifest_path=manifest_a,
         batch_size_samples=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
     )
     loader_b = mx8.load(
         link_b,
-        manifest_store_root=store_root,
-        dev_manifest_path=manifest_b,
+        manifest_store=store_root,
+        manifest_path=manifest_b,
         batch_size_samples=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
     )
     mixed_error = mx8.mix(
@@ -150,12 +150,12 @@ def _run_source_exhaustion_policy_checks(
         weights=[1.0, 1.0],
         seed=19,
         epoch=5,
-        on_source_exhausted="error",
+        source_exhausted="error",
         profile="balanced",
         autotune=True,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
         runtime=mx8.RuntimeConfig(
             prefetch_batches=1,
@@ -171,28 +171,28 @@ def _run_source_exhaustion_policy_checks(
         if "source exhausted" not in message:
             raise RuntimeError(f"unexpected exhaustion error message: {message}") from err
     else:
-        raise RuntimeError("expected RuntimeError for on_source_exhausted=error")
+        raise RuntimeError("expected RuntimeError for source_exhausted=error")
     if seen == 0:
         raise RuntimeError("source exhaustion error fired before any progress")
 
     loader_a_allow = mx8.load(
         link_a,
-        manifest_store_root=store_root,
-        dev_manifest_path=manifest_a,
+        manifest_store=store_root,
+        manifest_path=manifest_a,
         batch_size_samples=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
     )
     loader_b_allow = mx8.load(
         link_b,
-        manifest_store_root=store_root,
-        dev_manifest_path=manifest_b,
+        manifest_store=store_root,
+        manifest_path=manifest_b,
         batch_size_samples=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
     )
     mixed_allow = mx8.mix(
@@ -200,12 +200,12 @@ def _run_source_exhaustion_policy_checks(
         weights=[1.0, 1.0],
         seed=19,
         epoch=5,
-        on_source_exhausted="allow",
+        source_exhausted="allow",
         profile="balanced",
         autotune=True,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=max_process_rss_bytes,
+            max_ram_bytes=max_process_rss_bytes,
         ),
         runtime=mx8.RuntimeConfig(
             prefetch_batches=1,
@@ -216,7 +216,7 @@ def _run_source_exhaustion_policy_checks(
     for _batch in mixed_allow:
         seen_allow += 1
     if seen_allow == 0:
-        raise RuntimeError("expected progress for on_source_exhausted=allow")
+        raise RuntimeError("expected progress for source_exhausted=allow")
     allow_stats = mixed_allow.stats()
     policy = str(allow_stats.get("mix_source_exhaustion_policy", ""))
     if policy != "allow":
@@ -293,7 +293,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
-        on_source_exhausted="allow",
+        source_exhausted="allow",
         mix_profile="balanced",
         mix_autotune=True,
     )
@@ -309,7 +309,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
-        on_source_exhausted="allow",
+        source_exhausted="allow",
         mix_profile="balanced",
         mix_autotune=True,
     )
@@ -325,7 +325,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
-        on_source_exhausted="allow",
+        source_exhausted="allow",
         mix_profile="balanced",
         mix_autotune=True,
     )
@@ -350,7 +350,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
-        on_source_exhausted="allow",
+        source_exhausted="allow",
         mix_profile="balanced",
         mix_autotune=True,
     )
@@ -366,7 +366,7 @@ def main() -> None:
         weights=weights,
         max_inflight_bytes=max_inflight_bytes,
         max_process_rss_bytes=max_process_rss_bytes,
-        on_source_exhausted="allow",
+        source_exhausted="allow",
         mix_profile="balanced",
         mix_autotune=True,
     )

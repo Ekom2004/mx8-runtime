@@ -133,8 +133,8 @@ def _check_stage1_failure_taxonomy(store_root: Path, tmp_root: Path) -> dict:
     _write_stage1_failure_manifest(manifest)
     out = mx8._internal.video_index_build(
         "s3://bucket/video_stage2b/@refresh",
-        manifest_store_root=str(store_root),
-        dev_manifest_path=str(manifest),
+        manifest_store=str(store_root),
+        manifest_path=str(manifest),
         recursive=True,
         clip_len=4,
         stride=2,
@@ -164,13 +164,13 @@ def _check_runtime_io_failure(
 ) -> str:
     constraints = mx8.Constraints(
         max_inflight_bytes=8 * 1024 * 1024,
-        max_process_rss_bytes=None,
+        max_ram_bytes=None,
     )
     _ffmpeg_bin()
     doomed = _make_failure_probe_video(data_root)
     loader = mx8.video(
         str(data_root),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=clip_len,
         stride=stride,
@@ -215,12 +215,12 @@ def main() -> None:
 
     constraints = mx8.Constraints(
         max_inflight_bytes=128 * 1024,
-        max_process_rss_bytes=None,
+        max_ram_bytes=None,
     )
 
     loader1 = mx8.video(
         str(ds_root),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=clip_len,
         stride=stride,
@@ -235,7 +235,7 @@ def main() -> None:
 
     loader2 = mx8.video(
         str(ds_root),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=clip_len,
         stride=stride,
@@ -274,7 +274,7 @@ def main() -> None:
     try:
         mx8.video(
             str(ds_root),
-            manifest_store_root=str(store_root),
+            manifest_store=str(store_root),
             recursive=True,
             clip_len=clip_len,
             stride=stride,
@@ -284,7 +284,7 @@ def main() -> None:
             epoch=epoch,
             constraints=mx8.Constraints(
                 max_inflight_bytes=2 * 1024,
-                max_process_rss_bytes=None,
+                max_ram_bytes=None,
             ),
         )
         raise RuntimeError("expected max_inflight_bytes guard to reject config")

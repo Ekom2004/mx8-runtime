@@ -122,7 +122,7 @@ def _run_loader(
     started = time.perf_counter()
     loader = mx8.video(
         str(dataset_root),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=clip_len,
         stride=stride,
@@ -132,7 +132,7 @@ def _run_loader(
         epoch=epoch,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
-            max_process_rss_bytes=None,
+            max_ram_bytes=None,
         ),
     )
     seq = []

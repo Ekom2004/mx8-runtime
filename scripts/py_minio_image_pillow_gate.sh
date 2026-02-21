@@ -6,7 +6,7 @@ set -euo pipefail
 # Proves the end-to-end "vision v0" user story:
 # - Seed ImageFolder-style JPEGs into MinIO (S3-compatible).
 # - Pack raw prefix -> tar shards + `_mx8/manifest.tsv`.
-# - `mx8.vision.ImageFolderLoader` reads + decodes JPEGs and yields `(images, labels)` torch tensors.
+# - `mx8.image(...)` reads + decodes JPEGs and yields `(images, labels)` torch tensors.
 # - A tiny Torch loop trains for N steps.
 #
 # Usage:

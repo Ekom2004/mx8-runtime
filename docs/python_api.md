@@ -9,7 +9,7 @@ This page documents the API that ships today in `mx8==0.x`.
 
 ## Snapshot + packing
 
-- `mx8.resolve_manifest_hash(dataset_link, *, manifest_store_root=None, dev_manifest_path=None, recursive=True, node_id=None) -> str`
+- `mx8.resolve_manifest_hash(dataset_link, *, manifest_store=None, manifest_path=None, recursive=True, node_id=None) -> str`
 - `mx8.pack(pack_in, *, out, shard_mb=512, label_mode="auto", require_labels=False) -> dict`
   - S3 input/output packer (`s3://...`).
 - `mx8.pack_dir(in_dir, *, out, shard_mb=512, label_mode="auto", require_labels=False) -> dict`
@@ -40,14 +40,13 @@ for batch in loader:
 ### `mx8.load` args
 
 - `dataset_link` (`plain`, `@refresh`, `@sha256:...`)
-- `manifest_store_root` (default `/var/lib/mx8/manifests`)
-- `dev_manifest_path` (dev-only local manifest source)
+- `manifest_store` (default `/var/lib/mx8/manifests`)
+- `manifest_path` (dev-only local manifest source)
 - `recursive` (default `True`; set `False` to only index top-level objects/files under the prefix)
 - `batch_size_samples`
 - `max_inflight_bytes`
 - `max_queue_batches`
 - `prefetch_batches`
-- `max_process_rss_bytes`
 - `start_id`, `end_id` (must be set together)
 - `node_id` (for lock ownership/proof logs)
 - `profile` (`safe|balanced|throughput`)
@@ -62,11 +61,12 @@ import mx8
 
 loader = mx8.load(
     "s3://bucket/train@refresh",
+    manifest_store="/var/lib/mx8/manifests",
     profile="throughput",
     autotune=True,
     constraints=mx8.Constraints(
         max_inflight_bytes=512 * 1024 * 1024,
-        max_process_rss_bytes=24 * 1024 * 1024 * 1024,
+        max_ram_bytes=24 * 1024 * 1024 * 1024,
     ),
 )
 
@@ -99,14 +99,14 @@ loader_manual = mx8.load(
 
 Hidden operator guard (env-only): set `MX8_MAX_PROCESS_RSS_BYTES` to enforce a process RSS hard limit (fail-fast instead of OS OOM kill).
 
-## Vision loader
+## Image loader
 
-Use `mx8.vision.ImageFolderLoader(...)` when manifests include ImageFolder label hints.
+Use `mx8.image(...)` when manifests include ImageFolder label hints.
 
 ```python
 import mx8
 
-loader = mx8.vision.ImageFolderLoader(
+loader = mx8.image(
     "s3://bucket/mx8/train/@refresh",
     batch_size_samples=64,
     resize_hw=(224, 224),
@@ -243,7 +243,7 @@ mixed = mx8.mix(
     weights=[0.7, 0.3],
     seed=17,
     epoch=3,
-    on_source_exhausted="error",  # default: fail fast
+    source_exhausted="error",  # default: fail fast
     profile="balanced",
     autotune=True,
     constraints=mx8.Constraints(max_inflight_bytes=256 * 1024 * 1024),
@@ -256,7 +256,7 @@ Arguments:
 - `weights`: positive list, same length as `loaders`.
 - `seed`, `epoch`: deterministic scheduling inputs.
 - `starvation_window`: scheduler starvation accounting window.
-- `on_source_exhausted`: `error|allow` (default `error`).
+- `source_exhausted`: `error|allow` (default `error`).
 - `profile`: `safe|balanced|throughput` profile rails for shared mix defaults.
 - `autotune`: when `True`, applies profile defaults before explicit overrides.
 - `constraints`: optional `mx8.Constraints` override for shared mix cap.

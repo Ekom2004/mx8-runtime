@@ -6,7 +6,7 @@ set -euo pipefail
 # Proves the frictionless user story without infra:
 # - Create a tiny ImageFolder-style directory on disk.
 # - `mx8.pack_dir(...)` packs it into tar shards + `_mx8/manifest.tsv` + `_mx8/labels.tsv`.
-# - `mx8.vision.ImageFolderLoader` yields `(images, labels)` torch tensors.
+# - `mx8.image(...)` yields `(images, labels)` torch tensors.
 # - A tiny Torch loop trains for N steps.
 #
 # Usage:
@@ -86,16 +86,16 @@ if int(res["samples"]) != 4:
     raise SystemExit(f"unexpected pack_dir result: {res}")
 PY
 
-echo "[mx8] python: ImageFolderLoader.classes"
+echo "[mx8] python: mx8.image classes"
 MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
 MX8_DATASET_LINK="${OUT_DIR}@refresh" \
 "${PYTHON_BIN}" - <<'PY' >/dev/null
 import os
 import mx8
 
-loader = mx8.vision.ImageFolderLoader(
+loader = mx8.image(
     os.environ["MX8_DATASET_LINK"],
-    manifest_store_root=os.environ["MX8_MANIFEST_STORE_ROOT"],
+    manifest_store=os.environ["MX8_MANIFEST_STORE_ROOT"],
     batch_size_samples=2,
     prefetch_batches=2,
 )

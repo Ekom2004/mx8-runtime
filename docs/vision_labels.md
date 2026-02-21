@@ -50,7 +50,7 @@ Use one of:
 
 ## Training vs inference/ETL
 
-- Training/classification: labels typically required; use `ImageFolderLoader` or `batch.to_torch_with_labels()`.
+- Training/classification: labels typically required; use `mx8.image(...)` or `batch.to_torch_with_labels()`.
 - Inference/ETL: labels optional; use `mx8.load(...)` and process raw bytes / sample IDs.
 
 ## API contract to users

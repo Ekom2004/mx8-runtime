@@ -12,8 +12,8 @@ def main() -> None:
     link = os.environ.get("MX8_DATASET_LINK", "/tmp/dev@refresh")
     loader = mx8.DataLoader(
         link,
-        manifest_store_root=root,
-        dev_manifest_path=dev_manifest,
+        manifest_store=root,
+        manifest_path=dev_manifest,
         batch_size_samples=8,
         max_inflight_bytes=64 * 1024,
         max_queue_batches=16,

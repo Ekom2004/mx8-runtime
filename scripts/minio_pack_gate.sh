@@ -169,7 +169,7 @@ link = os.environ["MX8_DATASET_LINK"]
 
 loader = mx8.DataLoader(
     link,
-    manifest_store_root=root,
+    manifest_store=root,
     batch_size_samples=2,
     max_inflight_bytes=8 * 1024 * 1024,
     max_queue_batches=8,

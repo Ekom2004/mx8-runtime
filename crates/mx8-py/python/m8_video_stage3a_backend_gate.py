@@ -61,7 +61,7 @@ def _run_backend(
     os.environ["MX8_VIDEO_DECODE_BACKEND"] = backend
     loader = mx8.video(
         str(data_root),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=clip_len,
         stride=stride,
@@ -71,7 +71,7 @@ def _run_backend(
         epoch=epoch,
         constraints=mx8.Constraints(
             max_inflight_bytes=128 * 1024 * 1024,
-            max_process_rss_bytes=None,
+            max_ram_bytes=None,
         ),
     )
 

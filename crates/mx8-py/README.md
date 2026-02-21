@@ -39,7 +39,7 @@ mx8.pack_dir(
     require_labels=True,
 )
 
-loader = mx8.vision.ImageFolderLoader(
+loader = mx8.image(
     "/path/to/mx8-dataset@refresh",
     batch_size_samples=64,
     max_inflight_bytes=256 * 1024 * 1024,
@@ -112,7 +112,7 @@ Set a hard cap and periodically print high-water marks:
 ```python
 import mx8
 
-loader = mx8.vision.ImageFolderLoader(
+loader = mx8.image(
     "/path/to/mx8-dataset@refresh",
     batch_size_samples=64,
     max_inflight_bytes=256 * 1024 * 1024,

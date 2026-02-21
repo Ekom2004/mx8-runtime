@@ -47,7 +47,7 @@ Treat memory safety as layered:
 To close the remaining OOM gap:
 
 - `max_batch_bytes` / `max_batch_tokens`: cap per-batch workload size.
-- `max_process_rss_bytes`: whole-process watchdog.
+- `max_ram_bytes`: whole-process watchdog.
   - soft threshold: throttle intake + warn.
   - hard threshold: fail fast with clear error (instead of OS OOM kill).
 

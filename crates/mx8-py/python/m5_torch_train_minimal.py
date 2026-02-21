@@ -22,8 +22,8 @@ def main() -> None:
 
     loader = mx8.DataLoader(
         link,
-        manifest_store_root=root,
-        dev_manifest_path=dev_manifest,
+        manifest_store=root,
+        manifest_path=dev_manifest,
         batch_size_samples=32,
         max_inflight_bytes=8 * 1024 * 1024,
         max_queue_batches=16,

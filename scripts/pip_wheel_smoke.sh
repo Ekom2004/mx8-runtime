@@ -8,7 +8,7 @@ set -euo pipefail
 #   ./scripts/pip_wheel_smoke.sh
 #
 # Notes:
-# - Installs torch + pillow + numpy to exercise `mx8.vision.ImageFolderLoader`.
+# - Installs torch + pillow + numpy to exercise `mx8.image(...)`.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
@@ -62,9 +62,9 @@ write("dog", "1.jpg", (0, 200, 0))
 
 mx8.pack_dir(raw_dir, out=out_dir, shard_mb=1, label_mode="imagefolder", require_labels=True)
 
-loader = mx8.vision.ImageFolderLoader(
+loader = mx8.image(
     f"{out_dir}@refresh",
-    manifest_store_root=store_root,
+    manifest_store=store_root,
     batch_size_samples=2,
     max_inflight_bytes=64 * 1024,
     max_queue_batches=4,

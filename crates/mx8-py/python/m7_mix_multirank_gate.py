@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import multiprocessing as mp
 import os
-import struct
+import queue as py_queue
 import traceback
 
 import mx8
@@ -80,26 +80,26 @@ def _worker(
 
         loader_a = mx8.load(
             link_a,
-            manifest_store_root=store_root,
-            dev_manifest_path=manifest_a,
+            manifest_store=store_root,
+            manifest_path=manifest_a,
             start_id=start_id,
             end_id=end_id,
             batch_size_samples=1,
             constraints=mx8.Constraints(
                 max_inflight_bytes=max_inflight_bytes,
-                max_process_rss_bytes=max_process_rss_bytes,
+                max_ram_bytes=max_process_rss_bytes,
             ),
         )
         loader_b = mx8.load(
             link_b,
-            manifest_store_root=store_root,
-            dev_manifest_path=manifest_b,
+            manifest_store=store_root,
+            manifest_path=manifest_b,
             start_id=start_id,
             end_id=end_id,
             batch_size_samples=1,
             constraints=mx8.Constraints(
                 max_inflight_bytes=max_inflight_bytes,
-                max_process_rss_bytes=max_process_rss_bytes,
+                max_ram_bytes=max_process_rss_bytes,
             ),
         )
 
@@ -108,12 +108,12 @@ def _worker(
             weights=weights,
             seed=seed,
             epoch=epoch,
-            on_source_exhausted="allow",
+            source_exhausted="allow",
             profile="balanced",
             autotune=True,
             constraints=mx8.Constraints(
                 max_inflight_bytes=max_inflight_bytes,
-                max_process_rss_bytes=max_process_rss_bytes,
+                max_ram_bytes=max_process_rss_bytes,
             ),
             runtime=mx8.RuntimeConfig(prefetch_batches=1, max_queue_batches=8),
         )
@@ -151,9 +151,35 @@ def _run_once(
         proc.start()
 
     results: list[list[str] | None] = [None] * world_size
-    for _ in range(world_size):
-        rank, ids = queue.get()
-        results[int(rank)] = list(ids)
+    pending = world_size
+    while pending > 0:
+        try:
+            rank, ids = queue.get(timeout=1.0)
+        except py_queue.Empty:
+            failed = [proc for proc in procs if proc.exitcode not in (None, 0)]
+            if failed:
+                for proc in procs:
+                    if proc.is_alive():
+                        proc.terminate()
+                for proc in procs:
+                    proc.join(timeout=1.0)
+                fail_desc = ", ".join(
+                    f"pid={proc.pid} exit={proc.exitcode}" for proc in failed
+                )
+                raise RuntimeError(
+                    f"mix multirank gate worker exited before publishing results: {fail_desc}"
+                )
+            if not any(proc.is_alive() for proc in procs):
+                break
+            continue
+
+        rank_idx = int(rank)
+        if rank_idx < 0 or rank_idx >= world_size:
+            raise RuntimeError(f"invalid rank from worker: {rank_idx}")
+        if results[rank_idx] is not None:
+            raise RuntimeError(f"duplicate result from rank {rank_idx}")
+        results[rank_idx] = list(ids)
+        pending -= 1
 
     for proc in procs:
         proc.join()
@@ -161,6 +187,13 @@ def _run_once(
             raise RuntimeError(
                 f"mix multirank gate failed: process {proc.pid} exit code {proc.exitcode}"
             )
+
+    missing_ranks = [rank for rank, ids in enumerate(results) if ids is None]
+    if missing_ranks:
+        raise RuntimeError(
+            f"missing worker results from ranks={missing_ranks}; "
+            "workers may have exited before publishing to queue"
+        )
 
     per_rank = [ids or [] for ids in results]
     total_ids = 0
@@ -171,21 +204,51 @@ def _run_once(
         total_ids += len(ids)
         if len(ids) != len(set(ids)):
             raise RuntimeError(f"duplicates within rank {rank}")
-        ids_sorted = sorted(ids)
-        digests.append(_digest_ids(ids_sorted))
-        overlap = union.intersection(ids_sorted)
+        # Preserve emission order for digest so epoch/seed schedule changes are observable.
+        digests.append(_digest_ids(ids))
+        overlap = union.intersection(ids)
         if overlap:
             first = sorted(overlap)[0]
             raise RuntimeError(
                 f"overlap detected: sample={first} (rank={rank} and earlier rank)"
             )
-        union.update(ids_sorted)
+        union.update(ids)
 
     return per_rank, digests, total_ids, len(union)
 
 
+def _run_with_weights(
+    world_size: int,
+    total_samples: int,
+    steps: int,
+    seed: int,
+    epoch: int,
+    weights_csv: str | None,
+) -> tuple[list[list[str]], list[str], int, int]:
+    prev = os.environ.get("MX8_MIX_GATE_WEIGHTS")
+    try:
+        if weights_csv is None:
+            os.environ.pop("MX8_MIX_GATE_WEIGHTS", None)
+        else:
+            os.environ["MX8_MIX_GATE_WEIGHTS"] = weights_csv
+        return _run_once(
+            world_size=world_size,
+            total_samples=total_samples,
+            steps=steps,
+            seed=seed,
+            epoch=epoch,
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("MX8_MIX_GATE_WEIGHTS", None)
+        else:
+            os.environ["MX8_MIX_GATE_WEIGHTS"] = prev
+
+
 def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "4"))
+    if world_size <= 0:
+        raise RuntimeError(f"WORLD_SIZE must be >= 1, got={world_size}")
     total_samples = int(os.environ.get("MX8_TOTAL_SAMPLES", "2048"))
     steps = int(os.environ.get("MX8_MIX_DDP_STEPS", "128"))
     seed = int(os.environ.get("MX8_MIX_GATE_SEED", "17"))
@@ -193,6 +256,7 @@ def main() -> None:
     expect_epoch_drift = (
         os.environ.get("MX8_MIX_GATE_EXPECT_EPOCH_DRIFT", "1").strip() == "1"
     )
+    drift_probe_weights = os.environ.get("MX8_MIX_GATE_EPOCH_DRIFT_WEIGHTS", "1.0,1.0")
 
     per_rank_a, digests_a, total_ids_a, union_ids_a = _run_once(
         world_size=world_size,
@@ -221,9 +285,29 @@ def main() -> None:
         epoch=epoch + 1,
     )
     if expect_epoch_drift and digests_a == digests_c:
-        raise RuntimeError(
-            f"mix multirank epoch drift expected but digests unchanged: {digests_a}"
+        # Some imbalanced weights can produce the same finite prefix across epochs.
+        # Probe with tie-heavy weights to verify epoch-dependent tie breaking.
+        _probe_rank_a, probe_a, _probe_total_a, _probe_union_a = _run_with_weights(
+            world_size=world_size,
+            total_samples=total_samples,
+            steps=steps,
+            seed=seed,
+            epoch=epoch,
+            weights_csv=drift_probe_weights,
         )
+        _probe_rank_b, probe_b, _probe_total_b, _probe_union_b = _run_with_weights(
+            world_size=world_size,
+            total_samples=total_samples,
+            steps=steps,
+            seed=seed,
+            epoch=epoch + 1,
+            weights_csv=drift_probe_weights,
+        )
+        if probe_a == probe_b:
+            raise RuntimeError(
+                "mix multirank epoch drift expected but digests unchanged for both "
+                f"default and probe weights={drift_probe_weights!r}: {digests_a}"
+            )
 
     print("ranks:", world_size)
     print("steps:", steps)

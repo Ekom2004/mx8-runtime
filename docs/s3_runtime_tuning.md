@@ -66,7 +66,7 @@ In v0, use layered caps:
 In v1, planned additions complete the safety envelope:
 
 - per-batch cap: `max_batch_bytes` / `max_batch_tokens`
-- process cap: `max_process_rss_bytes` (whole process RAM watchdog)
+- process cap: `max_ram_bytes` (whole process RAM watchdog)
 
 ## S3 throttling notes
 

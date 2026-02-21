@@ -85,11 +85,11 @@ def main() -> None:
     seed = int(os.environ.get("MX8_VIDEO_STAGE2A_SEED", "23"))
     epoch = int(os.environ.get("MX8_VIDEO_STAGE2A_EPOCH", "5"))
 
-    constraints = mx8.Constraints(max_inflight_bytes=64 * 1024, max_process_rss_bytes=None)
+    constraints = mx8.Constraints(max_inflight_bytes=64 * 1024, max_ram_bytes=None)
 
     loader1 = mx8.video(
         str(ds_root),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=clip_len,
         stride=stride,
@@ -104,7 +104,7 @@ def main() -> None:
 
     loader2 = mx8.video(
         str(ds_root),
-        manifest_store_root=str(store_root),
+        manifest_store=str(store_root),
         recursive=True,
         clip_len=clip_len,
         stride=stride,
@@ -129,7 +129,7 @@ def main() -> None:
     try:
         mx8.video(
             str(ds_root),
-            manifest_store_root=str(store_root),
+            manifest_store=str(store_root),
             recursive=True,
             clip_len=clip_len,
             stride=stride,
@@ -137,7 +137,7 @@ def main() -> None:
             batch_size_samples=batch_size,
             seed=seed,
             epoch=epoch,
-            constraints=mx8.Constraints(max_inflight_bytes=2 * 1024, max_process_rss_bytes=None),
+            constraints=mx8.Constraints(max_inflight_bytes=2 * 1024, max_ram_bytes=None),
         )
         raise RuntimeError("expected max_inflight_bytes guard to reject config")
     except ValueError as e:

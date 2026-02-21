@@ -101,4 +101,4 @@ If you want deterministic failure before OS OOM kill, set:
 
 - `MX8_MAX_PROCESS_RSS_BYTES=<bytes>`
 
-When process RSS exceeds this cap, MX8 fails fast with a clear `process rss ... exceeds max_process_rss_bytes ...` error.
+When process RSS exceeds this cap, MX8 fails fast with a clear `process rss ... exceeds max_ram_bytes ...` error.
