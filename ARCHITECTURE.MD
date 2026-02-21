@@ -275,8 +275,5 @@ Date: 2026-02-12
 
 ### Autotune rollout status (v0)
 - Startup profile autotune is available on v1-style API calls (for example `profile`, `constraints`, and `runtime` args).
-- Runtime autotune loops are currently env-gated by surface:
-  - `mx8.load(...)`: `MX8_LOAD_AUTOTUNE_RUNTIME=1`
-  - `mx8.mix(...)`: `MX8_MIX_AUTOTUNE_RUNTIME=1`
-  - `mx8.DistributedDataLoader(...)`: `MX8_AUTOTUNE=1`
+- Runtime autotune loops are controlled through loader API args (`profile`, `autotune`, caps/constraints) on supported surfaces.
 - Runtime autotune is intentionally not universal yet across all surfaces (for example video path), to keep contract and stability risk bounded during v0.

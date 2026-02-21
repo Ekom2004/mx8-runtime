@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Python+MinIO gate for "vision v0" ergonomics:
+# Python+MinIO gate for image ergonomics:
 #
 # Proves:
 # - `mx8.DataLoader` can resolve `s3://bucket/prefix@refresh` via LIST (MinIO).
@@ -9,7 +9,7 @@ set -euo pipefail
 # - Runtime delivers `label_ids` alongside `(payload, offsets, sample_ids)`.
 #
 # Usage:
-#   ./scripts/py_minio_imagefolder_gate.sh
+#   ./scripts/py_minio_image_gate.sh
 #
 # Prereqs:
 # - docker (daemon running)
@@ -39,7 +39,7 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mx8-py-minio-imagefolder-gate.XXXXXX")"
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mx8-py-minio-image-gate.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 VENV_DIR="${TMP_ROOT}/venv"
@@ -63,10 +63,10 @@ echo "[mx8] maturin develop (mx8, with s3 enabled)"
 IMAGE="${MX8_MINIO_IMAGE:-minio/minio:latest}"
 PORT="${MX8_MINIO_PORT:-9000}"
 CONSOLE_PORT="${MX8_MINIO_CONSOLE_PORT:-9001}"
-NAME="mx8-minio-py-imagefolder-gate-$$"
+NAME="mx8-minio-py-image-gate-$$"
 
-BUCKET="${MX8_MINIO_BUCKET:-mx8-vision}"
-PREFIX="${MX8_MINIO_PREFIX:-vision/}"
+BUCKET="${MX8_MINIO_BUCKET:-mx8-image}"
+PREFIX="${MX8_MINIO_PREFIX:-image/}"
 
 STORE_ROOT="${TMP_ROOT}/store"
 SEED_FILE="${TMP_ROOT}/seed.bin"
@@ -170,6 +170,6 @@ want = [(0, 0), (1, 0), (2, 1), (3, 1)]  # cat=0, dog=1 (lexicographic label ord
 if seen != want:
     raise SystemExit(f"unexpected (sample_id,label_id) pairs: got={seen} want={want}")
 
-print("[mx8] py_minio_imagefolder_gate OK")
+print("[mx8] py_minio_image_gate OK")
 PY
 

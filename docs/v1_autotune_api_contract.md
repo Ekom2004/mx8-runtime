@@ -1,6 +1,6 @@
 # MX8 v1 Autotune API Contract (Planned)
 
-Status: **planned for v1** (not shipped in `mx8==0.x`)
+Status: **active contract direction** for current loader API cleanup.
 
 ## Goals
 

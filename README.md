@@ -9,7 +9,7 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 ## Documentation
 
 - Python API: `docs/python_api.md`
-- Vision labels/layouts: `docs/vision_labels.md`
+- Image labels/layouts: `docs/vision_labels.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
 - Troubleshooting: `docs/troubleshooting.md`
 - Mix contract/runbook: `docs/mix_v17_contract.md`, `docs/mix_gate_runbook.md`
@@ -18,18 +18,8 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 
 MX8 currently has two autotune layers:
 
-- Startup autotune (profile defaults + caps): enabled when using v1 API args such as `profile`, `constraints`, and `runtime`.
-- Runtime autotune (feedback loop): env-gated for specific surfaces.
-
-Current runtime autotune toggles:
-
-- `mx8.load(...)`: `MX8_LOAD_AUTOTUNE_RUNTIME=1`
-- `mx8.mix(...)`: `MX8_MIX_AUTOTUNE_RUNTIME=1`
-- `mx8.DistributedDataLoader(...)`: `MX8_AUTOTUNE=1`
-
-Optional profile selector:
-
-- `MX8_AUTOTUNE_PROFILE=safe|balanced|throughput`
+- Startup autotune (profile defaults + caps): applied from API args such as `profile`, `max_ram_gb`, `constraints`, and `runtime`.
+- Runtime autotune (feedback loop): available by loader surface and controlled by loader autotune/runtime settings.
 
 ## Bounded memory (v0)
 
@@ -41,9 +31,8 @@ import mx8
 loader = mx8.image(
     "/path/to/mx8-dataset@refresh",
     batch_size_samples=64,
-    max_inflight_bytes=256 * 1024 * 1024,
-    max_queue_batches=8,
-    prefetch_batches=4,
+    max_ram_gb=12,
+    profile="balanced",
 )
 
 for step, (images, labels) in enumerate(loader):
@@ -66,7 +55,7 @@ for step, (images, labels) in enumerate(loader):
   - `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_DEMO2_MINIO_SCALE=1 MX8_SMOKE_MINIO_MANIFEST_STORE=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_MINIO_PACK=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_PY_VISION_PILLOW=1 ./scripts/smoke.sh` (heavier; installs torch+pillow in a temp venv)
+  - `MX8_SMOKE_PY_IMAGE_PILLOW=1 ./scripts/smoke.sh` (heavier; installs torch+pillow in a temp venv)
 - PyTorch DDP gates (local multi-process):
   - `MX8_SMOKE_TORCH_DDP=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_TORCH_DDP_NODUPES=1 ./scripts/smoke.sh`
@@ -81,13 +70,13 @@ for step, (images, labels) in enumerate(loader):
 
 ## Packing (v0)
 
-If your dataset is “many small S3 objects” (e.g. ImageFolder layout with millions of files), run `mx8-pack-s3` once to create tar shards plus a byte-range manifest:
+If your dataset is “many small S3 objects” (e.g. image-class-folder layout with millions of files), run `mx8-pack-s3` once to create tar shards plus a byte-range manifest:
 
 - Input: `s3://bucket/raw/train/`
 - Output: `s3://bucket/mx8/train/`
   - shards: `s3://bucket/mx8/train/shards/shard-00000.tar`
   - manifest: `s3://bucket/mx8/train/_mx8/manifest.tsv`
-  - labels (optional): `s3://bucket/mx8/train/_mx8/labels.tsv` (if ImageFolder labels are enabled)
+  - labels (optional): `s3://bucket/mx8/train/_mx8/labels.tsv` (if image-folder labels are enabled)
 
 You can run the packer either via the CLI:
 
@@ -100,9 +89,9 @@ Or via the Python API (after installing `mx8`):
 
 Then point MX8 at the packed prefix (snapshot resolver will use the precomputed manifest, avoiding large LIST operations).
 
-## Vision v0 (ImageFolder, PyTorch)
+## Image Loader (PyTorch)
 
-For ImageFolder-style datasets (`prefix/<label>/<file>`), MX8 can deliver `(images, labels)` directly as torch tensors:
+For class-folder datasets (`prefix/<label>/<file>`), MX8 can deliver `(images, labels)` directly as torch tensors:
 
 ```python
 import mx8
@@ -170,9 +159,7 @@ mixed = mx8.mix(
     seed=17,
     epoch=3,
     source_exhausted="error",  # or "allow"
+    max_ram_gb=12,
     profile="balanced",
-    autotune=True,
-    constraints=mx8.Constraints(max_inflight_bytes=256 * 1024 * 1024),
-    runtime=mx8.RuntimeConfig(prefetch_batches=1, max_queue_batches=8),
 )
 ```

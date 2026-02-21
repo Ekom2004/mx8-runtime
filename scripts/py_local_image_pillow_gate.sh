@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Local (no S3/MinIO) vision training gate:
+# Local (no S3/MinIO) image training gate:
 #
 # Proves the frictionless user story without infra:
 # - Create a tiny ImageFolder-style directory on disk.
@@ -10,7 +10,7 @@ set -euo pipefail
 # - A tiny Torch loop trains for N steps.
 #
 # Usage:
-#   ./scripts/py_local_vision_pillow_gate.sh
+#   ./scripts/py_local_image_pillow_gate.sh
 #
 # Prereqs:
 # - python3
@@ -23,7 +23,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mx8-py-local-vision-gate.XXXXXX")"
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mx8-py-local-image-gate.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 STORE_ROOT="${TMP_ROOT}/store"
@@ -107,10 +107,10 @@ if classes != ["cat", "dog"]:
     raise SystemExit(f"unexpected classes: {classes}")
 PY
 
-echo "[mx8] running minimal Pillow vision train"
+echo "[mx8] running minimal Pillow image train"
 MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
 MX8_DATASET_LINK="${OUT_DIR}@refresh" \
 MX8_TRAIN_STEPS="${MX8_TRAIN_STEPS:-8}" \
-"${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m6_vision_pillow_train_minimal.py" >/dev/null
+"${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m6_image_pillow_train_minimal.py" >/dev/null
 
-echo "[mx8] py_local_vision_pillow_gate OK"
+echo "[mx8] py_local_image_pillow_gate OK"

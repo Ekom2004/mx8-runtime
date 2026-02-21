@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pillow-based vision training gate:
+# Pillow-based image training gate:
 #
-# Proves the end-to-end "vision v0" user story:
+# Proves the end-to-end image loader user story:
 # - Seed ImageFolder-style JPEGs into MinIO (S3-compatible).
 # - Pack raw prefix -> tar shards + `_mx8/manifest.tsv`.
 # - `mx8.image(...)` reads + decodes JPEGs and yields `(images, labels)` torch tensors.
 # - A tiny Torch loop trains for N steps.
 #
 # Usage:
-#   ./scripts/py_minio_vision_pillow_gate.sh
+#   ./scripts/py_minio_image_pillow_gate.sh
 #
 # Prereqs:
 # - docker (daemon running)
@@ -43,13 +43,13 @@ fi
 IMAGE="${MX8_MINIO_IMAGE:-minio/minio:latest}"
 PORT="${MX8_MINIO_PORT:-9000}"
 CONSOLE_PORT="${MX8_MINIO_CONSOLE_PORT:-9001}"
-NAME="mx8-minio-pillow-vision-gate-$$"
+NAME="mx8-minio-pillow-image-gate-$$"
 
 BUCKET="${MX8_MINIO_BUCKET:-mx8-vision}"
 RAW_PREFIX="${MX8_MINIO_RAW_PREFIX:-raw/vision/train/}"
 OUT_PREFIX="${MX8_MINIO_OUT_PREFIX:-mx8/vision/train/}"
 
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mx8-py-minio-vision-pillow-gate.XXXXXX")"
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mx8-py-minio-image-pillow-gate.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 STORE_ROOT="${TMP_ROOT}/store"
@@ -158,10 +158,10 @@ PY
 echo "[mx8] install torch"
 "${PYTHON_BIN}" -m pip install -U torch >/dev/null
 
-echo "[mx8] running minimal Pillow vision train"
+echo "[mx8] running minimal Pillow image train"
 MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
 MX8_DATASET_LINK="s3://${BUCKET}/${OUT_PREFIX}@refresh" \
 MX8_TRAIN_STEPS="${MX8_TRAIN_STEPS:-8}" \
-"${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m6_vision_pillow_train_minimal.py" >/dev/null
+"${PYTHON_BIN}" "${ROOT}/crates/mx8-py/python/m6_image_pillow_train_minimal.py" >/dev/null
 
-echo "[mx8] py_minio_vision_pillow_gate OK"
+echo "[mx8] py_minio_image_pillow_gate OK"

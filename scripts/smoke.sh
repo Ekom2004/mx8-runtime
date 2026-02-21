@@ -19,6 +19,9 @@ else
   ./scripts/check.sh
 fi
 
+echo "[mx8] jitter_guardrail (batch byte jitter contract gate)"
+cargo test -p mx8-runtime jitter_guardrail
+
 echo "[mx8] demo2 (leases + kill-a-node recovery)"
 RUST_LOG=info \
   MX8_TOTAL_SAMPLES=8000 \
@@ -78,24 +81,24 @@ if [[ "${MX8_SMOKE_MINIO_PACK:-0}" == "1" ]]; then
   ./scripts/minio_pack_gate.sh
 fi
 
-if [[ "${MX8_SMOKE_PY_MINIO_IMAGEFOLDER:-0}" == "1" ]]; then
-  echo "[mx8] py_minio_imagefolder_gate (Python DataLoader + MinIO labels)"
-  ./scripts/py_minio_imagefolder_gate.sh
+if [[ "${MX8_SMOKE_PY_MINIO_IMAGE:-0}" == "1" ]]; then
+  echo "[mx8] py_minio_image_gate (Python DataLoader + MinIO labels)"
+  ./scripts/py_minio_image_gate.sh
 fi
 
-if [[ "${MX8_SMOKE_PY_VISION_PILLOW:-0}" == "1" ]]; then
-  echo "[mx8] py_minio_vision_pillow_gate (Pillow decode + torch train)"
-  ./scripts/py_minio_vision_pillow_gate.sh
+if [[ "${MX8_SMOKE_PY_IMAGE_PILLOW:-0}" == "1" ]]; then
+  echo "[mx8] py_minio_image_pillow_gate (Pillow decode + torch train)"
+  ./scripts/py_minio_image_pillow_gate.sh
 fi
 
-if [[ "${MX8_SMOKE_PY_LOCAL_VISION_PILLOW:-0}" == "1" ]]; then
-  echo "[mx8] py_local_vision_pillow_gate (no S3; pack_dir + torch train)"
-  ./scripts/py_local_vision_pillow_gate.sh
+if [[ "${MX8_SMOKE_PY_LOCAL_IMAGE_PILLOW:-0}" == "1" ]]; then
+  echo "[mx8] py_local_image_pillow_gate (no S3; pack_dir + torch train)"
+  ./scripts/py_local_image_pillow_gate.sh
 fi
 
-if [[ "${MX8_SMOKE_PY_VISION_DECODE_BENCH:-0}" == "1" ]]; then
-  echo "[mx8] py_vision_decode_backend_bench (rust vs python decode perf compare)"
-  ./scripts/py_vision_decode_backend_bench.sh
+if [[ "${MX8_SMOKE_PY_IMAGE_DECODE_BENCH:-0}" == "1" ]]; then
+  echo "[mx8] py_image_decode_backend_bench (rust vs python decode perf compare)"
+  ./scripts/py_image_decode_backend_bench.sh
 fi
 
 if [[ "${MX8_SMOKE_SOAK_DEMO2_MINIO_SCALE:-0}" == "1" ]]; then

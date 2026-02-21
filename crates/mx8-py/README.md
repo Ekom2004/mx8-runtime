@@ -67,7 +67,7 @@ for batch in loader:
     pass
 ```
 
-## Mix multiple loaders (v1.7 preview)
+## Mix multiple loaders
 
 `mx8.mix(...)` composes existing loaders into one deterministic stream.
 `weights` are sampling proportions (not model-loss weights).

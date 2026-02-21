@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ::image::imageops::FilterType as ImageFilterType;
 use anyhow::Result;
 use fast_image_resize::images::Image as FirImage;
 use fast_image_resize::{
     FilterType as FirFilterType, PixelType as FirPixelType, ResizeAlg as FirResizeAlg,
     ResizeOptions as FirResizeOptions, Resizer as FirResizer,
 };
-use image::imageops::FilterType as ImageFilterType;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyTuple};
@@ -225,6 +225,12 @@ struct VideoDataLoader {
     s3_stage2d_plan_used_total: u64,
     s3_stage2d_plan_fallback_total: u64,
     s3_full_object_range_fallback_total: u64,
+    video_runtime_autotune_enabled: bool,
+    video_runtime_autotune_period_batches: u64,
+    video_runtime_autotune_last_batch: u64,
+    video_runtime_autotune_adjustments_total: u64,
+    video_runtime_autotune_pressure_milli: u64,
+    video_max_process_rss_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -467,6 +473,38 @@ fn metrics_to_dict<'py>(py: Python<'py>, metrics: &RuntimeMetrics) -> PyResult<B
     out.set_item("inflight_bytes", metrics.inflight_bytes.get())?;
     out.set_item("process_rss_bytes", metrics.process_rss_bytes.get())?;
     out.set_item("ram_high_water_bytes", metrics.ram_high_water_bytes.get())?;
+    out.set_item(
+        "batch_payload_bytes_p50",
+        metrics.batch_payload_bytes_p50.get(),
+    )?;
+    out.set_item(
+        "batch_payload_bytes_p95",
+        metrics.batch_payload_bytes_p95.get(),
+    )?;
+    out.set_item(
+        "batch_payload_window_size",
+        metrics.batch_payload_window_size.get(),
+    )?;
+    out.set_item(
+        "batch_payload_bytes_p95_over_p50",
+        metrics.batch_payload_bytes_p95_over_p50_milli.get() as f64 / 1000.0,
+    )?;
+    out.set_item(
+        "batch_jitter_slo_breaches_total",
+        metrics.batch_jitter_slo_breaches_total.get(),
+    )?;
+    out.set_item(
+        "batch_jitter_band_adjustments_total",
+        metrics.batch_jitter_band_adjustments_total.get(),
+    )?;
+    out.set_item(
+        "batch_jitter_band_lower_pct",
+        metrics.batch_jitter_band_lower_pct.get(),
+    )?;
+    out.set_item(
+        "batch_jitter_band_upper_pct",
+        metrics.batch_jitter_band_upper_pct.get(),
+    )?;
     Ok(out)
 }
 
@@ -634,7 +672,7 @@ fn decode_images_nchw_u8(
             bytes: &[u8],
             sample_id: u64,
         ) -> Result<(Vec<u8>, u32, u32), String> {
-            let decoded = image::load_from_memory(bytes)
+            let decoded = ::image::load_from_memory(bytes)
                 .map_err(|e| format!("decode failed for sample_id {sample_id}: {e}"))?;
             let rgb = decoded.to_rgb8();
             let width = rgb.width();
@@ -768,10 +806,10 @@ fn decode_images_nchw_u8(
                 }
                 RustResizeBackend::Image => {
                     let rgb =
-                        image::RgbImage::from_raw(width, height, raw_rgb).ok_or_else(|| {
+                        ::image::RgbImage::from_raw(width, height, raw_rgb).ok_or_else(|| {
                             format!("decoded rgb buffer shape mismatch for sample_id {sample_id}")
                         })?;
-                    let resized = image::imageops::resize(&rgb, w, h, ImageFilterType::Triangle);
+                    let resized = ::image::imageops::resize(&rgb, w, h, ImageFilterType::Triangle);
                     resized.into_raw()
                 }
             };
@@ -932,6 +970,8 @@ impl DataLoader {
         start_id=None,
         end_id=None,
         node_id=None,
+        profile=None,
+        autotune=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -949,6 +989,8 @@ impl DataLoader {
         start_id: Option<u64>,
         end_id: Option<u64>,
         node_id: Option<String>,
+        profile: Option<String>,
+        autotune: Option<bool>,
     ) -> PyResult<Self> {
         let parsed = mx8_core::dataset_link::DatasetLink::parse(&dataset_link)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
@@ -971,20 +1013,22 @@ impl DataLoader {
 
         let max_process_rss_bytes_cap =
             max_ram_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
+        let (effective_target_batch_bytes, effective_max_batch_bytes) =
+            derive_byte_batch_caps(max_inflight_bytes, target_batch_bytes, max_batch_bytes);
         let caps = RuntimeCaps {
             max_inflight_bytes,
             max_queue_batches,
             batch_size_samples,
             prefetch_batches,
-            target_batch_bytes,
-            max_batch_bytes,
+            target_batch_bytes: effective_target_batch_bytes,
+            max_batch_bytes: effective_max_batch_bytes,
             max_process_rss_bytes: max_process_rss_bytes_cap,
         };
         let pipeline = Pipeline::new(caps);
         let metrics = pipeline.metrics();
-        let autotune_enabled = env_bool("MX8_LOAD_AUTOTUNE_RUNTIME", false);
+        let autotune_enabled = autotune.unwrap_or(true);
         let autotune_profile = if autotune_enabled {
-            Some(AutotuneProfile::from_env())
+            Some(AutotuneProfile::from_name(profile.as_deref()))
         } else {
             None
         };
@@ -1717,6 +1761,64 @@ impl VideoDataLoader {
             .saturating_add(self.decode_failed_missing_stream)
             .saturating_add(self.decode_failed_backend_unavailable)
             .saturating_add(self.decode_failed_decode_failed)
+    }
+
+    fn maybe_run_runtime_autotune(&mut self) {
+        if !self.video_runtime_autotune_enabled {
+            return;
+        }
+        let period = self.video_runtime_autotune_period_batches.max(1);
+        if self
+            .delivered_batches
+            .saturating_sub(self.video_runtime_autotune_last_batch)
+            < period
+        {
+            return;
+        }
+        self.video_runtime_autotune_last_batch = self.delivered_batches;
+
+        let Some(max_process_rss_bytes) = self.video_max_process_rss_bytes else {
+            return;
+        };
+        if max_process_rss_bytes == 0 {
+            return;
+        }
+        let rss_bytes = sample_process_rss_bytes_local().unwrap_or(0);
+        let rss_ratio = (rss_bytes as f64 / max_process_rss_bytes as f64).clamp(0.0, 2.0);
+        let inflight_ratio =
+            (self.max_inflight_bytes as f64 / max_process_rss_bytes as f64).clamp(0.0, 2.0);
+        let pressure = rss_ratio.max(inflight_ratio);
+        self.video_runtime_autotune_pressure_milli = (pressure * 1000.0).round() as u64;
+
+        let min_inflight = (self.batch_size_samples as u64)
+            .saturating_mul(self.decode_contract.clip_bytes)
+            .max(1);
+        let max_inflight = max_process_rss_bytes.max(min_inflight);
+        let old_inflight = self.max_inflight_bytes;
+        let mut next_inflight = old_inflight;
+        if rss_ratio > 0.92 {
+            next_inflight = ((old_inflight as f64) * 0.85).round() as u64;
+        } else if rss_ratio < 0.60 {
+            next_inflight = ((old_inflight as f64) * 1.05).round() as u64;
+        }
+        next_inflight = next_inflight.clamp(min_inflight, max_inflight);
+        if next_inflight != old_inflight {
+            self.max_inflight_bytes = next_inflight;
+            self.video_runtime_autotune_adjustments_total = self
+                .video_runtime_autotune_adjustments_total
+                .saturating_add(1);
+            tracing::info!(
+                target: "mx8_proof",
+                event = "video_runtime_autotune_adjustment",
+                pressure = pressure,
+                rss_ratio = rss_ratio,
+                max_process_rss_bytes = max_process_rss_bytes,
+                old_max_inflight_bytes = old_inflight,
+                new_max_inflight_bytes = next_inflight,
+                adjustments_total = self.video_runtime_autotune_adjustments_total,
+                "video runtime autotune adjusted max inflight"
+            );
+        }
     }
 
     fn derive_decode_contract(
@@ -2487,6 +2589,7 @@ impl VideoDataLoader {
             .delivered_samples
             .saturating_add(sample_ids.len() as u64);
         self.delivered_bytes = self.delivered_bytes.saturating_add(payload_bytes);
+        self.maybe_run_runtime_autotune();
         let batch_decode_ms = batch_started
             .elapsed()
             .as_millis()
@@ -2555,6 +2658,18 @@ impl VideoDataLoader {
         out.set_item("video_clip_bytes", self.decode_contract.clip_bytes)?;
         out.set_item("bytes_per_clip", self.bytes_per_clip as u64)?;
         out.set_item("max_inflight_bytes", self.max_inflight_bytes)?;
+        out.set_item(
+            "video_runtime_autotune_enabled",
+            self.video_runtime_autotune_enabled,
+        )?;
+        out.set_item(
+            "video_runtime_autotune_pressure",
+            self.video_runtime_autotune_pressure_milli as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "video_runtime_autotune_adjustments_total",
+            self.video_runtime_autotune_adjustments_total,
+        )?;
         out.set_item("clips_total", self.clips.len() as u64)?;
         out.set_item(
             "clips_remaining",
@@ -2812,9 +2927,12 @@ impl ImageLoader {
         prefetch_batches=1,
         target_batch_bytes=None,
         max_batch_bytes=None,
+        max_ram_bytes=None,
         start_id=None,
         end_id=None,
         node_id=None,
+        profile=None,
+        autotune=None,
         resize_hw=None,
         to_float=true,
     ))]
@@ -2830,9 +2948,12 @@ impl ImageLoader {
         prefetch_batches: usize,
         target_batch_bytes: Option<u64>,
         max_batch_bytes: Option<u64>,
+        max_ram_bytes: Option<u64>,
         start_id: Option<u64>,
         end_id: Option<u64>,
         node_id: Option<String>,
+        profile: Option<String>,
+        autotune: Option<bool>,
         resize_hw: Option<(u32, u32)>,
         to_float: bool,
     ) -> PyResult<Self> {
@@ -2847,10 +2968,12 @@ impl ImageLoader {
             prefetch_batches,
             target_batch_bytes,
             max_batch_bytes,
-            None,
+            max_ram_bytes,
             start_id,
             end_id,
             node_id,
+            profile,
+            autotune,
         )?;
         let base = loader.dataset_base.clone();
         let classes = loader
@@ -3370,6 +3493,7 @@ fn pack_dir<'py>(
 }
 
 #[pyfunction]
+#[pyo3(name = "image")]
 #[pyo3(signature = (
     dataset_link,
     *,
@@ -3385,6 +3509,7 @@ fn pack_dir<'py>(
     start_id=None,
     end_id=None,
     node_id=None,
+    max_ram_gb=None,
     profile=None,
     autotune=None,
     constraints=None,
@@ -3406,29 +3531,26 @@ fn load(
     start_id: Option<u64>,
     end_id: Option<u64>,
     node_id: Option<String>,
+    max_ram_gb: Option<f64>,
     profile: Option<String>,
     autotune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
 ) -> PyResult<Py<DataLoader>> {
-    let has_v1_args =
-        profile.is_some() || autotune.is_some() || constraints.is_some() || runtime.is_some();
-
+    let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
     let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+    let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+    let defaults = ProfileDefaults::for_profile(selected_profile);
 
-    let mut effective_max_inflight_bytes = max_inflight_bytes;
-    let mut effective_max_queue_batches = max_queue_batches;
-    let mut effective_prefetch_batches = prefetch_batches;
+    let mut effective_max_inflight_bytes = defaults.max_inflight_bytes;
+    let mut effective_max_queue_batches = defaults.max_queue_batches;
+    let mut effective_prefetch_batches = defaults.prefetch_batches;
     let mut effective_max_process_rss_bytes = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
+    let max_ram_bytes_from_gb = max_ram_gb_to_bytes(max_ram_gb)?;
 
-    if has_v1_args {
-        let selected_profile = AutotuneProfile::from_name(profile.as_deref());
-        let defaults = ProfileDefaults::for_profile(selected_profile);
+    {
         let autotune_enabled = autotune.unwrap_or(true);
-        effective_max_inflight_bytes = defaults.max_inflight_bytes;
-        effective_max_queue_batches = defaults.max_queue_batches;
-        effective_prefetch_batches = defaults.prefetch_batches;
 
         if let Some(runtime_cfg) = &runtime_cfg {
             if let Some(prefetch) = runtime_cfg.prefetch_batches {
@@ -3446,6 +3568,18 @@ fn load(
             if let Some(max_process) = constraints_cfg.max_process_rss_bytes {
                 effective_max_process_rss_bytes = Some(max_process.max(1));
             }
+        }
+        if let Some(max_ram_bytes) = max_ram_bytes_from_gb {
+            if constraints_cfg
+                .as_ref()
+                .and_then(|c| c.max_process_rss_bytes)
+                .is_some()
+            {
+                return Err(PyValueError::new_err(
+                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                ));
+            }
+            effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
         }
 
         if autotune_enabled && effective_max_process_rss_bytes.is_none() {
@@ -3522,6 +3656,8 @@ fn load(
         start_id,
         end_id,
         node_id,
+        profile.clone(),
+        autotune,
     )?;
     Py::new(py, loader)
 }
@@ -3542,11 +3678,16 @@ fn load(
     start_id=None,
     end_id=None,
     node_id=None,
+    max_ram_gb=None,
+    profile=None,
+    autotune=None,
+    constraints=None,
+    runtime=None,
     resize_hw=None,
     to_float=true,
 ))]
 #[allow(clippy::too_many_arguments)]
-fn image(
+fn py_image(
     py: Python<'_>,
     dataset_link: String,
     manifest_store: Option<PathBuf>,
@@ -3561,23 +3702,83 @@ fn image(
     start_id: Option<u64>,
     end_id: Option<u64>,
     node_id: Option<String>,
+    max_ram_gb: Option<f64>,
+    profile: Option<String>,
+    autotune: Option<bool>,
+    constraints: Option<Py<Constraints>>,
+    runtime: Option<Py<RuntimeConfig>>,
     resize_hw: Option<(u32, u32)>,
     to_float: bool,
 ) -> PyResult<Py<ImageLoader>> {
+    let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
+    let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
+    let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+    let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+    let defaults = ProfileDefaults::for_profile(selected_profile);
+
+    let mut effective_max_inflight_bytes = defaults.max_inflight_bytes;
+    let mut effective_max_queue_batches = defaults.max_queue_batches;
+    let mut effective_prefetch_batches = defaults.prefetch_batches;
+    let mut effective_max_process_rss_bytes = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
+    let max_ram_bytes_from_gb = max_ram_gb_to_bytes(max_ram_gb)?;
+
+    {
+        let _autotune_enabled = autotune.unwrap_or(true);
+
+        if let Some(runtime_cfg) = &runtime_cfg {
+            if let Some(prefetch) = runtime_cfg.prefetch_batches {
+                effective_prefetch_batches = prefetch.max(1);
+            }
+            if let Some(max_queue) = runtime_cfg.max_queue_batches {
+                effective_max_queue_batches = max_queue.max(1);
+            }
+        }
+
+        if let Some(constraints_cfg) = &constraints_cfg {
+            if let Some(max_inflight) = constraints_cfg.max_inflight_bytes {
+                effective_max_inflight_bytes = max_inflight.max(1);
+            }
+            if let Some(max_process) = constraints_cfg.max_process_rss_bytes {
+                effective_max_process_rss_bytes = Some(max_process.max(1));
+            }
+        }
+        if let Some(max_ram_bytes) = max_ram_bytes_from_gb {
+            if constraints_cfg
+                .as_ref()
+                .and_then(|c| c.max_process_rss_bytes)
+                .is_some()
+            {
+                return Err(PyValueError::new_err(
+                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                ));
+            }
+            effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
+        }
+
+        if let Some(max_process) = effective_max_process_rss_bytes {
+            if effective_max_inflight_bytes > max_process {
+                effective_max_inflight_bytes = max_process;
+            }
+        }
+    }
+
     let loader = ImageLoader::new(
         dataset_link,
         manifest_store,
         manifest_path,
         recursive,
         batch_size_samples,
-        max_inflight_bytes,
-        max_queue_batches,
-        prefetch_batches,
+        effective_max_inflight_bytes,
+        effective_max_queue_batches,
+        effective_prefetch_batches,
         target_batch_bytes,
         max_batch_bytes,
+        effective_max_process_rss_bytes,
         start_id,
         end_id,
         node_id,
+        profile,
+        autotune,
         resize_hw,
         to_float,
     )?;
@@ -3597,7 +3798,11 @@ fn image(
     batch_size_samples=32,
     seed=0,
     epoch=0,
+    max_ram_gb=None,
+    profile=None,
+    autotune=None,
     constraints=None,
+    runtime=None,
     node_id=None
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -3613,7 +3818,11 @@ fn video(
     batch_size_samples: usize,
     seed: u64,
     epoch: u64,
-    constraints: Option<Constraints>,
+    max_ram_gb: Option<f64>,
+    profile: Option<String>,
+    autotune: Option<bool>,
+    constraints: Option<Py<Constraints>>,
+    runtime: Option<Py<RuntimeConfig>>,
     node_id: Option<String>,
 ) -> PyResult<Py<VideoDataLoader>> {
     if fps == 0 {
@@ -3664,11 +3873,70 @@ fn video(
         .build()
         .map_err(|e| PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}")))?;
 
-    let max_inflight_bytes = constraints
-        .as_ref()
-        .and_then(|c| c.max_inflight_bytes)
-        .unwrap_or(128 * 1024 * 1024)
-        .max(1);
+    let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
+    let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+
+    if let Some(runtime_cfg) = &runtime_cfg {
+        if runtime_cfg.prefetch_batches.is_some()
+            || runtime_cfg.max_queue_batches.is_some()
+            || runtime_cfg.want.is_some()
+        {
+            return Err(PyValueError::new_err(
+                "mx8.video runtime overrides are unsupported in this stage",
+            ));
+        }
+    }
+
+    let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+    let defaults = ProfileDefaults::for_profile(selected_profile);
+    let autotune_enabled = autotune.unwrap_or(true);
+    let mut effective_max_inflight_bytes = defaults.max_inflight_bytes;
+    let mut effective_max_process_rss_bytes = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
+    let max_ram_bytes_from_gb = max_ram_gb_to_bytes(max_ram_gb)?;
+
+    if let Some(constraints_cfg) = &constraints_cfg {
+        if let Some(max_inflight) = constraints_cfg.max_inflight_bytes {
+            effective_max_inflight_bytes = max_inflight.max(1);
+        }
+        if let Some(max_process) = constraints_cfg.max_process_rss_bytes {
+            effective_max_process_rss_bytes = Some(max_process.max(1));
+        }
+    }
+    if let Some(max_ram_bytes) = max_ram_bytes_from_gb {
+        if constraints_cfg
+            .as_ref()
+            .and_then(|c| c.max_process_rss_bytes)
+            .is_some()
+        {
+            return Err(PyValueError::new_err(
+                "pass only one of max_ram_gb or constraints.max_ram_bytes",
+            ));
+        }
+        effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
+    }
+    if autotune_enabled && effective_max_process_rss_bytes.is_none() {
+        if let Some(node_limit) = detect_node_ram_limit_bytes() {
+            let profile_fraction = match selected_profile {
+                AutotuneProfile::Safe => 0.60f64,
+                AutotuneProfile::Balanced => 0.75f64,
+                AutotuneProfile::Throughput => 0.85f64,
+            };
+            let reserve_bytes = 1u64 << 30;
+            let mut derived = ((node_limit as f64) * profile_fraction) as u64;
+            derived = derived.saturating_sub(reserve_bytes);
+            let min_required = effective_max_inflight_bytes;
+            if derived < min_required {
+                derived = min_required;
+            }
+            effective_max_process_rss_bytes = Some(derived.max(effective_max_inflight_bytes));
+        }
+    }
+    if let Some(max_process) = effective_max_process_rss_bytes {
+        if effective_max_inflight_bytes > max_process {
+            effective_max_inflight_bytes = max_process;
+        }
+    }
+    let max_inflight_bytes = effective_max_inflight_bytes.max(1);
     let decode_backend = video_decode_backend_from_env()?;
     let bytes_per_clip = env_usize("MX8_VIDEO_STAGE2_BYTES_PER_CLIP", 4096).max(1);
     let decode_contract = VideoDataLoader::derive_decode_contract(clip_len, bytes_per_clip)?;
@@ -3682,6 +3950,9 @@ fn video(
             "video batch_size_samples ({batch_size_samples}) * bytes_per_clip ({bytes_per_clip}) exceeds max_inflight_bytes ({max_inflight_bytes}); lower batch size or raise cap"
         )));
     }
+    let video_runtime_autotune_period_batches = env_u64("MX8_VIDEO_AUTOTUNE_PERIOD_BATCHES")
+        .unwrap_or(16)
+        .max(1);
 
     tracing::info!(
         target: "mx8_proof",
@@ -3695,6 +3966,13 @@ fn video(
         stage2d_sidecars = stage2d_sidecars.len() as u64,
         decode_backend = video_decode_backend_name(decode_backend),
         max_inflight_bytes = max_inflight_bytes,
+        max_process_rss_bytes = effective_max_process_rss_bytes.unwrap_or(0),
+        profile = match selected_profile {
+            AutotuneProfile::Safe => "safe",
+            AutotuneProfile::Balanced => "balanced",
+            AutotuneProfile::Throughput => "throughput",
+        },
+        autotune_enabled = autotune_enabled,
         bytes_per_clip = bytes_per_clip as u64,
         seed = seed,
         epoch = epoch,
@@ -3738,6 +4016,12 @@ fn video(
             s3_stage2d_plan_used_total: 0,
             s3_stage2d_plan_fallback_total: 0,
             s3_full_object_range_fallback_total: 0,
+            video_runtime_autotune_enabled: autotune_enabled,
+            video_runtime_autotune_period_batches,
+            video_runtime_autotune_last_batch: 0,
+            video_runtime_autotune_adjustments_total: 0,
+            video_runtime_autotune_pressure_milli: 0,
+            video_max_process_rss_bytes: effective_max_process_rss_bytes,
         },
     )
 }
@@ -3751,6 +4035,7 @@ fn video(
     epoch=0,
     starvation_window=10_000,
     source_exhausted="error",
+    max_ram_gb=None,
     profile=None,
     autotune=None,
     constraints=None,
@@ -3765,6 +4050,7 @@ fn mix(
     epoch: u64,
     starvation_window: u64,
     source_exhausted: &str,
+    max_ram_gb: Option<f64>,
     profile: Option<String>,
     autotune: Option<bool>,
     constraints: Option<Py<Constraints>>,
@@ -3785,10 +4071,9 @@ fn mix(
     let normalized =
         normalize_mix_weights(&weights).map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
-    let has_v1_args =
-        profile.is_some() || autotune.is_some() || constraints.is_some() || runtime.is_some();
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
     let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+    let max_ram_bytes_from_gb = max_ram_gb_to_bytes(max_ram_gb)?;
 
     let mut inflight_caps = Vec::with_capacity(loaders.len());
     let mut batch_sizes = Vec::with_capacity(loaders.len());
@@ -3808,26 +4093,23 @@ fn mix(
         }
     }
 
-    let mut mix_profile = None;
-    let mut mix_autotune_enabled = false;
+    let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+    let mix_profile = Some(
+        match selected_profile {
+            AutotuneProfile::Safe => "safe",
+            AutotuneProfile::Balanced => "balanced",
+            AutotuneProfile::Throughput => "throughput",
+        }
+        .to_string(),
+    );
+    let mix_autotune_enabled = autotune.unwrap_or(true);
     let mut runtime_prefetch_override: Option<usize> = None;
     let mut runtime_max_queue_override: Option<usize> = None;
     let mut shared_max_inflight_override: Option<u64> = None;
     let mut mix_autotune_rails: Option<AutotuneRails> = None;
     let mut mix_max_process_rss_bytes: Option<u64> = None;
 
-    if has_v1_args {
-        let selected_profile = AutotuneProfile::from_name(profile.as_deref());
-        mix_profile = Some(
-            match selected_profile {
-                AutotuneProfile::Safe => "safe",
-                AutotuneProfile::Balanced => "balanced",
-                AutotuneProfile::Throughput => "throughput",
-            }
-            .to_string(),
-        );
-        mix_autotune_enabled = autotune.unwrap_or(true);
-
+    {
         if mix_autotune_enabled {
             let defaults = ProfileDefaults::for_profile(selected_profile);
             mix_autotune_rails = Some(AutotuneRails::for_profile(selected_profile));
@@ -3874,6 +4156,23 @@ fn mix(
                 }
             }
         }
+        if let Some(max_ram_bytes) = max_ram_bytes_from_gb {
+            if constraints_cfg
+                .as_ref()
+                .and_then(|c| c.max_process_rss_bytes)
+                .is_some()
+            {
+                return Err(PyValueError::new_err(
+                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                ));
+            }
+            mix_max_process_rss_bytes = Some(max_ram_bytes.max(1));
+            if let Some(candidate_cap) = shared_max_inflight_override {
+                if candidate_cap > max_ram_bytes {
+                    shared_max_inflight_override = Some(max_ram_bytes);
+                }
+            }
+        }
     }
 
     for loader in &loaders {
@@ -3897,8 +4196,7 @@ fn mix(
         .unwrap_or_else(|| prefetch_caps.iter().copied().min().unwrap_or(1usize).max(1));
     let mix_effective_max_queue_batches = runtime_max_queue_override
         .unwrap_or_else(|| queue_caps.iter().copied().min().unwrap_or(1usize).max(1));
-    let mix_runtime_autotune_enabled =
-        mix_autotune_enabled && env_bool("MX8_MIX_AUTOTUNE_RUNTIME", false);
+    let mix_runtime_autotune_enabled = mix_autotune_enabled;
     let mix_runtime_autotune_period_ticks = env_u64("MX8_MIX_AUTOTUNE_PERIOD_TICKS")
         .unwrap_or(32)
         .max(1);
@@ -3998,7 +4296,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pack, m)?)?;
     m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
-    m.add_function(wrap_pyfunction!(image, m)?)?;
+    m.add_function(wrap_pyfunction!(py_image, m)?)?;
     m.add_function(wrap_pyfunction!(video, m)?)?;
     m.add_function(wrap_pyfunction!(mix, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
@@ -4025,6 +4323,43 @@ fn parse_pack_dir_label_mode(s: &str) -> Result<PackDirLabelMode> {
         _ => anyhow::bail!("invalid label mode {s:?} (expected: auto|none|imagefolder)"),
     };
     Ok(mode)
+}
+
+fn max_ram_gb_to_bytes(max_ram_gb: Option<f64>) -> PyResult<Option<u64>> {
+    let Some(max_ram_gb) = max_ram_gb else {
+        return Ok(None);
+    };
+    if !max_ram_gb.is_finite() || max_ram_gb <= 0.0 {
+        return Err(PyValueError::new_err(
+            "max_ram_gb must be a finite value > 0",
+        ));
+    }
+    let bytes = max_ram_gb * (1024f64 * 1024f64 * 1024f64);
+    if bytes > u64::MAX as f64 {
+        return Err(PyValueError::new_err("max_ram_gb is too large"));
+    }
+    Ok(Some(bytes as u64))
+}
+
+fn derive_byte_batch_caps(
+    max_inflight_bytes: u64,
+    target_batch_bytes: Option<u64>,
+    max_batch_bytes: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let default_max_batch = (max_inflight_bytes / 4)
+        .clamp(4 * 1024 * 1024, 64 * 1024 * 1024)
+        .min(max_inflight_bytes)
+        .max(1);
+    let effective_max_batch = max_batch_bytes
+        .unwrap_or(default_max_batch)
+        .min(max_inflight_bytes)
+        .max(1);
+    let default_target_batch = effective_max_batch.saturating_mul(9).div_ceil(10).max(1);
+    let effective_target_batch = target_batch_bytes
+        .unwrap_or(default_target_batch)
+        .min(effective_max_batch)
+        .max(1);
+    (Some(effective_target_batch), Some(effective_max_batch))
 }
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
@@ -4372,10 +4707,6 @@ impl AutotuneProfile {
             "throughput" => Self::Throughput,
             _ => Self::Balanced,
         }
-    }
-
-    fn from_env() -> Self {
-        Self::from_name(std::env::var("MX8_AUTOTUNE_PROFILE").ok().as_deref())
     }
 }
 
@@ -4914,11 +5245,17 @@ impl DistributedDataLoader {
         target_batch_bytes=None,
         max_batch_bytes=None,
         want=1,
+        max_ram_gb=None,
+        profile=None,
+        autotune=None,
+        constraints=None,
+        runtime=None,
         progress_interval_ms=500,
         grpc_max_message_bytes=DEFAULT_GRPC_MAX_MESSAGE_BYTES,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         coord_url: String,
         job_id: String,
         node_id: String,
@@ -4929,9 +5266,63 @@ impl DistributedDataLoader {
         target_batch_bytes: Option<u64>,
         max_batch_bytes: Option<u64>,
         want: u32,
+        max_ram_gb: Option<f64>,
+        profile: Option<String>,
+        autotune: Option<bool>,
+        constraints: Option<Py<Constraints>>,
+        runtime: Option<Py<RuntimeConfig>>,
         progress_interval_ms: u64,
         grpc_max_message_bytes: usize,
     ) -> PyResult<Self> {
+        let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
+        let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
+        let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+        let max_ram_bytes_from_gb = max_ram_gb_to_bytes(max_ram_gb)?;
+        let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+        let defaults = ProfileDefaults::for_profile(selected_profile);
+        let mut effective_max_inflight_bytes = defaults.max_inflight_bytes;
+        let mut effective_max_queue_batches = defaults.max_queue_batches;
+        let mut effective_prefetch_batches = defaults.prefetch_batches;
+        let mut effective_want = want;
+        let mut effective_max_process_rss_bytes = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
+        let autotune_enabled = autotune.unwrap_or(true);
+        if let Some(runtime_cfg) = &runtime_cfg {
+            if let Some(prefetch) = runtime_cfg.prefetch_batches {
+                effective_prefetch_batches = prefetch.max(1);
+            }
+            if let Some(max_queue) = runtime_cfg.max_queue_batches {
+                effective_max_queue_batches = max_queue.max(1);
+            }
+            if let Some(want) = runtime_cfg.want {
+                effective_want = want.max(1);
+            }
+        }
+        if let Some(constraints_cfg) = &constraints_cfg {
+            if let Some(max_inflight) = constraints_cfg.max_inflight_bytes {
+                effective_max_inflight_bytes = max_inflight.max(1);
+            }
+            if let Some(max_process) = constraints_cfg.max_process_rss_bytes {
+                effective_max_process_rss_bytes = Some(max_process.max(1));
+            }
+        }
+        if let Some(max_ram_bytes) = max_ram_bytes_from_gb {
+            if constraints_cfg
+                .as_ref()
+                .and_then(|c| c.max_process_rss_bytes)
+                .is_some()
+            {
+                return Err(PyValueError::new_err(
+                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                ));
+            }
+            effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
+        }
+        if let Some(max_process) = effective_max_process_rss_bytes {
+            if effective_max_inflight_bytes > max_process {
+                effective_max_inflight_bytes = max_process;
+            }
+        }
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -4947,8 +5338,9 @@ impl DistributedDataLoader {
                 let caps = Some(NodeCaps {
                     max_fetch_concurrency: 32,
                     max_decode_concurrency: 8,
-                    max_inflight_bytes,
-                    max_ram_bytes: max_inflight_bytes,
+                    max_inflight_bytes: effective_max_inflight_bytes,
+                    max_ram_bytes: effective_max_process_rss_bytes
+                        .unwrap_or(effective_max_inflight_bytes),
                 });
 
                 let mut resp = client
@@ -4991,26 +5383,30 @@ impl DistributedDataLoader {
             ))
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
-        let max_process_rss_bytes_cap = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
-        let caps = RuntimeCaps {
-            max_inflight_bytes,
-            max_queue_batches,
-            batch_size_samples,
-            prefetch_batches,
+        let max_process_rss_bytes_cap = effective_max_process_rss_bytes;
+        let (effective_target_batch_bytes, effective_max_batch_bytes) = derive_byte_batch_caps(
+            effective_max_inflight_bytes,
             target_batch_bytes,
             max_batch_bytes,
+        );
+        let caps = RuntimeCaps {
+            max_inflight_bytes: effective_max_inflight_bytes,
+            max_queue_batches: effective_max_queue_batches,
+            batch_size_samples,
+            prefetch_batches: effective_prefetch_batches,
+            target_batch_bytes: effective_target_batch_bytes,
+            max_batch_bytes: effective_max_batch_bytes,
             max_process_rss_bytes: max_process_rss_bytes_cap,
         };
         let pipeline = Arc::new(Pipeline::new(caps));
         let metrics = pipeline.metrics();
-        let autotune_enabled = env_bool("MX8_AUTOTUNE", false);
-        let autotune_profile = AutotuneProfile::from_env();
+        let autotune_profile = selected_profile;
         let rails = AutotuneRails::for_profile(autotune_profile);
-        let initial_want = std::cmp::max(1, want).clamp(rails.min_want, rails.max_want);
-        let initial_prefetch = prefetch_batches
+        let initial_want = std::cmp::max(1, effective_want).clamp(rails.min_want, rails.max_want);
+        let initial_prefetch = effective_prefetch_batches
             .max(rails.min_prefetch_batches)
             .min(rails.max_prefetch_batches);
-        let initial_max_queue = max_queue_batches
+        let initial_max_queue = effective_max_queue_batches
             .max(rails.min_max_queue_batches)
             .min(rails.max_max_queue_batches);
         pipeline.set_prefetch_batches(initial_prefetch);
@@ -5034,7 +5430,7 @@ impl DistributedDataLoader {
                 prefetch_batches = initial_prefetch as u64,
                 max_queue_batches = initial_max_queue as u64,
                 want = initial_want as u64,
-                max_inflight_bytes = max_inflight_bytes,
+                max_inflight_bytes = effective_max_inflight_bytes,
                 max_process_rss_bytes = max_process_rss_bytes_cap.unwrap_or(0),
                 "autotune initialized"
             );
@@ -5064,7 +5460,7 @@ impl DistributedDataLoader {
                 pipeline,
                 metrics,
                 shared,
-                max_inflight_bytes,
+                effective_max_inflight_bytes,
                 max_process_rss_bytes_cap,
                 rails,
             )))
@@ -5086,7 +5482,7 @@ impl DistributedDataLoader {
                 let want = if autotune_for_requests.enabled {
                     autotune_for_requests.want.load(Ordering::Relaxed).max(1)
                 } else {
-                    std::cmp::max(1, want)
+                    std::cmp::max(1, effective_want)
                 };
 
                 let mut client = CoordinatorClient::new(channel.clone())

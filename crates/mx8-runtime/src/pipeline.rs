@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::{io::BufRead, io::BufReader};
 
 use anyhow::Result;
@@ -26,6 +28,14 @@ type S3Client = ();
 type HttpClient = reqwest::Client;
 
 const PERMIT_UNIT_BYTES: u64 = 1024;
+const BATCH_JITTER_WINDOW: usize = 128;
+const BYTE_BAND_LOWER_PCT: u64 = 85;
+const BYTE_BAND_UPPER_PCT: u64 = 115;
+const BYTE_BAND_UPPER_MAX_PCT: u64 = 130;
+const BYTE_BAND_MIN_SPREAD_PCT: u64 = 10;
+const BATCH_JITTER_SLO_MAX_MILLI: u64 = 1250;
+const BATCH_JITTER_RELAX_MILLI: u64 = 1100;
+const BATCH_JITTER_ADJUST_COOLDOWN_BATCHES: u64 = 16;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeCaps {
@@ -46,6 +56,15 @@ pub struct RuntimeMetrics {
     pub inflight_bytes_high_water: Gauge,
     pub process_rss_bytes: Gauge,
     pub ram_high_water_bytes: Gauge,
+    pub batch_payload_bytes_p50: Gauge,
+    pub batch_payload_bytes_p95: Gauge,
+    pub batch_payload_bytes_p95_over_p50_milli: Gauge,
+    pub batch_payload_window_size: Gauge,
+    pub batch_jitter_slo_breaches_total: Counter,
+    pub batch_jitter_band_adjustments_total: Counter,
+    pub batch_jitter_band_lower_pct: Gauge,
+    pub batch_jitter_band_upper_pct: Gauge,
+    batch_payload_window: Mutex<VecDeque<u64>>,
 }
 
 impl RuntimeMetrics {
@@ -63,6 +82,55 @@ impl RuntimeMetrics {
         self.process_rss_bytes.set(rss);
         self.ram_high_water_bytes.max(rss);
     }
+
+    fn on_batch_payload_bytes(&self, payload_bytes: u64) {
+        let mut window = match self.batch_payload_window.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if window.len() >= BATCH_JITTER_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(payload_bytes);
+        let mut sorted: Vec<u64> = window.iter().copied().collect();
+        sorted.sort_unstable();
+        if sorted.is_empty() {
+            return;
+        }
+        let len = sorted.len();
+        let p50_idx = (len - 1) / 2;
+        let p95_idx = ((len - 1) * 95) / 100;
+        let p50 = sorted[p50_idx];
+        let p95 = sorted[p95_idx];
+        let ratio_milli = if p50 == 0 {
+            0
+        } else {
+            ((p95 as f64 / p50 as f64) * 1000.0).round() as u64
+        };
+        self.batch_payload_bytes_p50.set(p50);
+        self.batch_payload_bytes_p95.set(p95);
+        self.batch_payload_bytes_p95_over_p50_milli.set(ratio_milli);
+        self.batch_payload_window_size.set(len as u64);
+    }
+}
+
+fn byte_mode_band(
+    target_batch_bytes: u64,
+    max_batch_bytes: u64,
+    lower_pct: u64,
+    upper_pct: u64,
+) -> (u64, u64) {
+    let lower = target_batch_bytes
+        .saturating_mul(lower_pct)
+        .div_ceil(100)
+        .max(1)
+        .min(max_batch_bytes);
+    let upper = target_batch_bytes
+        .saturating_mul(upper_pct)
+        .div_ceil(100)
+        .max(lower)
+        .min(max_batch_bytes);
+    (lower, upper)
 }
 
 pub struct BatchLease {
@@ -86,19 +154,28 @@ pub struct Pipeline {
     rss_check_counter: Arc<AtomicU64>,
     prefetch_batches: Arc<AtomicUsize>,
     max_queue_batches: Arc<AtomicUsize>,
+    batch_band_lower_pct: Arc<AtomicU64>,
+    batch_band_upper_pct: Arc<AtomicU64>,
+    batch_jitter_adjust_cooldown: Arc<AtomicU64>,
 }
 
 impl Pipeline {
     pub fn new(caps: RuntimeCaps) -> Self {
         let max_units = caps.max_inflight_bytes.div_ceil(PERMIT_UNIT_BYTES).max(1);
         let max = usize::try_from(max_units).unwrap_or(usize::MAX);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        metrics.batch_jitter_band_lower_pct.set(BYTE_BAND_LOWER_PCT);
+        metrics.batch_jitter_band_upper_pct.set(BYTE_BAND_UPPER_PCT);
         Self {
             caps,
-            metrics: Arc::new(RuntimeMetrics::default()),
+            metrics,
             inflight_sem: Arc::new(Semaphore::new(max)),
             rss_check_counter: Arc::new(AtomicU64::new(0)),
             prefetch_batches: Arc::new(AtomicUsize::new(caps.prefetch_batches.max(1))),
             max_queue_batches: Arc::new(AtomicUsize::new(caps.max_queue_batches.max(1))),
+            batch_band_lower_pct: Arc::new(AtomicU64::new(BYTE_BAND_LOWER_PCT)),
+            batch_band_upper_pct: Arc::new(AtomicU64::new(BYTE_BAND_UPPER_PCT)),
+            batch_jitter_adjust_cooldown: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -122,6 +199,84 @@ impl Pipeline {
     pub fn set_max_queue_batches(&self, max_queue_batches: usize) {
         self.max_queue_batches
             .store(max_queue_batches.max(1), Ordering::Relaxed);
+    }
+
+    fn current_batch_band_pcts(&self) -> (u64, u64) {
+        let lower = self.batch_band_lower_pct.load(Ordering::Relaxed);
+        let upper = self.batch_band_upper_pct.load(Ordering::Relaxed);
+        (
+            lower,
+            upper.max(lower.saturating_add(BYTE_BAND_MIN_SPREAD_PCT)),
+        )
+    }
+
+    fn maybe_adjust_jitter_guardrail(&self) {
+        let window_size = self.metrics.batch_payload_window_size.get() as usize;
+        if window_size < BATCH_JITTER_WINDOW {
+            return;
+        }
+
+        let cooldown = self.batch_jitter_adjust_cooldown.load(Ordering::Relaxed);
+        if cooldown > 0 {
+            self.batch_jitter_adjust_cooldown
+                .store(cooldown.saturating_sub(1), Ordering::Relaxed);
+            return;
+        }
+
+        let ratio_milli = self.metrics.batch_payload_bytes_p95_over_p50_milli.get();
+        let (lower, upper) = self.current_batch_band_pcts();
+        let mut next_lower = lower;
+        let mut next_upper = upper;
+
+        if ratio_milli > BATCH_JITTER_SLO_MAX_MILLI {
+            self.metrics.batch_jitter_slo_breaches_total.inc();
+            next_lower = (lower.saturating_add(2)).min(95);
+            next_upper = upper
+                .saturating_sub(2)
+                .max(next_lower.saturating_add(BYTE_BAND_MIN_SPREAD_PCT));
+            next_upper = next_upper.min(BYTE_BAND_UPPER_MAX_PCT);
+            tracing::warn!(
+                target: "mx8_proof",
+                event = "batch_jitter_slo_breached",
+                p95_over_p50 = ratio_milli as f64 / 1000.0,
+                slo_max = BATCH_JITTER_SLO_MAX_MILLI as f64 / 1000.0,
+                old_band_lower_pct = lower,
+                old_band_upper_pct = upper,
+                new_band_lower_pct = next_lower,
+                new_band_upper_pct = next_upper,
+                "batch payload jitter exceeded SLO"
+            );
+        } else if ratio_milli < BATCH_JITTER_RELAX_MILLI {
+            if lower > BYTE_BAND_LOWER_PCT {
+                next_lower = lower.saturating_sub(1).max(BYTE_BAND_LOWER_PCT);
+            }
+            if upper < BYTE_BAND_UPPER_PCT {
+                next_upper = upper.saturating_add(1).min(BYTE_BAND_UPPER_PCT);
+            }
+            next_upper = next_upper.max(next_lower.saturating_add(BYTE_BAND_MIN_SPREAD_PCT));
+        }
+
+        if next_lower != lower || next_upper != upper {
+            self.batch_band_lower_pct
+                .store(next_lower, Ordering::Relaxed);
+            self.batch_band_upper_pct
+                .store(next_upper, Ordering::Relaxed);
+            self.batch_jitter_adjust_cooldown
+                .store(BATCH_JITTER_ADJUST_COOLDOWN_BATCHES, Ordering::Relaxed);
+            self.metrics.batch_jitter_band_adjustments_total.inc();
+            self.metrics.batch_jitter_band_lower_pct.set(next_lower);
+            self.metrics.batch_jitter_band_upper_pct.set(next_upper);
+            tracing::info!(
+                target: "mx8_proof",
+                event = "batch_jitter_band_adjusted",
+                p95_over_p50 = ratio_milli as f64 / 1000.0,
+                old_band_lower_pct = lower,
+                old_band_upper_pct = upper,
+                new_band_lower_pct = next_lower,
+                new_band_upper_pct = next_upper,
+                "adjusted byte-batch jitter guardrail band"
+            );
+        }
     }
 
     /// Spawn a manifest-driven producer which streams `BatchLease`s to the caller.
@@ -573,7 +728,9 @@ impl Pipeline {
         s3_client: Option<S3Client>,
         http_client: Option<HttpClient>,
     ) -> Result<()> {
-        let ranges = build_manifest_batch_ranges(&records, self.caps)?;
+        let (band_lower_pct, band_upper_pct) = self.current_batch_band_pcts();
+        let ranges =
+            build_manifest_batch_ranges(&records, self.caps, band_lower_pct, band_upper_pct)?;
         let prefetch = self.effective_prefetch_batches();
         if prefetch <= 1 {
             let sender = tx;
@@ -643,6 +800,7 @@ impl Pipeline {
             buffer.insert(batch_id, inflight);
 
             while let Some(inflight) = buffer.remove(&next_to_send) {
+                self.maybe_adjust_jitter_guardrail();
                 tx.send(inflight).await?;
                 next_to_send = next_to_send.saturating_add(1);
             }
@@ -651,6 +809,7 @@ impl Pipeline {
         Ok(())
     }
 
+    #[cfg(feature = "s3")]
     async fn produce_manifest_record_batches(
         &self,
         tx: mpsc::Sender<BatchLease>,
@@ -680,6 +839,17 @@ impl Pipeline {
             .unwrap_or(max_batch_bytes)
             .min(max_batch_bytes)
             .max(1);
+        let (band_lower_bytes, band_upper_bytes) = if byte_mode_enabled {
+            let (band_lower_pct, band_upper_pct) = self.current_batch_band_pcts();
+            byte_mode_band(
+                target_batch_bytes,
+                max_batch_bytes,
+                band_lower_pct,
+                band_upper_pct,
+            )
+        } else {
+            (0, 0)
+        };
 
         let mut sender = tx;
         let mut batch_records: Vec<mx8_core::types::ManifestRecord> =
@@ -711,9 +881,17 @@ impl Pipeline {
                     .checked_add(sample_bytes)
                     .map(|v| v > max_batch_bytes)
                     .unwrap_or(true);
+            let would_exceed_band = byte_mode_enabled
+                && !batch_records.is_empty()
+                && batch_bytes >= band_lower_bytes
+                && batch_bytes
+                    .checked_add(sample_bytes)
+                    .map(|v| v > band_upper_bytes)
+                    .unwrap_or(true);
 
             if batch_records.len() >= sample_cap
-                || (byte_mode_enabled && (batch_bytes >= target_batch_bytes || would_exceed_max))
+                || (byte_mode_enabled
+                    && (batch_bytes >= target_batch_bytes || would_exceed_max || would_exceed_band))
             {
                 self.flush_manifest_record_batch(
                     &mut sender,
@@ -746,6 +924,7 @@ impl Pipeline {
         Ok(())
     }
 
+    #[cfg(feature = "s3")]
     async fn flush_manifest_record_batch(
         &self,
         sender: &mut mpsc::Sender<BatchLease>,
@@ -767,6 +946,7 @@ impl Pipeline {
             http_client,
         )
         .await?;
+        self.maybe_adjust_jitter_guardrail();
         sender.send(inflight).await?;
         Ok(())
     }
@@ -834,6 +1014,8 @@ impl Pipeline {
         payload.clear();
 
         self.metrics.on_inflight_add(bytes);
+        self.metrics.on_batch_payload_bytes(bytes);
+        self.maybe_adjust_jitter_guardrail();
 
         tx.send(BatchLease {
             batch,
@@ -1077,6 +1259,8 @@ fn sample_count_batch_ranges(total_samples: usize, batch_size_samples: usize) ->
 fn build_manifest_batch_ranges(
     records: &[mx8_core::types::ManifestRecord],
     caps: RuntimeCaps,
+    band_lower_pct: u64,
+    band_upper_pct: u64,
 ) -> Result<Vec<BatchRange>> {
     let sample_cap = std::cmp::max(1, caps.batch_size_samples);
     let byte_mode_enabled = caps.target_batch_bytes.is_some() || caps.max_batch_bytes.is_some();
@@ -1098,6 +1282,12 @@ fn build_manifest_batch_ranges(
         .unwrap_or(max_batch_bytes)
         .min(max_batch_bytes)
         .max(1);
+    let (band_lower_bytes, band_upper_bytes) = byte_mode_band(
+        target_batch_bytes,
+        max_batch_bytes,
+        band_lower_pct,
+        band_upper_pct,
+    );
 
     let mut ranges: Vec<BatchRange> = Vec::new();
     let mut start = 0usize;
@@ -1124,7 +1314,17 @@ fn build_manifest_batch_ranges(
                 .checked_add(sample_bytes)
                 .map(|v| v > max_batch_bytes)
                 .unwrap_or(true);
-        if batch_samples >= sample_cap || batch_bytes >= target_batch_bytes || would_exceed_max {
+        let would_exceed_band = batch_samples > 0
+            && batch_bytes >= band_lower_bytes
+            && batch_bytes
+                .checked_add(sample_bytes)
+                .map(|v| v > band_upper_bytes)
+                .unwrap_or(true);
+        if batch_samples >= sample_cap
+            || batch_bytes >= target_batch_bytes
+            || would_exceed_max
+            || would_exceed_band
+        {
             ranges.push(BatchRange { start, end: idx });
             start = idx;
             batch_bytes = 0;
@@ -1941,6 +2141,7 @@ async fn build_manifest_inflight_batch(
         .await?;
 
     metrics.on_inflight_add(bytes);
+    metrics.on_batch_payload_bytes(bytes);
 
     let payload = match fetch_specs_payload(&plan.specs, s3_client, http_client).await {
         Ok(p) => p,
@@ -2449,6 +2650,7 @@ mod s3_parse_tests {
 mod manifest_reader_tests {
     use super::*;
 
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2618,6 +2820,98 @@ mod manifest_reader_tests {
             .await?;
 
         assert_eq!(sink_bytes.snapshot(), sink_reader.snapshot());
+        Ok(())
+    }
+
+    #[test]
+    fn jitter_guardrail_emits_breach_and_tightens_band() {
+        let caps = RuntimeCaps {
+            max_inflight_bytes: 8 * 1024 * 1024,
+            max_queue_batches: 8,
+            batch_size_samples: 64,
+            prefetch_batches: 1,
+            target_batch_bytes: Some(512 * 1024),
+            max_batch_bytes: Some(1024 * 1024),
+            max_process_rss_bytes: None,
+        };
+        let pipeline = Pipeline::new(caps);
+
+        for i in 0..BATCH_JITTER_WINDOW {
+            let payload = if i % 2 == 0 { 128 * 1024 } else { 512 * 1024 };
+            pipeline.metrics.on_batch_payload_bytes(payload);
+        }
+
+        let before_lower = pipeline.batch_band_lower_pct.load(Ordering::Relaxed);
+        let before_upper = pipeline.batch_band_upper_pct.load(Ordering::Relaxed);
+        pipeline.maybe_adjust_jitter_guardrail();
+        let after_lower = pipeline.batch_band_lower_pct.load(Ordering::Relaxed);
+        let after_upper = pipeline.batch_band_upper_pct.load(Ordering::Relaxed);
+
+        assert!(pipeline.metrics.batch_jitter_slo_breaches_total.get() >= 1);
+        assert!(pipeline.metrics.batch_jitter_band_adjustments_total.get() >= 1);
+        assert!(after_lower >= before_lower);
+        assert!(after_upper <= before_upper);
+    }
+
+    #[test]
+    fn jitter_guardrail_ranges_hold_p95_over_p50_for_full_batches() -> Result<()> {
+        let mut records = Vec::new();
+        let sizes = [
+            64_u64 * 1024,
+            96_u64 * 1024,
+            128_u64 * 1024,
+            160_u64 * 1024,
+            192_u64 * 1024,
+            224_u64 * 1024,
+        ];
+        for i in 0..512_u64 {
+            records.push(mx8_core::types::ManifestRecord {
+                sample_id: i,
+                location: format!("file:///tmp/{i}.bin"),
+                byte_offset: Some(0),
+                byte_length: Some(sizes[(i as usize) % sizes.len()]),
+                decode_hint: None,
+            });
+        }
+
+        let caps = RuntimeCaps {
+            max_inflight_bytes: 16 * 1024 * 1024,
+            max_queue_batches: 8,
+            batch_size_samples: 256,
+            prefetch_batches: 1,
+            target_batch_bytes: Some(512 * 1024),
+            max_batch_bytes: Some(640 * 1024),
+            max_process_rss_bytes: None,
+        };
+        let (band_lower_bytes, _) = byte_mode_band(
+            512 * 1024,
+            640 * 1024,
+            BYTE_BAND_LOWER_PCT,
+            BYTE_BAND_UPPER_PCT,
+        );
+        let ranges =
+            build_manifest_batch_ranges(&records, caps, BYTE_BAND_LOWER_PCT, BYTE_BAND_UPPER_PCT)?;
+
+        let mut payloads = Vec::new();
+        for r in ranges {
+            let mut total = 0_u64;
+            for rec in &records[r.start..r.end] {
+                total = total.saturating_add(rec.byte_length.unwrap_or(0));
+            }
+            if total >= band_lower_bytes {
+                payloads.push(total);
+            }
+        }
+        payloads.sort_unstable();
+        assert!(!payloads.is_empty());
+        let len = payloads.len();
+        let p50 = payloads[(len - 1) / 2];
+        let p95 = payloads[((len - 1) * 95) / 100];
+        let ratio = p95 as f64 / p50 as f64;
+        assert!(
+            ratio <= 1.25,
+            "expected p95/p50 <= 1.25 for full batches, got {ratio:.3}"
+        );
         Ok(())
     }
 

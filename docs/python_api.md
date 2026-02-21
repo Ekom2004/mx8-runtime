@@ -27,8 +27,9 @@ import mx8
 loader = mx8.load(
     "s3://bucket/prefix/",
     recursive=True,  # default
+    batch_size_samples=64,
+    max_ram_gb=12,
     profile="balanced",
-    autotune=True,
 )
 
 for batch in loader:
@@ -44,9 +45,11 @@ for batch in loader:
 - `manifest_path` (dev-only local manifest source)
 - `recursive` (default `True`; set `False` to only index top-level objects/files under the prefix)
 - `batch_size_samples`
+- `max_ram_gb` (recommended default cap input)
 - `max_inflight_bytes`
 - `max_queue_batches`
 - `prefetch_batches`
+- `target_batch_bytes`, `max_batch_bytes` (advanced overrides; default byte-aware batching is derived automatically)
 - `start_id`, `end_id` (must be set together)
 - `node_id` (for lock ownership/proof logs)
 - `profile` (`safe|balanced|throughput`)
@@ -62,12 +65,10 @@ import mx8
 loader = mx8.load(
     "s3://bucket/train@refresh",
     manifest_store="/var/lib/mx8/manifests",
+    max_ram_gb=24,
     profile="throughput",
     autotune=True,
-    constraints=mx8.Constraints(
-        max_inflight_bytes=512 * 1024 * 1024,
-        max_ram_bytes=24 * 1024 * 1024 * 1024,
-    ),
+    constraints=mx8.Constraints(max_inflight_bytes=512 * 1024 * 1024),
 )
 
 loader_manual = mx8.load(
@@ -96,6 +97,17 @@ loader_manual = mx8.load(
   - `inflight_bytes`
   - `process_rss_bytes`
   - `ram_high_water_bytes`
+  - byte-batch jitter metrics:
+    - `batch_payload_bytes_p50`
+    - `batch_payload_bytes_p95`
+    - `batch_payload_bytes_p95_over_p50`
+    - `batch_payload_window_size`
+    - `batch_jitter_slo_breaches_total`
+    - `batch_jitter_band_adjustments_total`
+    - `batch_jitter_band_lower_pct`
+    - `batch_jitter_band_upper_pct`
+
+Byte-aware batching is enabled by default (MX8 auto-derives target/max batch bytes from inflight caps). MX8 applies a tighter internal byte band around the target to reduce high/low batch-byte oscillation, emits a proof event when jitter SLO is breached, and adaptively tightens/relaxes the band with bounded hysteresis.
 
 Hidden operator guard (env-only): set `MX8_MAX_PROCESS_RSS_BYTES` to enforce a process RSS hard limit (fail-fast instead of OS OOM kill).
 
@@ -109,8 +121,9 @@ import mx8
 loader = mx8.image(
     "s3://bucket/mx8/train/@refresh",
     batch_size_samples=64,
+    max_ram_gb=12,
     resize_hw=(224, 224),
-    max_inflight_bytes=256 * 1024 * 1024,
+    profile="balanced",
 )
 
 print(loader.classes)  # ["cat", "dog", ...] or None
@@ -140,7 +153,8 @@ loader = mx8.video(
     stride=8,
     fps=8,
     batch_size_samples=32,
-    constraints=mx8.Constraints(max_inflight_bytes=128 * 1024 * 1024),
+    max_ram_gb=12,
+    profile="balanced",
 )
 
 for batch in loader:
@@ -156,6 +170,9 @@ Current contract:
 - offsets are monotonic and `offsets[-1] == len(payload)`
 - init rejects invalid cap combinations (`batch_size_samples * bytes_per_clip > max_inflight_bytes`)
 - default decode backend uses local `ffmpeg` CLI (`MX8_FFMPEG_BIN` override, default `ffmpeg`)
+- supports startup autotune args (`profile`, `autotune`, `max_ram_gb`, `constraints`) for cap/profile selection
+- runtime autotune is enabled by default (`autotune=False` disables) and adapts `max_inflight_bytes` within safe bounds
+- `runtime` overrides are currently unsupported for `mx8.video(...)`
 
 Video decode backend selection (Stage 3A):
 
@@ -181,6 +198,7 @@ S3 range-streaming status:
 - contract: `video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_stride_t/h/w/c`, `video_clip_bytes`
 - backend: `video_decode_backend` (`cli|ffi`)
 - runtime decode counters: `video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_*_total`, `video_decode_failed_total`, `video_decode_ms_total`
+- runtime autotune counters: `video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`
 
 Video gate checklist:
 
@@ -209,7 +227,8 @@ loader = mx8.DistributedDataLoader(
     job_id="demo",
     node_id="node1",
     batch_size_samples=512,
-    want=1,
+    max_ram_gb=24,
+    profile="balanced",
 )
 
 for batch in loader:
@@ -221,9 +240,9 @@ Important fields:
 - `want`: max concurrent leases per node.
 - `progress_interval_ms`: progress report interval.
 - `grpc_max_message_bytes`: gRPC message cap for manifest/control-path.
-- experimental distributed autotune (env-gated):
-  - `MX8_AUTOTUNE=1`
-  - `MX8_AUTOTUNE_PROFILE=safe|balanced|throughput` (default `balanced`)
+- distributed autotune supports API-driven profile/autotune control:
+  - `profile=safe|balanced|throughput`
+  - `autotune=True|False`
   - current implementation adjusts `want`, `prefetch_batches`, and `max_queue_batches` inside profile rails.
 
 v0 training note: distributed data delivery is supported, but v0 is non-elastic (DDP rank death terminates training).
@@ -244,10 +263,8 @@ mixed = mx8.mix(
     seed=17,
     epoch=3,
     source_exhausted="error",  # default: fail fast
+    max_ram_gb=12,
     profile="balanced",
-    autotune=True,
-    constraints=mx8.Constraints(max_inflight_bytes=256 * 1024 * 1024),
-    runtime=mx8.RuntimeConfig(prefetch_batches=1, max_queue_batches=8),
 )
 ```
 
@@ -275,15 +292,13 @@ Gate commands:
 - smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
 - smoke multi-rank toggle: `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
 
-## API shape (v0 vs v1 direction)
+## API modes
 
-v0 still supports explicit tuning knobs in constructor args (`max_inflight_bytes`, `max_queue_batches`, `prefetch_batches`, `want`, ...).
+MX8 exposes two modes across loader APIs:
 
-v0 also ships the v1-style preview for `mx8.load(...)`:
-
-- simple path (`profile` + `autotune`)
-- advanced path (`constraints` + `RuntimeConfig`)
+- default mode: provide workload intent and cap (`batch_size_samples`, `max_ram_gb`, `profile`) and let MX8 autotune runtime knobs
+- advanced mode: provide explicit overrides (`autotune=False`, `constraints`, `RuntimeConfig`)
 
 Formal contract note:
 
-- `docs/python_api.md` + `docs/memory_contract.md` are the public contract surface for v0.
+- `docs/python_api.md` + `docs/memory_contract.md` are the public contract surface.

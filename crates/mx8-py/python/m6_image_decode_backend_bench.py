@@ -126,14 +126,14 @@ def main() -> None:
         raise SystemExit("MX8_DATASET_LINK is required")
 
     store_root = os.environ.get("MX8_MANIFEST_STORE_ROOT", "/tmp/mx8-manifests")
-    backends = parse_csv("MX8_VISION_BENCH_BACKENDS", "rust,python")
-    rust_codecs = parse_rust_codecs("MX8_VISION_BENCH_RUST_CODECS", "zune,image")
-    modes = parse_csv("MX8_VISION_BENCH_MODES", "decode_only,train_step")
-    torch_threads_list = parse_int_csv("MX8_VISION_BENCH_TORCH_THREADS_LIST", "1")
-    decode_threads_list = parse_int_csv("MX8_VISION_BENCH_DECODE_THREADS_LIST", "1")
-    batch_size = int(os.environ.get("MX8_VISION_BENCH_BATCH_SIZE", "64"))
-    steps = int(os.environ.get("MX8_VISION_BENCH_STEPS", "128"))
-    warmup_steps = int(os.environ.get("MX8_VISION_BENCH_WARMUP_STEPS", "8"))
+    backends = parse_csv("MX8_IMAGE_BENCH_BACKENDS", "rust,python")
+    rust_codecs = parse_rust_codecs("MX8_IMAGE_BENCH_RUST_CODECS", "zune,image")
+    modes = parse_csv("MX8_IMAGE_BENCH_MODES", "decode_only,train_step")
+    torch_threads_list = parse_int_csv("MX8_IMAGE_BENCH_TORCH_THREADS_LIST", "1")
+    decode_threads_list = parse_int_csv("MX8_IMAGE_BENCH_DECODE_THREADS_LIST", "1")
+    batch_size = int(os.environ.get("MX8_IMAGE_BENCH_BATCH_SIZE", "64"))
+    steps = int(os.environ.get("MX8_IMAGE_BENCH_STEPS", "128"))
+    warmup_steps = int(os.environ.get("MX8_IMAGE_BENCH_WARMUP_STEPS", "8"))
     min_speedup = float(os.environ.get("MX8_DECODE_BENCH_MIN_SPEEDUP", "0"))
 
     if batch_size < 1 or steps < 1 or warmup_steps < 0:
@@ -145,7 +145,7 @@ def main() -> None:
     for mode in modes:
         if mode not in known_modes:
             raise SystemExit(
-                f"unsupported mode {mode!r} in MX8_VISION_BENCH_MODES (allowed: {sorted(known_modes)})"
+                f"unsupported mode {mode!r} in MX8_IMAGE_BENCH_MODES (allowed: {sorted(known_modes)})"
             )
 
     results: dict[tuple[str, int, int, str, str], tuple[int, int]] = {}
