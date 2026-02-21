@@ -124,6 +124,8 @@ Controller outputs:
 
 Controller cadence: fixed interval (e.g., 2s) with cooldown.
 
+Jitter SLO (byte payload stability): `batch_payload_bytes_p95_over_p50 <= 1.25`.
+
 Increase path (only if all are true):
 
 - data-wait ratio above target threshold
