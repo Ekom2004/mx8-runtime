@@ -1,5 +1,7 @@
 # Troubleshooting
 
+For production incidents and rollback flow, see `docs/prod_runbook.md`.
+
 ## `reqwest` rlib error during build/run
 
 Symptom:
@@ -97,8 +99,22 @@ Fix:
 
 ## Process OOM protection
 
-If you want deterministic failure before OS OOM kill, set:
+MX8 loader surfaces use a default process RSS fail-fast cap. To pin a stricter org-level limit, set:
 
 - `MX8_MAX_PROCESS_RSS_BYTES=<bytes>`
 
-When process RSS exceeds this cap, MX8 fails fast with a clear `process rss ... exceeds max_ram_bytes ...` error.
+When process RSS exceeds the cap, MX8 fails fast with a clear `process rss ... exceeds max_process_rss_bytes ...` error.
+
+## `mx8-tui` headless probe failures
+
+Symptom:
+
+- `lease panel remained empty`
+- `runtime panel remained empty`
+- `manifest panel remained empty`
+
+Fix:
+
+- ensure coordinator is reachable (`--coord-url`) and `--job-id` matches active job
+- ensure at least one agent is heartbeating (runtime panel is built from node heartbeat stats)
+- ensure manifest is resolvable from coordinator `manifest_store`; use `--manifest-path` for a local TSV fallback

@@ -148,6 +148,7 @@ fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> 
 struct NodeEntry {
     caps: Option<NodeCaps>,
     last_heartbeat_unix_time_ms: Option<u64>,
+    last_stats: Option<NodeStats>,
 }
 
 #[derive(Debug, Default)]
@@ -219,6 +220,52 @@ impl CoordinatorSvc {
     async fn is_job_ready(&self) -> bool {
         let state = self.state.read().await;
         state.nodes.len() as u32 >= self.world_size
+    }
+
+    async fn build_snapshot(&self) -> GetJobSnapshotResponse {
+        let state = self.state.read().await;
+        let membership = state.frozen_membership.clone();
+        let nodes = state
+            .nodes
+            .iter()
+            .map(|(node_id, entry)| {
+                let assigned_rank = membership
+                    .as_ref()
+                    .and_then(|m| m.iter().position(|id| id == node_id))
+                    .or_else(|| state.nodes.keys().position(|id| id == node_id))
+                    .unwrap_or(0) as u32;
+                NodeSnapshot {
+                    node_id: node_id.clone(),
+                    assigned_rank,
+                    last_heartbeat_unix_time_ms: entry.last_heartbeat_unix_time_ms.unwrap_or(0),
+                    caps: entry.caps.clone(),
+                    stats: entry.last_stats.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let live_leases = state.leases.values().cloned().collect::<Vec<_>>();
+        let counters = Some(CoordinatorCounters {
+            register_total: self.metrics.register_total.get(),
+            heartbeat_total: self.metrics.heartbeat_total.get(),
+            request_lease_total: self.metrics.request_lease_total.get(),
+            leases_granted_total: self.metrics.leases_granted_total.get(),
+            leases_expired_total: self.metrics.leases_expired_total.get(),
+            ranges_requeued_total: self.metrics.ranges_requeued_total.get(),
+            progress_total: self.metrics.progress_total.get(),
+        });
+        GetJobSnapshotResponse {
+            server_unix_time_ms: Self::unix_time_ms(),
+            manifest_hash: self.manifest_hash.clone(),
+            world_size: self.world_size,
+            registered_nodes: state.nodes.len() as u32,
+            job_ready: state.nodes.len() as u32 >= self.world_size,
+            job_drained: state.drained_emitted,
+            active_leases: state.leases.len() as u64,
+            available_ranges: state.available_ranges.len() as u64,
+            nodes,
+            live_leases,
+            counters,
+        }
     }
 
     fn mix64(mut x: u64) -> u64 {
@@ -631,12 +678,14 @@ impl Coordinator for CoordinatorSvc {
                 }
                 existing.caps = req.caps.clone();
                 existing.last_heartbeat_unix_time_ms = Some(now_ms);
+                existing.last_stats = None;
             } else {
                 state.nodes.insert(
                     req.node_id.clone(),
                     NodeEntry {
                         caps: req.caps.clone(),
                         last_heartbeat_unix_time_ms: Some(now_ms),
+                        last_stats: None,
                     },
                 );
             }
@@ -713,6 +762,7 @@ impl Coordinator for CoordinatorSvc {
             let mut state = self.state.write().await;
             if let Some(entry) = state.nodes.get_mut(&req.node_id) {
                 entry.last_heartbeat_unix_time_ms = Some(req.unix_time_ms);
+                entry.last_stats = req.stats.clone();
             }
         }
         Ok(Response::new(HeartbeatResponse {}))
@@ -1030,6 +1080,17 @@ impl Coordinator for CoordinatorSvc {
         Ok(Response::new(
             Box::pin(ReceiverStream::new(rx)) as Self::GetManifestStreamStream
         ))
+    }
+
+    async fn get_job_snapshot(
+        &self,
+        request: Request<GetJobSnapshotRequest>,
+    ) -> Result<Response<GetJobSnapshotResponse>, Status> {
+        let req = request.into_inner();
+        if let Some(status) = Self::validate_id("job_id", &req.job_id) {
+            return Err(status);
+        }
+        Ok(Response::new(self.build_snapshot().await))
     }
 }
 

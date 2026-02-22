@@ -1011,8 +1011,24 @@ impl DataLoader {
 
         let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
-        let max_process_rss_bytes_cap =
+        let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+        let mut max_process_rss_bytes_cap =
             max_ram_bytes.or_else(|| env_u64("MX8_MAX_PROCESS_RSS_BYTES"));
+        if max_process_rss_bytes_cap.is_none() {
+            max_process_rss_bytes_cap =
+                derive_default_max_process_rss_bytes(selected_profile, max_inflight_bytes);
+            if let Some(cap) = max_process_rss_bytes_cap {
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "rss_cap_defaulted",
+                    mode = "single_node_legacy",
+                    profile = profile_name(selected_profile),
+                    max_inflight_bytes = max_inflight_bytes,
+                    max_process_rss_bytes = cap,
+                    "defaulted process RSS cap from profile and node memory limit"
+                );
+            }
+        }
         let (effective_target_batch_bytes, effective_max_batch_bytes) =
             derive_byte_batch_caps(max_inflight_bytes, target_batch_bytes, max_batch_bytes);
         let caps = RuntimeCaps {
@@ -1028,7 +1044,7 @@ impl DataLoader {
         let metrics = pipeline.metrics();
         let autotune_enabled = autotune.unwrap_or(true);
         let autotune_profile = if autotune_enabled {
-            Some(AutotuneProfile::from_name(profile.as_deref()))
+            Some(selected_profile)
         } else {
             None
         };
@@ -3582,38 +3598,36 @@ fn load(
             effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
         }
 
-        if autotune_enabled && effective_max_process_rss_bytes.is_none() {
-            if let Some(node_limit) = detect_node_ram_limit_bytes() {
-                let profile_fraction = match selected_profile {
-                    AutotuneProfile::Safe => 0.60f64,
-                    AutotuneProfile::Balanced => 0.75f64,
-                    AutotuneProfile::Throughput => 0.85f64,
-                };
-                let reserve_bytes = 1u64 << 30;
-                let base_rss = sample_process_rss_bytes_local().unwrap_or(0);
-                let mut derived = ((node_limit as f64) * profile_fraction) as u64;
-                derived = derived.saturating_sub(reserve_bytes);
-                let min_required = base_rss.saturating_add(effective_max_inflight_bytes);
-                if derived < min_required {
-                    derived = min_required;
-                }
-                effective_max_process_rss_bytes = Some(derived.max(effective_max_inflight_bytes));
+        if effective_max_process_rss_bytes.is_none() {
+            effective_max_process_rss_bytes = derive_default_max_process_rss_bytes(
+                selected_profile,
+                effective_max_inflight_bytes,
+            );
+            if let Some(cap) = effective_max_process_rss_bytes {
                 tracing::info!(
                     target: "mx8_proof",
-                    event = "autotune_startup_caps_selected",
+                    event = "rss_cap_defaulted",
                     mode = "single_node",
-                    profile = match selected_profile {
-                        AutotuneProfile::Safe => "safe",
-                        AutotuneProfile::Balanced => "balanced",
-                        AutotuneProfile::Throughput => "throughput",
-                    },
+                    profile = profile_name(selected_profile),
                     max_inflight_bytes = effective_max_inflight_bytes,
-                    max_process_rss_bytes = effective_max_process_rss_bytes.unwrap_or(0),
-                    max_queue_batches = effective_max_queue_batches as u64,
-                    prefetch_batches = effective_prefetch_batches as u64,
-                    "v1 profile/autotune startup caps resolved"
+                    max_process_rss_bytes = cap,
+                    "defaulted process RSS cap from profile and node memory limit"
                 );
             }
+        }
+
+        if autotune_enabled {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "autotune_startup_caps_selected",
+                mode = "single_node",
+                profile = profile_name(selected_profile),
+                max_inflight_bytes = effective_max_inflight_bytes,
+                max_process_rss_bytes = effective_max_process_rss_bytes.unwrap_or(0),
+                max_queue_batches = effective_max_queue_batches as u64,
+                prefetch_batches = effective_prefetch_batches as u64,
+                "v1 profile/autotune startup caps resolved"
+            );
         }
 
         if let Some(max_process) = effective_max_process_rss_bytes {
@@ -3753,6 +3767,24 @@ fn py_image(
                 ));
             }
             effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
+        }
+
+        if effective_max_process_rss_bytes.is_none() {
+            effective_max_process_rss_bytes = derive_default_max_process_rss_bytes(
+                selected_profile,
+                effective_max_inflight_bytes,
+            );
+            if let Some(cap) = effective_max_process_rss_bytes {
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "rss_cap_defaulted",
+                    mode = "image",
+                    profile = profile_name(selected_profile),
+                    max_inflight_bytes = effective_max_inflight_bytes,
+                    max_process_rss_bytes = cap,
+                    "defaulted process RSS cap from profile and node memory limit"
+                );
+            }
         }
 
         if let Some(max_process) = effective_max_process_rss_bytes {
@@ -3914,21 +3946,19 @@ fn video(
         }
         effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
     }
-    if autotune_enabled && effective_max_process_rss_bytes.is_none() {
-        if let Some(node_limit) = detect_node_ram_limit_bytes() {
-            let profile_fraction = match selected_profile {
-                AutotuneProfile::Safe => 0.60f64,
-                AutotuneProfile::Balanced => 0.75f64,
-                AutotuneProfile::Throughput => 0.85f64,
-            };
-            let reserve_bytes = 1u64 << 30;
-            let mut derived = ((node_limit as f64) * profile_fraction) as u64;
-            derived = derived.saturating_sub(reserve_bytes);
-            let min_required = effective_max_inflight_bytes;
-            if derived < min_required {
-                derived = min_required;
-            }
-            effective_max_process_rss_bytes = Some(derived.max(effective_max_inflight_bytes));
+    if effective_max_process_rss_bytes.is_none() {
+        effective_max_process_rss_bytes =
+            derive_default_max_process_rss_bytes(selected_profile, effective_max_inflight_bytes);
+        if let Some(cap) = effective_max_process_rss_bytes {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "rss_cap_defaulted",
+                mode = "video",
+                profile = profile_name(selected_profile),
+                max_inflight_bytes = effective_max_inflight_bytes,
+                max_process_rss_bytes = cap,
+                "defaulted process RSS cap from profile and node memory limit"
+            );
         }
     }
     if let Some(max_process) = effective_max_process_rss_bytes {
@@ -4188,9 +4218,30 @@ fn mix(
         prefetch_caps.push(guard.prefetch_batches);
     }
 
-    let shared_max_inflight_bytes = shared_max_inflight_override
+    let mut shared_max_inflight_bytes = shared_max_inflight_override
         .map(|v| v.min(loader_shared_max_inflight_bytes))
         .unwrap_or(loader_shared_max_inflight_bytes);
+
+    if mix_max_process_rss_bytes.is_none() {
+        mix_max_process_rss_bytes =
+            derive_default_max_process_rss_bytes(selected_profile, shared_max_inflight_bytes);
+        if let Some(cap) = mix_max_process_rss_bytes {
+            tracing::info!(
+                target: "mx8_proof",
+                event = "rss_cap_defaulted",
+                mode = "mix",
+                profile = profile_name(selected_profile),
+                max_inflight_bytes = shared_max_inflight_bytes,
+                max_process_rss_bytes = cap,
+                "defaulted process RSS cap from profile and node memory limit"
+            );
+        }
+    }
+    if let Some(max_process) = mix_max_process_rss_bytes {
+        if shared_max_inflight_bytes > max_process {
+            shared_max_inflight_bytes = max_process;
+        }
+    }
 
     let mix_effective_prefetch_batches = runtime_prefetch_override
         .unwrap_or_else(|| prefetch_caps.iter().copied().min().unwrap_or(1usize).max(1));
@@ -4339,6 +4390,43 @@ fn max_ram_gb_to_bytes(max_ram_gb: Option<f64>) -> PyResult<Option<u64>> {
         return Err(PyValueError::new_err("max_ram_gb is too large"));
     }
     Ok(Some(bytes as u64))
+}
+
+fn rss_profile_fraction(profile: AutotuneProfile) -> f64 {
+    match profile {
+        AutotuneProfile::Safe => 0.60,
+        AutotuneProfile::Balanced => 0.75,
+        AutotuneProfile::Throughput => 0.85,
+    }
+}
+
+fn derive_default_max_process_rss_bytes(
+    profile: AutotuneProfile,
+    max_inflight_bytes: u64,
+) -> Option<u64> {
+    let node_limit = detect_node_ram_limit_bytes();
+    let reserve_bytes = 1u64 << 30;
+    let base_rss = sample_process_rss_bytes_local().unwrap_or(0);
+    let min_required = base_rss.saturating_add(max_inflight_bytes);
+    let mut derived = match node_limit {
+        Some(limit) => ((limit as f64) * rss_profile_fraction(profile)).max(1.0) as u64,
+        None => min_required.saturating_add(reserve_bytes),
+    };
+    if node_limit.is_some() {
+        derived = derived.saturating_sub(reserve_bytes);
+    }
+    if derived < min_required {
+        derived = min_required;
+    }
+    Some(derived.max(max_inflight_bytes).max(1))
+}
+
+fn profile_name(profile: AutotuneProfile) -> &'static str {
+    match profile {
+        AutotuneProfile::Safe => "safe",
+        AutotuneProfile::Balanced => "balanced",
+        AutotuneProfile::Throughput => "throughput",
+    }
 }
 
 fn derive_byte_batch_caps(
@@ -4625,6 +4713,14 @@ fn unix_time_ms() -> u64 {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+fn clamp_u64_to_u32(v: u64) -> u32 {
+    if v > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        v as u32
+    }
 }
 
 #[derive(Debug)]
@@ -5087,6 +5183,7 @@ async fn heartbeat_loop(
     job_id: String,
     node_id: String,
     pipeline: Arc<Pipeline>,
+    autotune: Arc<AutotuneShared>,
 ) {
     let mut client = CoordinatorClient::new(channel)
         .max_decoding_message_size(grpc_max_message_bytes)
@@ -5103,6 +5200,22 @@ async fn heartbeat_loop(
             fetch_queue_depth: 0,
             decode_queue_depth: 0,
             pack_queue_depth: 0,
+            autotune_enabled: autotune.enabled,
+            effective_prefetch_batches: clamp_u64_to_u32(
+                pipeline.effective_prefetch_batches() as u64
+            ),
+            effective_max_queue_batches: clamp_u64_to_u32(
+                pipeline.effective_max_queue_batches() as u64
+            ),
+            effective_want: autotune.want.load(Ordering::Relaxed),
+            autotune_pressure_milli: clamp_u64_to_u32(
+                autotune.pressure_milli.load(Ordering::Relaxed),
+            ),
+            autotune_cooldown_ticks: autotune.cooldown_ticks.load(Ordering::Relaxed),
+            batch_payload_p95_over_p50_milli: clamp_u64_to_u32(
+                metrics.batch_payload_bytes_p95_over_p50_milli.get(),
+            ),
+            batch_jitter_slo_breaches_total: metrics.batch_jitter_slo_breaches_total.get(),
         };
 
         let _ = client
@@ -5317,6 +5430,23 @@ impl DistributedDataLoader {
             }
             effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
         }
+        if effective_max_process_rss_bytes.is_none() {
+            effective_max_process_rss_bytes = derive_default_max_process_rss_bytes(
+                selected_profile,
+                effective_max_inflight_bytes,
+            );
+            if let Some(cap) = effective_max_process_rss_bytes {
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "rss_cap_defaulted",
+                    mode = "distributed",
+                    profile = profile_name(selected_profile),
+                    max_inflight_bytes = effective_max_inflight_bytes,
+                    max_process_rss_bytes = cap,
+                    "defaulted process RSS cap from profile and node memory limit"
+                );
+            }
+        }
         if let Some(max_process) = effective_max_process_rss_bytes {
             if effective_max_inflight_bytes > max_process {
                 effective_max_inflight_bytes = max_process;
@@ -5439,6 +5569,7 @@ impl DistributedDataLoader {
         let heartbeat_task = {
             let interval = Duration::from_millis(std::cmp::max(1, heartbeat_interval_ms) as u64);
             let pipeline = pipeline.clone();
+            let autotune = autotune.clone();
             let job_id = job_id.clone();
             let node_id = node_id.clone();
             let channel = channel.clone();
@@ -5449,6 +5580,7 @@ impl DistributedDataLoader {
                 job_id,
                 node_id,
                 pipeline,
+                autotune,
             )))
         };
 

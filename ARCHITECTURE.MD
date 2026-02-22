@@ -1,4 +1,4 @@
-MX8 v0 Architecture (Distributed Data Runtime + Tiny Authority Layer)
+MX8 v1.8 Architecture (Distributed Data Runtime + Tiny Authority Layer)
 
 What MX8 Is:
 MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus a small, per-job distributed authority layer that:
@@ -6,7 +6,7 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 - Keeps the hot-path (fetch/decode/pack/deliver) **in-process and bounded**.
 - Centralizes cluster-level decisions (ownership, pacing) so multi-node behaves like **one coordinated consumer**, not many independent loaders.
 
-Primary v0 workloads: offline inference / ETL / preprocessing / large corpus processing. Training is supported as a consumer (stability/throughput), but v0 does not keep DDP alive after node failure.
+Primary v1.8 workloads: offline inference / ETL / preprocessing / large corpus processing. Training is supported as a consumer (stability/throughput), but v1.8 does not keep DDP alive after node failure.
 
 ## Goals
 - Stop “each node pulls independently” by introducing a tiny cluster authority layer.
@@ -15,12 +15,12 @@ Primary v0 workloads: offline inference / ETL / preprocessing / large corpus pro
 - Deterministic sharding for a **pinned snapshot** (manifest hash) when failure-free.
 - Kill-a-node recovery for inference/ETL via leases + cursor + reassignment.
 
-## Non-Goals (v0)
+## Non-Goals (v1.8)
 - Multi-job QoS / fair-sharing across jobs.
 - Fleet scheduler / GPU placement.
 - Coordinator HA (if coordinator dies, the job stops/pauses).
-- Mid-run “live pickup” of newly added data (refresh is job-start only in v0).
-- Exactly-once delivery guarantees (at-least-once at boundaries is acceptable for v0 inference/ETL).
+- Mid-run “live pickup” of newly added data (refresh is job-start only in v1.8).
+- Exactly-once delivery guarantees (at-least-once at boundaries is acceptable for v1.8 inference/ETL).
 
 ## Core Invariants
 1) **No overlap**: a sample ID belongs to at most one *live* lease at a time.
@@ -40,7 +40,7 @@ Responsibilities:
 - Local authority for budgets and feeding work to runtimes on the machine.
 - Enforces per-node limits (fetch concurrency, inflight bytes, memory caps).
 - Talks to coordinator for leases/heartbeats/progress.
-- Hands subranges to local processes/ranks (node is the scheduling unit in v0).
+- Hands subranges to local processes/ranks (node is the scheduling unit in v1.8).
 
 ### C) `mx8-coordinator` (per job leader)
 Responsibilities:
@@ -59,13 +59,13 @@ Everything is a global sample ID space. Files/objects are implementation detail.
   - byte offsets/lengths when applicable
   - decode hints (optional; may include lightweight semantics like ImageFolder label IDs)
 
-Vision v0 convention (optional):
+Vision v1.8 convention (optional):
 - `decode_hint="mx8:vision:imagefolder;label_id=<n>"` enables classification-style training loops to consume
   `label_id` without per-sample label strings.
 - When packing many small objects into `_mx8/manifest.tsv`, also write `_mx8/labels.tsv` once per dataset
   (`label_id<TAB>label`, percent-encoded) so users can map IDs back to strings.
 
-v0 manifest format: **canonical TSV** (`_mx8/manifest.tsv` for packed datasets), with a **canonical hashing rule** for `manifest_hash` (hash the canonical record stream + schema version; do not rely on raw file bytes).
+v1.8 manifest format: **canonical TSV** (`_mx8/manifest.tsv` for packed datasets), with a **canonical hashing rule** for `manifest_hash` (hash the canonical record stream + schema version; do not rely on raw file bytes).
 
 ### WorkRange (unit of assignment)
 Contiguous physical ID interval in pinned sample-ID space:
@@ -74,7 +74,7 @@ Contiguous physical ID interval in pinned sample-ID space:
 WorkRange { start_id: u64, end_id: u64 /* half-open */, epoch: u32, seed: u64 }
 ```
 
-Shuffle in v0 is block-based in physical ID space:
+Shuffle in v1.8 is block-based in physical ID space:
 - Split `[0..N)` into blocks (e.g., 64k–1M samples).
 - Shuffle block order deterministically by `(seed, epoch)`.
 - Iterate sequentially within a block (or tiny local shuffle).
@@ -84,24 +84,24 @@ Shuffle in v0 is block-based in physical ID space:
 Lease { lease_id, node_id, range: WorkRange, expires_at, cursor }
 ```
 
-Cursor semantics (v0):
+Cursor semantics (v1.8):
 - Cursor advances only after **DELIVER** (batch handed to Python/consumer).
 
 ## Dataset Links, Snapshotting, and `manifest_store`
 Product rule:
 - MX8 always runs off a **pinned snapshot** (`manifest_hash`), even if the user only provides a prefix/path.
 
-Link forms (v0):
+Link forms (v1.8):
 - Plain: `s3://bucket/prefix/` or `/mnt/data/prefix/` → resolves to the current pinned snapshot for the intent.
 - Pinned: `...@sha256:<manifest_hash>` → uses that snapshot; no listing/indexing.
 - Refresh: `...@refresh` → forces a new snapshot at job start; updates the intent pointer.
 
-Packing convention (v0, optional):
+Packing convention (v1.8, optional):
 - If a prefix contains a precomputed canonical manifest at `s3://bucket/prefix/_mx8/manifest.tsv`,
   the snapshot resolver should use it instead of listing objects.
 
 Refresh scope:
-- v0 refresh is **job-start only** (frozen within a run).
+- v1.8 refresh is **job-start only** (frozen within a run).
 
 `manifest_store`:
 - Configured location for manifests, locks, and intent pointers.
@@ -126,11 +126,16 @@ Agent loop (~200ms):
 - If local runtime has capacity, request leases.
 - Hand ranges to local runtimes; report progress cursor periodically.
 
+Heartbeat observability contract (v1.8):
+- Node stats include memory/backpressure (`inflight_bytes`, `ram_high_water_bytes`, queue depths).
+- When available from the runtime surface, heartbeats also include autotune/jitter summaries
+  (effective knobs, pressure/cooldown, jitter ratio, breach counters).
+
 Runtime loop:
 - Get next range from local agent.
 - Fetch/decode/pack/deliver with bounded queues + backpressure.
 
-## Default Lease + Membership Policies (v0)
+## Default Lease + Membership Policies (v1.8)
 - Membership: dynamic registration + barrier to `world_size=N`, then freeze for the run.
   - Rank assignment: stable rule (sort by `node_id`) unless explicit ranks are provided.
 - Heartbeat: 1s; coordinator tick: 1s; lease TTL: ~10s.
@@ -213,8 +218,8 @@ These are ASCII diagrams (not Mermaid) so they render the same everywhere.
 Date: 2026-02-12
 
 ### Workload scope
-- v0 primary: offline inference / ETL / preprocessing / corpus processing.
-- Training supported as a consumer, but v0 is **non-elastic** (DDP node death kills the job).
+- v1.8 primary: offline inference / ETL / preprocessing / corpus processing.
+- Training supported as a consumer, but v1.8 is **non-elastic** (DDP node death kills the job).
 
 ### Runtime + authority split
 - Hot path stays in-process in Rust (`mx8` runtime).
@@ -222,7 +227,7 @@ Date: 2026-02-12
 
 ### Snapshot rule
 - MX8 always runs off a **pinned snapshot** (manifest + `manifest_hash`), even if the user only provides a prefix/path.
-- v0 is **frozen within a run** (no mid-run pickup of new data).
+- v1.8 is **frozen within a run** (no mid-run pickup of new data).
 - Default: frozen unless explicitly refreshed.
 - Link syntax supports:
   - `@sha256:<manifest_hash>` pinned snapshot
@@ -242,19 +247,19 @@ Date: 2026-02-12
 - Determinism: failure-free determinism is defined for a pinned snapshot and frozen membership.
 
 ### Manifest format
-- v0 manifest format: canonical TSV (`_mx8/manifest.tsv` for packed datasets).
+- v1.8 manifest format: canonical TSV (`_mx8/manifest.tsv` for packed datasets).
 - `manifest_hash` must be computed via a canonical hashing rule over records + schema version (not raw file bytes).
 
 ### Auto-index scope
 - “Paste link and go” is supported for built-in indexers.
-- v0 auto-index includes:
+- v1.8 auto-index includes:
   - one-file/object-per-sample
   - exactly one packed format (customer-driven; likely WebDataset tar)
 - All other layouts use explicit manifests (“bring your own manifest”) until additional indexers are shipped.
 
 ### Video decode (CPU + GPU)
-- v0 baseline: CPU decode is supported everywhere.
-- v0 GPU decode: Linux + NVIDIA (NVDEC) first.
+- v1.8 baseline: CPU decode is supported everywhere.
+- v1.8 GPU decode: Linux + NVIDIA (NVDEC) first.
 - GPU decode is best-effort and must fail open to CPU (any GPU-decode error falls back to CPU) with a consistent output contract.
 
 ### Leases and progress semantics
@@ -264,16 +269,16 @@ Date: 2026-02-12
 
 ### Lease sizing and timings
 - Heartbeat: ~1s; coordinator tick: ~1s; lease TTL: ~10s.
-- No mid-flight splitting in v0.
+- No mid-flight splitting in v1.8.
 - Range sizing targets ~5 seconds of work (adaptive based on observed throughput).
 - Lease unit: **1 lease = 1 shuffle block**; nodes may request multiple concurrent leases.
 
 ### Concurrency caps
 - Enforce per-node caps via agent (fetch streams, inflight bytes/memory).
-- Optional process-level watchdog (`max_process_rss_bytes`) enforces a hard RSS ceiling; MX8 fails fast with an explicit error before OS OOM kill.
-- Cluster-wide caps are applied indirectly via coordinator lease issuance (one job at a time in v0; no multi-job QoS).
+- Process-level RSS watchdog is enabled by default in production-facing loader surfaces (`max_ram_bytes` / `MX8_MAX_PROCESS_RSS_BYTES` override derived defaults); MX8 fails fast with an explicit error before OS OOM kill.
+- Cluster-wide caps are applied indirectly via coordinator lease issuance (one job at a time in v1.8; no multi-job QoS).
 
-### Autotune rollout status (v0)
+### Autotune rollout status (v1.8)
 - Startup profile autotune is available on v1-style API calls (for example `profile`, `constraints`, and `runtime` args).
 - Runtime autotune loops are controlled through loader API args (`profile`, `autotune`, caps/constraints) on supported surfaces.
-- Runtime autotune is intentionally not universal yet across all surfaces (for example video path), to keep contract and stability risk bounded during v0.
+- Runtime autotune is intentionally rolled out incrementally across surfaces/modes to keep contract and stability risk bounded in v1.8.

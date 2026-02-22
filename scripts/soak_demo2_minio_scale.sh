@@ -32,8 +32,6 @@ WAIT_FIRST_LEASE_TIMEOUT_MS="${WAIT_FIRST_LEASE_TIMEOUT_MS:-60000}"
 WAIT_REQUEUE_TIMEOUT_MS="${WAIT_REQUEUE_TIMEOUT_MS:-60000}"
 WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS:-600000}" # 10 minutes by default
 
-MIN_EXPECTED_MANIFEST_BYTES="$(( 4 * 1024 * 1024 + 1 ))"
-
 extract_artifacts() {
   python3 - "$1" <<'PY'
 import sys
@@ -48,14 +46,13 @@ PY
 }
 
 validate_artifacts() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  python3 - "$1" "$2" <<'PY'
 import os
 import re
 import sys
 
 root = sys.argv[1]
 world_size = int(sys.argv[2])
-min_manifest = int(sys.argv[3])
 
 ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -73,31 +70,25 @@ def must_not_contain(path: str, needle: str) -> None:
     if needle in txt:
         raise SystemExit(f"{path} contained unexpected substring: {needle}")
 
-def find_manifest_cached_bytes(path: str) -> int:
-    txt = read_text(path)
-    for line in txt.splitlines():
-        if 'event="manifest_cached"' in line:
-            m = re.search(r"\bmanifest_bytes=(\d+)\b", line)
-            if m:
-                return int(m.group(1))
-    return 0
-
 coord_log = os.path.join(root, "coordinator.log")
 must_contain(coord_log, 'event="job_drained"')
 must_contain(coord_log, 'event="no_overlap_ok"')
+must_contain(coord_log, 'event="lease_completed"')
+must_contain(coord_log, 'event="progress"')
 must_not_contain(coord_log, "message length too large")
 must_not_contain(coord_log, "OutOfRange")
 
-any_large = False
+saw_direct_stream = False
 for i in range(1, world_size + 1):
     agent_log = os.path.join(root, f"agent_node{i}.log")
     must_not_contain(agent_log, "message length too large")
     must_not_contain(agent_log, "OutOfRange")
-    if find_manifest_cached_bytes(agent_log) >= min_manifest:
-        any_large = True
+    txt = read_text(agent_log)
+    if 'event="lease_started"' in txt and 'source="direct_stream"' in txt:
+        saw_direct_stream = True
 
-if not any_large:
-    raise SystemExit(f"expected at least one agent to cache a >4MiB manifest (>= {min_manifest} bytes)")
+if not saw_direct_stream:
+    raise SystemExit("expected at least one agent to execute a direct-stream lease")
 
 print("[soak] validate OK")
 PY
@@ -123,6 +114,5 @@ WAIT_DRAIN_TIMEOUT_MS="${WAIT_DRAIN_TIMEOUT_MS}" \
 artifacts="$(extract_artifacts "${tmp_log}")"
 echo "[soak] artifacts=${artifacts}" >&2
 
-validate_artifacts "${artifacts}" "${WORLD_SIZE}" "${MIN_EXPECTED_MANIFEST_BYTES}" >&2
+validate_artifacts "${artifacts}" "${WORLD_SIZE}" >&2
 echo "[soak] OK: WORLD_SIZE=${WORLD_SIZE} TOTAL_SAMPLES=${TOTAL_SAMPLES} KILL_COUNT=${KILL_COUNT}"
-

@@ -10,7 +10,7 @@ members = [
   "crates/mx8-runtime",
   "crates/mx8-py",
   "crates/mx8d-agent",
-  "crates/mx8-coordinator",
+  "crates/mx8-coordinator", "crates/mx8-tui",
 ]
 
 [workspace.package]

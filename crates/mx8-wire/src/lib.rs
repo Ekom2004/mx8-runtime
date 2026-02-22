@@ -63,6 +63,14 @@ impl ToWire<wire::NodeStats> for core::NodeStats {
             fetch_queue_depth: self.fetch_queue_depth,
             decode_queue_depth: self.decode_queue_depth,
             pack_queue_depth: self.pack_queue_depth,
+            autotune_enabled: false,
+            effective_prefetch_batches: 0,
+            effective_max_queue_batches: 0,
+            effective_want: 0,
+            autotune_pressure_milli: 0,
+            autotune_cooldown_ticks: 0,
+            batch_payload_p95_over_p50_milli: 0,
+            batch_jitter_slo_breaches_total: 0,
         }
     }
 }

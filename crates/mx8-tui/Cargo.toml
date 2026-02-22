@@ -1,0 +1,15 @@
+[package]
+name = "mx8-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crossterm = "0.29.0"
+mx8-core = { version = "1.0.0", path = "../mx8-core" }
+mx8-proto = { version = "1.0.0", path = "../mx8-proto" }
+ratatui = "0.30.0"
+tokio.workspace = true
+tonic.workspace = true

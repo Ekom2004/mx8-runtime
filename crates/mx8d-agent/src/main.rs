@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -181,12 +181,19 @@ impl LeaseProgress {
 struct LeaseProgressSink {
     progress: Arc<LeaseProgress>,
     sleep: Duration,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Sink for LeaseProgressSink {
     fn deliver(&self, batch: Batch) -> Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("lease revoked by coordinator");
+        }
         if !self.sleep.is_zero() {
             std::thread::sleep(self.sleep);
+        }
+        if self.cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("lease revoked by coordinator");
         }
 
         self.progress
@@ -214,6 +221,7 @@ async fn report_progress_loop(
     channel: Channel,
     ctx: ProgressLoopCtx,
     progress: Arc<LeaseProgress>,
+    cancelled: Arc<AtomicBool>,
     mut done: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut client = CoordinatorClient::new(channel)
@@ -236,6 +244,18 @@ async fn report_progress_loop(
                     unix_time_ms: mx8_observe::time::unix_time_ms(),
                 };
                 if let Err(err) = client.report_progress(req).await {
+                    if err.code() == tonic::Code::NotFound {
+                        cancelled.store(true, Ordering::Relaxed);
+                        warn!(
+                            target: "mx8_proof",
+                            event = "lease_progress_stale_lease",
+                            error = %err,
+                            lease_id = %ctx.lease_id,
+                            cursor = cursor,
+                            "stale lease detected; cancelling local lease work"
+                        );
+                        return;
+                    }
                     warn!(error = %err, lease_id = %ctx.lease_id, cursor = cursor, "ReportProgress failed");
                 } else {
                     tracing::debug!(lease_id = %ctx.lease_id, cursor = cursor, "ReportProgress ok");
@@ -419,9 +439,11 @@ async fn run_lease(
     );
 
     let progress = Arc::new(LeaseProgress::new(range.start_id, range.end_id));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(LeaseProgressSink {
         progress: progress.clone(),
         sleep: Duration::from_millis(args.sink_sleep_ms),
+        cancelled: cancelled.clone(),
     });
 
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -436,13 +458,32 @@ async fn run_lease(
             grpc_max_message_bytes: args.grpc_max_message_bytes,
         },
         progress.clone(),
+        cancelled.clone(),
         done_rx,
     ));
 
-    pipeline.run_manifest_records(sink, records).await?;
+    let run_res = pipeline.run_manifest_records(sink, records).await;
 
     let _ = done_tx.send(());
     let _ = reporter.await;
+
+    if cancelled.load(Ordering::Relaxed) {
+        tracing::warn!(
+            target: "mx8_proof",
+            event = "lease_revoked",
+            job_id = %args.job_id,
+            node_id = %args.node_id,
+            manifest_hash = %manifest_hash,
+            lease_id = %lease.lease_id,
+            cursor = progress.cursor(),
+            delivered_samples = progress.delivered_samples(),
+            delivered_bytes = progress.delivered_bytes(),
+            "coordinator revoked lease; local work dropped"
+        );
+        return Ok(());
+    }
+
+    run_res?;
 
     let cursor = progress.cursor();
     let delivered_samples = progress.delivered_samples();
@@ -592,6 +633,14 @@ async fn main() -> Result<()> {
                     fetch_queue_depth: 0,
                     decode_queue_depth: 0,
                     pack_queue_depth: 0,
+                    autotune_enabled: false,
+                    effective_prefetch_batches: 0,
+                    effective_max_queue_batches: 0,
+                    effective_want: 0,
+                    autotune_pressure_milli: 0,
+                    autotune_cooldown_ticks: 0,
+                    batch_payload_p95_over_p50_milli: 0,
+                    batch_jitter_slo_breaches_total: 0,
                 };
 
                 let res = client
@@ -784,9 +833,10 @@ mod tests {
     use super::{run_lease, AgentMetrics, Args, ManifestSource};
     use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
     use mx8_proto::v0::{
-        GetManifestRequest, GetManifestResponse, HeartbeatRequest, HeartbeatResponse, Lease,
-        ManifestChunk, RegisterNodeRequest, RegisterNodeResponse, ReportProgressRequest,
-        ReportProgressResponse, RequestLeaseRequest, RequestLeaseResponse, WorkRange,
+        GetJobSnapshotRequest, GetJobSnapshotResponse, GetManifestRequest, GetManifestResponse,
+        HeartbeatRequest, HeartbeatResponse, Lease, ManifestChunk, RegisterNodeRequest,
+        RegisterNodeResponse, ReportProgressRequest, ReportProgressResponse, RequestLeaseRequest,
+        RequestLeaseResponse, WorkRange,
     };
     use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
     use std::pin::Pin;
@@ -874,6 +924,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+        }
+
+        async fn get_job_snapshot(
+            &self,
+            _request: Request<GetJobSnapshotRequest>,
+        ) -> Result<Response<GetJobSnapshotResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
         }
     }
 

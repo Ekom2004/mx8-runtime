@@ -1,6 +1,6 @@
-# MX8 Python API (v0)
+# MX8 Python API (v1.8)
 
-This page documents the API that ships today in `mx8==0.x`.
+This page documents the API that ships today in `mx8==1.8.x`.
 
 ## Install
 
@@ -109,7 +109,7 @@ loader_manual = mx8.load(
 
 Byte-aware batching is enabled by default (MX8 auto-derives target/max batch bytes from inflight caps). MX8 applies a tighter internal byte band around the target to reduce high/low batch-byte oscillation, emits a proof event when jitter SLO is breached, and adaptively tightens/relaxes the band with bounded hysteresis.
 
-Hidden operator guard (env-only): set `MX8_MAX_PROCESS_RSS_BYTES` to enforce a process RSS hard limit (fail-fast instead of OS OOM kill).
+RSS guard defaults on these loaders; set `max_ram_bytes` or `MX8_MAX_PROCESS_RSS_BYTES` to pin an explicit org-level process RSS hard limit.
 
 ## Image loader
 
@@ -133,7 +133,7 @@ for images, labels in loader:
 
 Decode backend behavior:
 
-- default/recommended in v0: Python/Pillow decode path
+- default/recommended in v1.8: Python/Pillow decode path
 - optional Rust path for benchmarking/optimization: set `MX8_DECODE_BACKEND=rust`
 - optional Rust decode worker count: set `MX8_DECODE_THREADS=<n>` (used when `MX8_DECODE_BACKEND=rust`)
 - optional Rust JPEG codec: set `MX8_RUST_JPEG_CODEC=zune|image|turbo` (default: `zune`)
@@ -245,7 +245,7 @@ Important fields:
   - `autotune=True|False`
   - current implementation adjusts `want`, `prefetch_batches`, and `max_queue_batches` inside profile rails.
 
-v0 training note: distributed data delivery is supported, but v0 is non-elastic (DDP rank death terminates training).
+v1.8 training note: distributed data delivery is supported, but v1.8 is non-elastic (DDP rank death terminates training).
 
 ## `mx8.mix(...)` (v1.7)
 

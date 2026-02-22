@@ -1,16 +1,19 @@
-# MX8 Memory Contract (v0 + v1 direction)
+# MX8 Memory Contract (v1.8)
 
-This page defines exactly what MX8 memory guarantees mean.
+This page defines exactly what MX8 memory guarantees mean in v1.8.
 
-## v0 hard guarantee
+## Hard guarantees in v1.8
 
-MX8 enforces a hard cap on loader-path memory with:
+MX8 can enforce two independent hard caps:
 
 - `max_inflight_bytes`
+  - caps bytes admitted into the MX8 pipeline (fetch/decode/queued delivery).
+  - backpressure engages when full.
+- `max_ram_bytes` (or env `MX8_MAX_PROCESS_RSS_BYTES`)
+  - caps whole-process RSS (explicit value or derived production default).
+  - MX8 fails fast with an explicit error when RSS exceeds the cap.
 
-This cap applies to bytes admitted into the MX8 pipeline (fetch/decode/queued delivery), with backpressure when full.
-
-## v0 bounded knobs
+## Bounded runtime knobs
 
 Use these together:
 
@@ -19,39 +22,24 @@ Use these together:
 - `prefetch_batches` (read-ahead depth)
 - `want` (distributed concurrent leases per node)
 
-These protect the data path from runaway buffering.
+These protect the data path from runaway buffering and lease over-requesting.
 
-## what v0 does not guarantee
+## What is conditional
 
-v0 does not hard-cap total process RSS.
+MX8 derives a default process RSS cap on production-facing loader APIs when no explicit cap is provided.
 
-Process RAM includes non-MX8 allocations:
+Residual risk remains for non-MX8 allocations (model/framework/user code): if they grow faster than expected, the process may still hit the RSS fail-fast cap and abort by design.
 
-- model activations / optimizer state
-- framework allocator behavior (PyTorch, Python)
-- user-retained tensors/batches
-
-So a process can still OOM even when MX8 respects `max_inflight_bytes`.
-
-## operator usage
+## Operator posture
 
 Treat memory safety as layered:
 
-1. Keep `max_inflight_bytes` strict.
-2. Keep `prefetch_batches` and `max_queue_batches` conservative.
-3. Monitor `loader.stats()` (`inflight_bytes`, `ram_high_water_bytes`).
-4. Avoid retaining batches beyond the step loop.
+1. Set `max_inflight_bytes` explicitly.
+2. Set `max_ram_bytes` (or `MX8_MAX_PROCESS_RSS_BYTES`) to enforce a strict org-level cap; otherwise MX8 uses a derived default.
+3. Keep `prefetch_batches` and `max_queue_batches` conservative for the workload.
+4. Monitor `loader.stats()` (`inflight_bytes`, `process_rss_bytes`, `ram_high_water_bytes`).
+5. Avoid retaining batches past the step loop.
 
-## v1 direction (planned)
+## One-line user contract
 
-To close the remaining OOM gap:
-
-- `max_batch_bytes` / `max_batch_tokens`: cap per-batch workload size.
-- `max_ram_bytes`: whole-process watchdog.
-  - soft threshold: throttle intake + warn.
-  - hard threshold: fail fast with clear error (instead of OS OOM kill).
-
-## one-line user contract
-
-v0: MX8 guarantees bounded loader-path memory, not total-process memory.  
-v1: MX8 adds process-level RSS guardrails for full end-to-end OOM protection.
+v1.8: MX8 guarantees bounded loader-path memory and defaults to whole-process RSS fail-fast protection on production-facing loader surfaces.

@@ -128,6 +128,11 @@ if [[ "${MX8_SMOKE_AUTOTUNE_PRESSURE_SIM:-0}" == "1" ]]; then
   ./scripts/autotune_memory_pressure_sim.sh
 fi
 
+if [[ "${MX8_SMOKE_TUI:-0}" == "1" ]]; then
+  echo "[mx8] tui_gate (read-only local TUI headless probe gate)"
+  ./scripts/tui_gate.sh
+fi
+
 if [[ "${MX8_SMOKE_MIX:-0}" == "1" ]]; then
   echo "[mx8] mix_gate (v1.7 weighted round-robin scheduler gate)"
   if [[ "${MX8_SMOKE_MIX_STRICT:-0}" == "1" ]]; then
@@ -185,6 +190,11 @@ fi
 if [[ "${MX8_SMOKE_VIDEO_GA:-0}" == "1" ]]; then
   echo "[mx8] video_ga_gate (video go/no-go checklist)"
   ./scripts/video_ga_gate.sh "${MX8_SMOKE_VIDEO_GA_MODE:---quick}"
+fi
+
+if [[ "${MX8_SMOKE_PROD_READINESS:-0}" == "1" ]]; then
+  echo "[mx8] prod_readiness (fixed production readiness suite)"
+  ./scripts/prod_readiness.sh
 fi
 
 echo "[mx8] smoke OK"

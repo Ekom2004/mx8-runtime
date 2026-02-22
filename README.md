@@ -9,9 +9,11 @@ MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus 
 ## Documentation
 
 - Python API: `docs/python_api.md`
+- Operator TUI: `docs/tui.md`
 - Image labels/layouts: `docs/vision_labels.md`
 - S3/runtime tuning: `docs/s3_runtime_tuning.md`
 - Troubleshooting: `docs/troubleshooting.md`
+- Production incident runbook: `docs/prod_runbook.md`
 - Mix contract/runbook: `docs/mix_v17_contract.md`, `docs/mix_gate_runbook.md`
 
 ## Autotune modes (current)
@@ -67,6 +69,12 @@ for step, (images, labels) in enumerate(loader):
   - `./scripts/mix_multirank_gate.sh`
   - `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
   - `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
+- TUI gate:
+  - `./scripts/tui_gate.sh`
+  - `MX8_SMOKE_TUI=1 ./scripts/smoke.sh`
+- Production readiness suite:
+  - `./scripts/prod_readiness.sh`
+  - `MX8_SMOKE_PROD_READINESS=1 ./scripts/smoke.sh`
 
 ## Packing (v0)
 
