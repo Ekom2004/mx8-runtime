@@ -22,6 +22,16 @@ Primary v1.8 workloads: offline inference / ETL / preprocessing / large corpus p
 - Mid-run “live pickup” of newly added data (refresh is job-start only in v1.8).
 - Exactly-once delivery guarantees (at-least-once at boundaries is acceptable for v1.8 inference/ETL).
 
+## Coordinator HA (v1.9 target)
+
+Coordinator HA is planned for v1.9 and is not part of the v1.8 shipped contract.
+
+- v1.8 contract: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
+- v1.9 target: leader failover with durable lease/progress state and single-writer fencing.
+
+Canonical plan and acceptance gates are defined in:
+- `docs/ha_contract.md`
+
 ## Core Invariants
 1) **No overlap**: a sample ID belongs to at most one *live* lease at a time.
 2) **Bounded memory**: every pipeline stage has hard caps; backpressure prevents runaway prefetch.

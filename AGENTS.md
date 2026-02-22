@@ -84,3 +84,8 @@ Testing harness is not yet established. When adding tests:
 
 - Do not commit secrets (AWS keys, tokens). Use env vars or workload identity.
 - macOS: `.DS_Store` should remain ignored via `.gitignore`.
+
+## Documentation Policy
+
+- Do not add personal/internal planning documents to `README.md` unless the user explicitly asks.
+- Keep `README.md` focused on stable, user-facing docs and workflows.

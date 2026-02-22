@@ -157,10 +157,41 @@ Rollback/escalation:
 
 Current v1.8 contract:
 
-- coordinator HA is not yet provided in default architecture
+- coordinator HA is not provided in default architecture
 - training is non-elastic (node-loss-tolerant continuation is not guaranteed)
 
-Operational implication:
+Coordinator failure action (v1.8):
 
-- use epoch-boundary restart/replacement for training jobs
-- do not promise continuous training progress through live membership churn
+1. Restart coordinator for the affected job.
+2. Restart affected agents/workers if they do not reconnect cleanly.
+3. Verify lease/progress recovery from fresh coordinator state.
+
+Checks:
+
+```bash
+cargo run -p mx8-tui -- --coord-url "$MX8_COORD_URL" --job-id "$MX8_JOB_ID" --headless-polls 6 --poll-ms 300
+```
+
+Expected outcome:
+
+- coordinator responds to snapshot RPCs
+- nodes re-register and heartbeat resumes
+- progress counters move again or job drains
+
+Rollback/escalation:
+
+- if coordinator repeatedly fails or job cannot resume progress, drain and relaunch from pinned `@sha256:<manifest_hash>`.
+
+Planned v1.9 HA scope:
+
+- single-writer leader with fencing
+- durable lease/progress state
+- automatic leader failover for inference/ETL jobs
+
+Canonical HA plan and acceptance gates:
+
+- `docs/ha_contract.md`
+
+Training note:
+
+- even after coordinator HA ships, training remains non-elastic unless explicitly upgraded in a later contract.

@@ -111,6 +111,12 @@ Byte-aware batching is enabled by default (MX8 auto-derives target/max batch byt
 
 RSS guard defaults on these loaders; set `max_ram_bytes` or `MX8_MAX_PROCESS_RSS_BYTES` to pin an explicit org-level process RSS hard limit.
 
+Current API note:
+
+- Top-level `mx8.stats(loader, raw=False)` is not shipped yet in v1.8.x.
+- Current supported surface is per-loader `loader.stats()` only.
+- Planned follow-up: add module-level `mx8.stats(...)` with human-readable default and raw passthrough mode.
+
 ## Image loader
 
 Use `mx8.image(...)` when manifests include ImageFolder label hints.
