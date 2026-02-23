@@ -257,42 +257,77 @@ Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./script
 
 ### Starting the coordinator
 
-Use `mx8.coordinator()` to start a local coordinator subprocess without any manual setup. It finds the `mx8d-coordinator` binary in your PATH, picks a free port, waits for it to be ready, and tears it down when the context exits.
+Use `mx8.coordinator()` to start a local coordinator subprocess without any manual setup. It finds the `mx8d-coordinator` binary in your PATH, starts it, waits for it to be ready, and tears it down when the context exits.
+
+**Single-machine multi-GPU (`torchrun`)**
+
+Pass `rank` so that only rank 0 starts the coordinator. All other ranks wait for it automatically — no manual barrier or broadcast needed.
 
 ```python
-import mx8
+# train.py — every rank runs the same script
+import os, mx8
 
-with mx8.coordinator(world_size=2) as coord:
-    print(coord.url)  # e.g. http://127.0.0.1:52341
+rank       = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
 
+with mx8.coordinator(rank=rank, world_size=world_size) as coord:
     loader = mx8.DistributedDataLoader(
         coord_url=coord.url,
         job_id="train",
-        node_id="rank0",
+        node_id=f"rank{rank}",
         batch_size_samples=512,
         max_ram_gb=24,
         profile="balanced",
     )
-
     for batch in loader:
         payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
 ```
 
+Launch with: `torchrun --nproc_per_node=8 train.py`
+
+**Multi-node**
+
+Set `bind_host="0.0.0.0"` and `master_addr` to the coordinator machine's reachable hostname or IP. Every rank gets a `coord.url` that points at the coordinator's public address.
+
+```python
+with mx8.coordinator(
+    rank=rank,
+    world_size=world_size,
+    bind_host="0.0.0.0",
+    master_addr="node0.cluster.local",
+    port=50051,
+) as coord:
+    loader = mx8.DistributedDataLoader(coord_url=coord.url, ...)
+```
+
+**Single process (no torchrun)**
+
+Omit `rank` and a free port is chosen automatically:
+
+```python
+with mx8.coordinator(world_size=1) as coord:
+    loader = mx8.DistributedDataLoader(coord_url=coord.url, ...)
+```
+
 `coordinator()` parameters:
 
-`dataset_link` — optional dataset link passed to the coordinator for snapshot resolution.
+`rank` — current process rank. When set, only rank 0 starts the subprocess; all other ranks wait for it to become ready. When omitted the function always starts the coordinator (single-process mode).
 
 `world_size` — number of ranks expected in this job (default 1).
 
-`port` — port to bind on. A free port is chosen automatically if not set.
+`dataset_link` — optional dataset link passed to the coordinator for snapshot resolution.
 
-`timeout_secs` — how long to wait for the coordinator to become ready (default 10).
+`port` — port to bind on. Defaults to 50051 when `rank` is set (all ranks must agree); auto-picked when `rank` is omitted.
 
-`log` — if `True`, the coordinator's output is forwarded to stderr. Default `False` (suppressed). Use `log=True` when debugging coordinator startup failures.
+`bind_host` — host the coordinator binds on (default `"127.0.0.1"`). Set to `"0.0.0.0"` for multi-node.
 
-`coord.stop()` terminates the subprocess immediately. It is called automatically on context exit and on garbage collection.
+`master_addr` — address other ranks use to reach the coordinator. Defaults to `bind_host`. Set this to the coordinator machine's public hostname or IP for multi-node jobs.
 
-For multi-node jobs the coordinator must be reachable from all ranks. Start it on a host with a stable address, set `MX8_COORD_BIND_ADDR=0.0.0.0:<port>`, and pass the resolved URL to each rank.
+`timeout_secs` — how long every rank waits for the coordinator to become ready (default 30).
+
+`log` — forward the coordinator's output to stderr. Default `False`. Use `log=True` when debugging startup failures.
+
+`coord.stop()` terminates the subprocess immediately. Called automatically on context exit and garbage collection.
 
 ### DistributedDataLoader
 

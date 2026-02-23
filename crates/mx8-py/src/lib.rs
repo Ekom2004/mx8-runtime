@@ -4492,25 +4492,46 @@ fn pick_free_port() -> Option<u16> {
 ///
 /// Parameters
 /// ----------
-/// dataset_link : str, optional
-///     Dataset link passed to the coordinator for snapshot resolution.
+/// rank : int, optional
+///     Current process rank. When set, only rank 0 starts the coordinator
+///     subprocess; all other ranks simply wait for it to become ready.
+///     This is the correct pattern for torchrun / multi-GPU jobs where every
+///     rank runs the same script.  When omitted the function behaves as a
+///     single-process helper and always starts the coordinator.
 /// world_size : int
 ///     Number of ranks in this job (default 1).
+/// dataset_link : str, optional
+///     Dataset link passed to the coordinator for snapshot resolution.
 /// port : int, optional
-///     Port to bind the coordinator on. A free port is chosen automatically
-///     if not set.
+///     Port to bind the coordinator on.
+///     When `rank` is set defaults to 50051 (so all ranks agree on the port).
+///     When `rank` is not set a free port is chosen automatically.
+/// bind_host : str
+///     Host/IP the coordinator binds on (default ``"127.0.0.1"``).
+///     Set to ``"0.0.0.0"`` for multi-node jobs where other machines need
+///     to reach the coordinator.
+/// master_addr : str, optional
+///     The address other ranks use to reach the coordinator.  Defaults to
+///     ``bind_host`` (fine for single-machine).  For multi-node, set this
+///     to the coordinator machine's reachable hostname or IP so the returned
+///     ``coord.url`` is correct for all ranks on all machines.
 /// timeout_secs : int
-///     How long to wait for the coordinator to become ready (default 10).
+///     How long every rank waits for the coordinator to become ready
+///     (default 30).
 /// log : bool
-///     If True, the coordinator's stdout/stderr is forwarded to the parent
-///     process's stderr. Default False (output is suppressed).
+///     Forward the coordinator's stdout/stderr to the parent process's
+///     stderr.  Default False (output is suppressed).
 ///
-/// Example
-/// -------
+/// Single-machine multi-GPU (torchrun)
+/// ------------------------------------
 /// ```python
-/// import mx8
+/// # train.py — every rank runs this
+/// import os, mx8
 ///
-/// with mx8.coordinator(world_size=8) as coord:
+/// rank       = int(os.environ["RANK"])
+/// world_size = int(os.environ["WORLD_SIZE"])
+///
+/// with mx8.coordinator(rank=rank, world_size=world_size) as coord:
 ///     loader = mx8.DistributedDataLoader(
 ///         coord_url=coord.url,
 ///         job_id="train",
@@ -4520,82 +4541,137 @@ fn pick_free_port() -> Option<u16> {
 ///         profile="balanced",
 ///     )
 /// ```
+///
+/// Multi-node
+/// ----------
+/// ```python
+/// # On every node — set bind_host + master_addr so the URL is reachable
+/// with mx8.coordinator(
+///     rank=rank,
+///     world_size=world_size,
+///     bind_host="0.0.0.0",
+///     master_addr="node0.cluster.local",
+///     port=50051,
+/// ) as coord:
+///     loader = mx8.DistributedDataLoader(coord_url=coord.url, ...)
+/// ```
 #[pyfunction]
-#[pyo3(signature = (*, dataset_link=None, world_size=1, port=None, timeout_secs=10, log=false))]
+#[pyo3(signature = (*, rank=None, world_size=1, dataset_link=None, port=None, bind_host="127.0.0.1".to_string(), master_addr=None, timeout_secs=30, log=false))]
+#[allow(clippy::too_many_arguments)]
 fn coordinator(
-    dataset_link: Option<String>,
+    rank: Option<u32>,
     world_size: u32,
+    dataset_link: Option<String>,
     port: Option<u16>,
+    bind_host: String,
+    master_addr: Option<String>,
     timeout_secs: u64,
     log: bool,
 ) -> PyResult<CoordinatorHandle> {
-    let binary = find_coordinator_binary()
-        .map_err(|e| PyRuntimeError::new_err(format!("mx8.coordinator: {e}")))?;
+    let is_rank_zero = rank.is_none_or(|r| r == 0);
 
-    let port = port.or_else(pick_free_port).unwrap_or(50051);
-    let bind_addr = format!("127.0.0.1:{port}");
-    let url = format!("http://127.0.0.1:{port}");
+    // Port selection:
+    // - Explicit port always wins.
+    // - With rank set: use 50051 so every rank agrees without coordination.
+    // - Without rank: auto-pick a free port (single-process helper).
+    let port = match port {
+        Some(p) => p,
+        None => {
+            if rank.is_some() {
+                50051
+            } else {
+                pick_free_port().unwrap_or(50051)
+            }
+        }
+    };
 
-    let mut cmd = std::process::Command::new(&binary);
-    cmd.arg("--addr").arg(&bind_addr);
-    cmd.arg("--world-size").arg(world_size.to_string());
-    if let Some(link) = &dataset_link {
-        cmd.arg("--dataset-link").arg(link);
-    }
-    if log {
-        cmd.stdout(std::process::Stdio::inherit());
-        cmd.stderr(std::process::Stdio::inherit());
-    } else {
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-    }
+    // The address ranks use to connect. For single-machine use 127.0.0.1.
+    // For multi-node the caller provides master_addr (the coordinator's
+    // public hostname / IP).
+    let connect_host = master_addr
+        .as_deref()
+        .unwrap_or(if bind_host == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            &bind_host
+        })
+        .to_string();
 
-    let mut child = cmd.spawn().map_err(|e| {
-        PyRuntimeError::new_err(format!(
-            "mx8.coordinator: failed to start {}: {e}",
-            binary.display()
-        ))
-    })?;
-
-    // Poll the TCP port until the coordinator is ready.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let addr: std::net::SocketAddr = bind_addr
+    let bind_addr = format!("{bind_host}:{port}");
+    let connect_addr: std::net::SocketAddr = format!("{connect_host}:{port}")
         .parse()
-        .map_err(|e| PyRuntimeError::new_err(format!("mx8.coordinator: bad addr: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("mx8.coordinator: bad address: {e}")))?;
+    let url = format!("http://{connect_host}:{port}");
+
+    // Only rank 0 (or a rank-less single-process call) starts the subprocess.
+    let mut child: Option<std::process::Child> = if is_rank_zero {
+        let binary = find_coordinator_binary()
+            .map_err(|e| PyRuntimeError::new_err(format!("mx8.coordinator: {e}")))?;
+
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("--addr").arg(&bind_addr);
+        cmd.arg("--world-size").arg(world_size.to_string());
+        if let Some(link) = &dataset_link {
+            cmd.arg("--dataset-link").arg(link);
+        }
+        if log {
+            cmd.stdout(std::process::Stdio::inherit());
+            cmd.stderr(std::process::Stdio::inherit());
+        } else {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+
+        let c = cmd.spawn().map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "mx8.coordinator: failed to start {}: {e}",
+                binary.display()
+            ))
+        })?;
+        Some(c)
+    } else {
+        // Non-zero ranks have no subprocess — they just wait for rank 0's.
+        None
+    };
+
+    // Every rank polls until the coordinator TCP port accepts connections.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut ready = false;
     while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
-            .is_ok()
+        if std::net::TcpStream::connect_timeout(
+            &connect_addr,
+            std::time::Duration::from_millis(100),
+        )
+        .is_ok()
         {
             ready = true;
             break;
         }
-        // Check if the process already died (bad binary, missing deps, etc.)
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        // Rank 0 can detect early process exit and give a useful error.
+        if let Some(ref mut c) = child {
+            if let Ok(Some(status)) = c.try_wait() {
                 return Err(PyRuntimeError::new_err(format!(
-                    "mx8.coordinator: coordinator process exited early (status={status}). \
-                     Re-run with log=True to see output."
+                    "mx8.coordinator: coordinator process exited early \
+                     (status={status}). Re-run with log=True to see output."
                 )));
             }
-            Ok(None) => {}
-            Err(_) => {}
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     if !ready {
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(mut c) = child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let rank_hint = rank.map_or(String::new(), |r| format!(" (rank {r})"));
         return Err(PyRuntimeError::new_err(format!(
-            "mx8.coordinator: did not become ready within {timeout_secs}s on port {port}"
+            "mx8.coordinator: {connect_host}:{port} did not become ready \
+             within {timeout_secs}s{rank_hint}"
         )));
     }
 
-    Ok(CoordinatorHandle {
-        url,
-        child: Some(child),
-    })
+    Ok(CoordinatorHandle { url, child })
 }
 
 #[pymodule]
