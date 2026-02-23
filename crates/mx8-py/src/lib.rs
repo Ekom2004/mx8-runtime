@@ -4395,6 +4395,209 @@ fn mix(
     Py::new(py, out)
 }
 
+// ── mx8.coordinator() ──────────────────────────────────────────────────────
+
+/// Handle returned by `mx8.coordinator()`. Use as a context manager:
+///
+/// ```python
+/// with mx8.coordinator() as coord:
+///     loader = mx8.DistributedDataLoader(coord_url=coord.url, ...)
+/// ```
+///
+/// The coordinator subprocess is terminated when the context exits (or when
+/// `coord.stop()` is called explicitly).
+#[pyclass]
+struct CoordinatorHandle {
+    url: String,
+    child: Option<std::process::Child>,
+}
+
+#[pymethods]
+impl CoordinatorHandle {
+    /// The HTTP URL the coordinator is listening on (e.g. `http://127.0.0.1:50051`).
+    #[getter]
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<PyObject>,
+        _exc_val: Option<PyObject>,
+        _exc_tb: Option<PyObject>,
+    ) -> bool {
+        self.stop();
+        false
+    }
+
+    /// Terminate the coordinator subprocess immediately.
+    /// Called automatically on context-manager exit or garbage collection.
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn __del__(&mut self) {
+        self.stop();
+    }
+
+    fn __repr__(&self) -> String {
+        format!("mx8.CoordinatorHandle(url={:?})", self.url)
+    }
+}
+
+/// Find the `mx8d-coordinator` binary.
+/// Checks PATH directories, then the directory containing the current
+/// executable (useful when the binary is bundled alongside the wheel).
+fn find_coordinator_binary() -> Result<std::path::PathBuf, String> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for dir in path_var.split(sep) {
+            let candidate = std::path::PathBuf::from(dir).join("mx8d-coordinator");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("mx8d-coordinator");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err("mx8d-coordinator not found in PATH. \
+         Build it with: cargo build -p mx8-coordinator \
+         then add the binary to your PATH."
+        .to_string())
+}
+
+/// Bind to port 0 to let the OS pick a free port, then release it.
+/// There is a small TOCTOU window but it is acceptable for local use.
+fn pick_free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
+/// Start a local coordinator subprocess and return a handle to it.
+///
+/// Parameters
+/// ----------
+/// dataset_link : str, optional
+///     Dataset link passed to the coordinator for snapshot resolution.
+/// world_size : int
+///     Number of ranks in this job (default 1).
+/// port : int, optional
+///     Port to bind the coordinator on. A free port is chosen automatically
+///     if not set.
+/// timeout_secs : int
+///     How long to wait for the coordinator to become ready (default 10).
+/// log : bool
+///     If True, the coordinator's stdout/stderr is forwarded to the parent
+///     process's stderr. Default False (output is suppressed).
+///
+/// Example
+/// -------
+/// ```python
+/// import mx8
+///
+/// with mx8.coordinator(world_size=8) as coord:
+///     loader = mx8.DistributedDataLoader(
+///         coord_url=coord.url,
+///         job_id="train",
+///         node_id=f"rank{rank}",
+///         batch_size_samples=512,
+///         max_ram_gb=24,
+///         profile="balanced",
+///     )
+/// ```
+#[pyfunction]
+#[pyo3(signature = (*, dataset_link=None, world_size=1, port=None, timeout_secs=10, log=false))]
+fn coordinator(
+    dataset_link: Option<String>,
+    world_size: u32,
+    port: Option<u16>,
+    timeout_secs: u64,
+    log: bool,
+) -> PyResult<CoordinatorHandle> {
+    let binary = find_coordinator_binary()
+        .map_err(|e| PyRuntimeError::new_err(format!("mx8.coordinator: {e}")))?;
+
+    let port = port.or_else(pick_free_port).unwrap_or(50051);
+    let bind_addr = format!("127.0.0.1:{port}");
+    let url = format!("http://127.0.0.1:{port}");
+
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.arg("--addr").arg(&bind_addr);
+    cmd.arg("--world-size").arg(world_size.to_string());
+    if let Some(link) = &dataset_link {
+        cmd.arg("--dataset-link").arg(link);
+    }
+    if log {
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "mx8.coordinator: failed to start {}: {e}",
+            binary.display()
+        ))
+    })?;
+
+    // Poll the TCP port until the coordinator is ready.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| PyRuntimeError::new_err(format!("mx8.coordinator: bad addr: {e}")))?;
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        // Check if the process already died (bad binary, missing deps, etc.)
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "mx8.coordinator: coordinator process exited early (status={status}). \
+                     Re-run with log=True to see output."
+                )));
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(PyRuntimeError::new_err(format!(
+            "mx8.coordinator: did not become ready within {timeout_secs}s on port {port}"
+        )));
+    }
+
+    Ok(CoordinatorHandle {
+        url,
+        child: Some(child),
+    })
+}
+
 #[pymodule]
 fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -4423,6 +4626,8 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(video, m)?)?;
     m.add_function(wrap_pyfunction!(mix, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
+    m.add_class::<CoordinatorHandle>()?;
+    m.add_function(wrap_pyfunction!(coordinator, m)?)?;
     Ok(())
 }
 

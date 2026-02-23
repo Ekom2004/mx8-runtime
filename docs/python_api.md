@@ -255,20 +255,56 @@ Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./script
 
 `mx8.DistributedDataLoader` is the distributed control-plane loader for DDP-style jobs. It connects to a running coordinator and participates in the lease protocol.
 
+### Starting the coordinator
+
+Use `mx8.coordinator()` to start a local coordinator subprocess without any manual setup. It finds the `mx8d-coordinator` binary in your PATH, picks a free port, waits for it to be ready, and tears it down when the context exits.
+
 ```python
 import mx8
 
+with mx8.coordinator(world_size=2) as coord:
+    print(coord.url)  # e.g. http://127.0.0.1:52341
+
+    loader = mx8.DistributedDataLoader(
+        coord_url=coord.url,
+        job_id="train",
+        node_id="rank0",
+        batch_size_samples=512,
+        max_ram_gb=24,
+        profile="balanced",
+    )
+
+    for batch in loader:
+        payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
+```
+
+`coordinator()` parameters:
+
+`dataset_link` — optional dataset link passed to the coordinator for snapshot resolution.
+
+`world_size` — number of ranks expected in this job (default 1).
+
+`port` — port to bind on. A free port is chosen automatically if not set.
+
+`timeout_secs` — how long to wait for the coordinator to become ready (default 10).
+
+`log` — if `True`, the coordinator's output is forwarded to stderr. Default `False` (suppressed). Use `log=True` when debugging coordinator startup failures.
+
+`coord.stop()` terminates the subprocess immediately. It is called automatically on context exit and on garbage collection.
+
+For multi-node jobs the coordinator must be reachable from all ranks. Start it on a host with a stable address, set `MX8_COORD_BIND_ADDR=0.0.0.0:<port>`, and pass the resolved URL to each rank.
+
+### DistributedDataLoader
+
+```python
 loader = mx8.DistributedDataLoader(
     coord_url="http://127.0.0.1:50051",
-    job_id="demo",
-    node_id="node1",
+    job_id="train",
+    node_id=f"rank{rank}",
     batch_size_samples=512,
     max_ram_gb=24,
     profile="balanced",
 )
-
-for batch in loader:
-    payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
 ```
 
 `want` sets the max number of concurrent leases this node will request. `progress_interval_ms` controls how often progress is reported to the coordinator (default 500ms). `grpc_max_message_bytes` caps the gRPC message size for manifest and control-path traffic (default 64MB).
