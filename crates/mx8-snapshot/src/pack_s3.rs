@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use futures::StreamExt;
@@ -187,26 +185,130 @@ async fn s3_client_from_env() -> Result<aws_sdk_s3::Client> {
     Ok(aws_sdk_s3::Client::from_conf(b.build()))
 }
 
-async fn upload_file(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    path: &PathBuf,
-) -> Result<()> {
-    let body = ByteStream::from_path(path)
-        .await
-        .with_context(|| format!("ByteStream::from_path failed: {}", path.display()))?;
+/// Default multipart part size. S3 requires ≥5MB per part (except the final part).
+/// 16MB gives good throughput and stays well above the minimum.
+/// Override with `MX8_PACK_PART_MB`.
+const DEFAULT_PART_MB: usize = 16;
 
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(body)
-        .send()
-        .await
-        .with_context(|| format!("put_object failed: s3://{bucket}/{key}"))?;
+/// Streams a tar shard directly to S3 via multipart upload.
+/// Bytes are accumulated in `part_buf`; a new part is flushed whenever the
+/// buffer reaches `part_size`. This eliminates the local temp-file requirement
+/// and overlaps download and upload, roughly halving effective pack time.
+struct MultipartState {
+    upload_id: String,
+    key: String,
+    bucket: String,
+    part_buf: Vec<u8>,
+    part_size: usize,
+    completed_parts: Vec<aws_sdk_s3::types::CompletedPart>,
+}
 
-    Ok(())
+impl MultipartState {
+    async fn start(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+        part_size: usize,
+    ) -> Result<Self> {
+        let resp = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("create_multipart_upload failed: s3://{bucket}/{key}"))?;
+        let upload_id = resp
+            .upload_id()
+            .ok_or_else(|| anyhow::anyhow!("create_multipart_upload: missing upload_id"))?
+            .to_string();
+        Ok(Self {
+            upload_id,
+            key: key.to_string(),
+            bucket: bucket.to_string(),
+            part_buf: Vec::with_capacity(part_size),
+            part_size,
+            completed_parts: Vec::new(),
+        })
+    }
+
+    async fn write(&mut self, client: &aws_sdk_s3::Client, data: &[u8]) -> Result<()> {
+        self.part_buf.extend_from_slice(data);
+        while self.part_buf.len() >= self.part_size {
+            let chunk: Vec<u8> = self.part_buf.drain(..self.part_size).collect();
+            self.flush_part(client, chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_part(&mut self, client: &aws_sdk_s3::Client, data: Vec<u8>) -> Result<()> {
+        let part_number = self.completed_parts.len() as i32 + 1;
+        anyhow::ensure!(
+            part_number <= 10_000,
+            "multipart upload exceeded 10,000 parts limit for s3://{}/{}",
+            self.bucket,
+            self.key
+        );
+        let resp = client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(data))
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "upload_part {} failed: s3://{}/{}",
+                    part_number, self.bucket, self.key
+                )
+            })?;
+        let etag = resp.e_tag().unwrap_or("").to_string();
+        self.completed_parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(etag)
+                .build(),
+        );
+        Ok(())
+    }
+
+    async fn finalize(mut self, client: &aws_sdk_s3::Client) -> Result<()> {
+        if !self.part_buf.is_empty() {
+            let remaining = std::mem::take(&mut self.part_buf);
+            self.flush_part(client, remaining).await?;
+        }
+        let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+            .set_parts(Some(self.completed_parts))
+            .build();
+        client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "complete_multipart_upload failed: s3://{}/{}",
+                    self.bucket, self.key
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Best-effort abort. Called on error to avoid accumulating incomplete
+    /// multipart uploads in S3 (which incur storage charges).
+    async fn abort(self, client: &aws_sdk_s3::Client) {
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await;
+    }
 }
 
 /// Check whether a packed manifest already exists for `s3_url`, and if not,
@@ -276,7 +378,7 @@ pub async fn autopack_if_needed(s3_url: &str, shard_mb: u64) -> Result<()> {
         shard_mb,
         label_mode: LabelMode::Auto,
         require_labels: false,
-        parallel_fetches: 32,
+        parallel_fetches: 128,
     })
     .await?;
 
@@ -424,18 +526,18 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
         }
     }
 
-    let tmp_root = {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "mx8-pack-s3-{}-{}",
-            std::process::id(),
-            mx8_manifest_store::sha256_hex(cfg.pack_out.as_bytes())
-        ));
-        std::fs::create_dir_all(&p)?;
-        p
+    let parallel_fetches = {
+        let from_env = std::env::var("MX8_PACK_PARALLEL_FETCHES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        from_env.unwrap_or(cfg.parallel_fetches).max(1)
     };
-
-    let parallel_fetches = cfg.parallel_fetches.max(1);
+    let part_size = std::env::var("MX8_PACK_PART_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PART_MB)
+        .max(5) // S3 minimum is 5MB per part
+        .saturating_mul(1024 * 1024);
 
     // Download objects in parallel (ordered) then write sequentially into shards.
     // futures::stream::buffered() drives up to `parallel_fetches` futures concurrently
@@ -501,45 +603,117 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
     let mut shard_idx: u64 = 0;
     let mut shard_bytes: u64 = 0;
     let mut shard_offset: u64 = 0;
-    let mut shard_path: PathBuf = tmp_root.join(format!("shard-{shard_idx:05}.tar"));
-    let mut shard_file = tokio::fs::File::create(&shard_path).await?;
-
     let mut total_shards: u64 = 0;
-
-    use tokio::io::AsyncWriteExt;
-
     let mut wrote_any_in_shard = false;
 
-    let mut fetch_stream = std::pin::pin!(fetch_stream);
-    while let Some(fetched) = fetch_stream.next().await {
-        let FetchedObject {
-            index: i,
-            key,
-            bytes: b,
-            size,
-            label,
-        } = fetched?;
+    // Helper: build the S3 key for the current shard index.
+    let shard_out_key = |idx: u64| -> String {
+        if out_prefix.is_empty() {
+            format!("shards/shard-{idx:05}.tar")
+        } else {
+            format!("{out_prefix}/shards/shard-{idx:05}.tar")
+        }
+    };
 
-        let ext = infer_ext(&key)
-            .map(|e| format!(".{e}"))
-            .unwrap_or_else(|| ".bin".to_string());
-        let name = format!("{:020}{}", i, ext);
-        let header = tar_header(&name, size)?;
-        let pad = tar_pad_len(size);
-        let entry_bytes = 512u64
-            .checked_add(size)
-            .and_then(|v| v.checked_add(pad))
-            .ok_or_else(|| anyhow::anyhow!("tar size overflow"))?;
+    let mut shard =
+        MultipartState::start(&client, &out_bucket, &shard_out_key(shard_idx), part_size).await?;
 
-        if wrote_any_in_shard && shard_bytes.saturating_add(entry_bytes) > shard_target_bytes {
-            shard_file.write_all(&[0u8; 1024]).await?;
-            shard_file.flush().await?;
+    // Run the main pack loop, aborting the active multipart upload on any error
+    // so incomplete uploads don't accumulate in S3.
+    let pack_result: Result<()> = async {
+        let mut fetch_stream = std::pin::pin!(fetch_stream);
+        while let Some(fetched) = fetch_stream.next().await {
+            let FetchedObject {
+                index: i,
+                key,
+                bytes: b,
+                size,
+                label,
+            } = fetched?;
 
-            let out_key = if out_prefix.is_empty() {
-                format!("shards/shard-{shard_idx:05}.tar")
+            let ext = infer_ext(&key)
+                .map(|e| format!(".{e}"))
+                .unwrap_or_else(|| ".bin".to_string());
+            let name = format!("{:020}{}", i, ext);
+            let header = tar_header(&name, size)?;
+            let pad = tar_pad_len(size);
+            let entry_bytes = 512u64
+                .checked_add(size)
+                .and_then(|v| v.checked_add(pad))
+                .ok_or_else(|| anyhow::anyhow!("tar size overflow"))?;
+
+            // Rotate shard when this entry would overflow.
+            if wrote_any_in_shard && shard_bytes.saturating_add(entry_bytes) > shard_target_bytes {
+                // Write tar end-of-archive marker and finalize the multipart upload.
+                shard.write(&client, &[0u8; 1024]).await?;
+                let out_key = shard_out_key(shard_idx);
+                info!(
+                    target: "mx8_proof",
+                    event = "pack_upload_shard",
+                    shard_idx,
+                    shard_bytes = shard_offset + 1024,
+                    shard_key = out_key.as_str(),
+                    "uploading shard"
+                );
+                shard.finalize(&client).await?;
+                total_shards = total_shards.saturating_add(1);
+
+                shard_idx = shard_idx.saturating_add(1);
+                shard_bytes = 0;
+                shard_offset = 0;
+                wrote_any_in_shard = false;
+
+                shard = MultipartState::start(
+                    &client,
+                    &out_bucket,
+                    &shard_out_key(shard_idx),
+                    part_size,
+                )
+                .await?;
+            }
+
+            let data_offset = shard_offset
+                .checked_add(512)
+                .ok_or_else(|| anyhow::anyhow!("offset overflow"))?;
+
+            shard.write(&client, &header).await?;
+            shard.write(&client, &b).await?;
+            if pad != 0 {
+                let zeros = vec![0u8; pad as usize];
+                shard.write(&client, &zeros).await?;
+            }
+
+            wrote_any_in_shard = true;
+            shard_bytes = shard_bytes.saturating_add(entry_bytes);
+            shard_offset = shard_offset.saturating_add(entry_bytes);
+
+            let location = format!("s3://{out_bucket}/{}", shard_out_key(shard_idx));
+
+            let decode_hint = if use_labels {
+                let label = label.context("internal error: missing label under use_labels=true")?;
+                let label_id = *label_map
+                    .get(&label)
+                    .with_context(|| format!("internal error: label not in map: {label:?}"))?;
+                Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
             } else {
-                format!("{out_prefix}/shards/shard-{shard_idx:05}.tar")
+                None
             };
+
+            let record = ManifestRecord {
+                sample_id: i as u64,
+                location,
+                byte_offset: Some(data_offset),
+                byte_length: Some(size),
+                decode_hint,
+            };
+            record.validate()?;
+            records.push(record);
+        }
+
+        // Finalize the last shard.
+        if wrote_any_in_shard {
+            shard.write(&client, &[0u8; 1024]).await?;
+            let out_key = shard_out_key(shard_idx);
             info!(
                 target: "mx8_proof",
                 event = "pack_upload_shard",
@@ -548,85 +722,17 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
                 shard_key = out_key.as_str(),
                 "uploading shard"
             );
-            drop(shard_file);
-            upload_file(&client, &out_bucket, &out_key, &shard_path).await?;
-
+            shard.finalize(&client).await?;
             total_shards = total_shards.saturating_add(1);
-
-            shard_idx = shard_idx.saturating_add(1);
-            shard_bytes = 0;
-            shard_offset = 0;
-
-            shard_path = tmp_root.join(format!("shard-{shard_idx:05}.tar"));
-            shard_file = tokio::fs::File::create(&shard_path).await?;
+        } else {
+            shard.abort(&client).await;
         }
 
-        let data_offset = shard_offset
-            .checked_add(512)
-            .ok_or_else(|| anyhow::anyhow!("offset overflow"))?;
-
-        shard_file.write_all(&header).await?;
-        shard_file.write_all(&b).await?;
-
-        if pad != 0 {
-            let zeros = vec![0u8; pad as usize];
-            shard_file.write_all(&zeros).await?;
-        }
-
-        wrote_any_in_shard = true;
-        shard_bytes = shard_bytes.saturating_add(entry_bytes);
-        shard_offset = shard_offset.saturating_add(entry_bytes);
-
-        let shard_key = if out_prefix.is_empty() {
-            format!("shards/shard-{shard_idx:05}.tar")
-        } else {
-            format!("{out_prefix}/shards/shard-{shard_idx:05}.tar")
-        };
-        let location = format!("s3://{out_bucket}/{shard_key}");
-
-        let decode_hint = if use_labels {
-            let label = label.context("internal error: missing label under use_labels=true")?;
-            let label_id = *label_map
-                .get(&label)
-                .with_context(|| format!("internal error: label not in map: {label:?}"))?;
-            Some(format!("mx8:vision:imagefolder;label_id={label_id}"))
-        } else {
-            None
-        };
-
-        let record = ManifestRecord {
-            sample_id: i as u64,
-            location,
-            byte_offset: Some(data_offset),
-            byte_length: Some(size),
-            decode_hint,
-        };
-        record.validate()?;
-        records.push(record);
+        Ok(())
     }
+    .await;
 
-    if wrote_any_in_shard {
-        shard_file.write_all(&[0u8; 1024]).await?;
-        shard_file.flush().await?;
-
-        let out_key = if out_prefix.is_empty() {
-            format!("shards/shard-{shard_idx:05}.tar")
-        } else {
-            format!("{out_prefix}/shards/shard-{shard_idx:05}.tar")
-        };
-        info!(
-            target: "mx8_proof",
-            event = "pack_upload_shard",
-            shard_idx,
-            shard_bytes = shard_offset + 1024,
-            shard_key = out_key.as_str(),
-            "uploading shard"
-        );
-        drop(shard_file);
-        upload_file(&client, &out_bucket, &out_key, &shard_path).await?;
-
-        total_shards = total_shards.saturating_add(1);
-    }
+    pack_result?;
 
     let manifest_bytes = canonicalize_manifest_bytes(&records);
     let manifest_hash = mx8_manifest_store::sha256_hex(&manifest_bytes);

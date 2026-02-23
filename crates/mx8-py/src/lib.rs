@@ -3431,7 +3431,7 @@ fn internal_video_index_replay_check<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (pack_in, *, out, shard_mb=512, label_mode=None, require_labels=false, parallel_fetches=32))]
+#[pyo3(signature = (pack_in, *, out, shard_mb=512, label_mode=None, require_labels=false, parallel_fetches=128))]
 fn pack<'py>(
     py: Python<'py>,
     pack_in: String,
