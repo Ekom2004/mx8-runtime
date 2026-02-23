@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
         shard_mb: args.shard_mb,
         label_mode,
         require_labels: args.require_labels,
+        parallel_fetches: 32,
     })
     .await?;
 

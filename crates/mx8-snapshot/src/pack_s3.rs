@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
+use futures::StreamExt;
 use mx8_core::types::{ManifestRecord, MANIFEST_SCHEMA_VERSION};
 use tracing::{info, warn};
 
@@ -19,6 +20,8 @@ pub struct PackS3Config {
     pub shard_mb: u64,
     pub label_mode: LabelMode,
     pub require_labels: bool,
+    /// Number of concurrent S3 GET requests during packing. Default: 32.
+    pub parallel_fetches: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +209,86 @@ async fn upload_file(
     Ok(())
 }
 
+/// Check whether a packed manifest already exists for `s3_url`, and if not,
+/// pack the prefix in-place.  This is the one-shot "autopack" path:
+/// - First call on an unpacked prefix: packs, then returns.
+/// - All subsequent calls: HEAD finds the manifest and returns immediately.
+pub async fn autopack_if_needed(s3_url: &str, shard_mb: u64) -> Result<()> {
+    let rest = s3_url
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("autopack: not an s3:// URL: {s3_url}"))?
+        .trim_matches('/');
+    let mut it = rest.splitn(2, '/');
+    let bucket = it.next().unwrap_or("").to_string();
+    let prefix = it.next().unwrap_or("").trim_matches('/').to_string();
+    let manifest_key = if prefix.is_empty() {
+        "_mx8/manifest.tsv".to_string()
+    } else {
+        format!("{prefix}/_mx8/manifest.tsv")
+    };
+
+    let client = s3_client_from_env().await?;
+    let manifest_exists = match client
+        .head_object()
+        .bucket(&bucket)
+        .key(&manifest_key)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(err) => {
+            let is_404 = err
+                .raw_response()
+                .map(|raw| {
+                    let s: u16 = raw.status().into();
+                    s == 404
+                })
+                .unwrap_or(false);
+            if is_404 {
+                false
+            } else {
+                anyhow::bail!("autopack: HEAD {manifest_key} failed: {err:?}");
+            }
+        }
+    };
+
+    if manifest_exists {
+        info!(
+            target: "mx8_proof",
+            event = "autopack_skipped",
+            s3_url,
+            "autopack: manifest already exists, skipping pack"
+        );
+        return Ok(());
+    }
+
+    info!(
+        target: "mx8_proof",
+        event = "autopack_start",
+        s3_url,
+        shard_mb,
+        "autopack: no manifest found, packing prefix in-place"
+    );
+
+    pack_s3(PackS3Config {
+        pack_in: s3_url.to_string(),
+        pack_out: s3_url.to_string(),
+        shard_mb,
+        label_mode: LabelMode::Auto,
+        require_labels: false,
+        parallel_fetches: 32,
+    })
+    .await?;
+
+    info!(
+        target: "mx8_proof",
+        event = "autopack_complete",
+        s3_url,
+        "autopack: packing complete"
+    );
+    Ok(())
+}
+
 pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
     anyhow::ensure!(!cfg.pack_in.trim().is_empty(), "pack_in is required");
     anyhow::ensure!(!cfg.pack_out.trim().is_empty(), "pack_out is required");
@@ -263,7 +346,19 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
                 if k.ends_with('/') {
                     continue;
                 }
-                if k.ends_with("/_mx8/manifest.tsv") || k == "_mx8/manifest.tsv" {
+                // Skip already-packed output artifacts so in-place packing
+                // (pack_in == pack_out) doesn't re-pack its own shards or index.
+                let shards_key = if out_prefix.is_empty() {
+                    "shards/".to_string()
+                } else {
+                    format!("{out_prefix}/shards/")
+                };
+                let mx8_key = if out_prefix.is_empty() {
+                    "_mx8/".to_string()
+                } else {
+                    format!("{out_prefix}/_mx8/")
+                };
+                if k.starts_with(&shards_key) || k.starts_with(&mx8_key) {
                     continue;
                 }
                 let sz: u64 = obj.size.and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
@@ -340,6 +435,67 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
         p
     };
 
+    let parallel_fetches = cfg.parallel_fetches.max(1);
+
+    // Download objects in parallel (ordered) then write sequentially into shards.
+    // futures::stream::buffered() drives up to `parallel_fetches` futures concurrently
+    // while preserving the original ordering — safe for deterministic byte offsets.
+    struct FetchedObject {
+        index: usize,
+        key: String,
+        bytes: Vec<u8>,
+        size: u64,
+        label: Option<String>,
+    }
+
+    let fetch_stream = futures::stream::iter(
+        objects
+            .iter()
+            .cloned()
+            .zip(maybe_labels.into_iter())
+            .enumerate()
+            .map(|(i, ((key, mut size), label))| {
+                let client = client.clone();
+                let in_bucket = in_bucket.clone();
+                async move {
+                    if size == 0 {
+                        let head = client
+                            .head_object()
+                            .bucket(&in_bucket)
+                            .key(&key)
+                            .send()
+                            .await?;
+                        size = head.content_length().unwrap_or(0) as u64;
+                    }
+                    anyhow::ensure!(size > 0, "zero/unknown object size: s3://{in_bucket}/{key}");
+                    let obj = client
+                        .get_object()
+                        .bucket(&in_bucket)
+                        .key(&key)
+                        .send()
+                        .await?;
+                    let collected = obj.body.collect().await?;
+                    let b: Vec<u8> = collected.into_bytes().to_vec();
+                    anyhow::ensure!(
+                        b.len() as u64 == size,
+                        "get_object size mismatch for s3://{}/{} (got {} expected {})",
+                        in_bucket,
+                        key,
+                        b.len(),
+                        size,
+                    );
+                    anyhow::Ok(FetchedObject {
+                        index: i,
+                        key,
+                        bytes: b,
+                        size,
+                        label,
+                    })
+                }
+            }),
+    )
+    .buffered(parallel_fetches);
+
     let mut records: Vec<ManifestRecord> = Vec::with_capacity(objects.len());
 
     let mut shard_idx: u64 = 0;
@@ -354,22 +510,15 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
 
     let mut wrote_any_in_shard = false;
 
-    for (i, ((key, mut size), label)) in objects
-        .iter()
-        .cloned()
-        .zip(maybe_labels.into_iter())
-        .enumerate()
-    {
-        if size == 0 {
-            let head = client
-                .head_object()
-                .bucket(&in_bucket)
-                .key(&key)
-                .send()
-                .await?;
-            size = head.content_length().unwrap_or(0) as u64;
-        }
-        anyhow::ensure!(size > 0, "zero/unknown object size: s3://{in_bucket}/{key}");
+    let mut fetch_stream = std::pin::pin!(fetch_stream);
+    while let Some(fetched) = fetch_stream.next().await {
+        let FetchedObject {
+            index: i,
+            key,
+            bytes: b,
+            size,
+            label,
+        } = fetched?;
 
         let ext = infer_ext(&key)
             .map(|e| format!(".{e}"))
@@ -417,25 +566,7 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
             .ok_or_else(|| anyhow::anyhow!("offset overflow"))?;
 
         shard_file.write_all(&header).await?;
-
-        let obj = client
-            .get_object()
-            .bucket(&in_bucket)
-            .key(&key)
-            .send()
-            .await?;
-        let collected = obj.body.collect().await?;
-        let b = collected.into_bytes();
         shard_file.write_all(&b).await?;
-        let wrote: u64 = b.len() as u64;
-        anyhow::ensure!(
-            wrote == size,
-            "get_object size mismatch for s3://{}/{} (wrote {} expected {})",
-            in_bucket,
-            key,
-            wrote,
-            size
-        );
 
         if pad != 0 {
             let zeros = vec![0u8; pad as usize];

@@ -89,3 +89,9 @@ Testing harness is not yet established. When adding tests:
 
 - Do not add personal/internal planning documents to `README.md` unless the user explicitly asks.
 - Keep `README.md` focused on stable, user-facing docs and workflows.
+- **Documentation Freshness Rule (Required):** if a change affects any public contract or operator behavior, update docs in the same change.
+- Public contract/operator behavior includes: Python API, CLI flags, env vars (`MX8_*`), stats fields, runtime defaults/caps, failure semantics, and runbook actions.
+- Do not defer docs as “follow-up”. If no doc update is made, explicitly state why: `No public contract change`.
+- Keep version labels and shipped/planned status consistent across `README.md`, `docs/python_api.md`, and `ARCHITECTURE.MD`.
+- Final response must include a `Docs Updated:` line.
+- `Docs Updated:` must list changed doc files, or exactly `Docs Updated: No public contract change`.

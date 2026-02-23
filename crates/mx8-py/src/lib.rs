@@ -3431,7 +3431,7 @@ fn internal_video_index_replay_check<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (pack_in, *, out, shard_mb=512, label_mode=None, require_labels=false))]
+#[pyo3(signature = (pack_in, *, out, shard_mb=512, label_mode=None, require_labels=false, parallel_fetches=32))]
 fn pack<'py>(
     py: Python<'py>,
     pack_in: String,
@@ -3439,6 +3439,7 @@ fn pack<'py>(
     shard_mb: u64,
     label_mode: Option<String>,
     require_labels: bool,
+    parallel_fetches: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
     let label_mode = parse_pack_label_mode(label_mode.as_deref().unwrap_or("auto"))
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
@@ -3456,6 +3457,7 @@ fn pack<'py>(
                 shard_mb,
                 label_mode,
                 require_labels,
+                parallel_fetches,
             }))
         })
         .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
@@ -3508,6 +3510,24 @@ fn pack_dir<'py>(
     Ok(d.into_any())
 }
 
+/// If `autopack=True` is set on a bare S3 prefix and no manifest exists yet,
+/// pack the prefix in-place so subsequent loads use the fast precomputed path.
+/// This is a one-time operation: once `_mx8/manifest.tsv` exists the pack step
+/// is skipped on every subsequent call.
+fn maybe_autopack(py: Python<'_>, s3_url: &str, shard_mb: u64) -> PyResult<()> {
+    use mx8_snapshot::pack_s3::autopack_if_needed;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| PyRuntimeError::new_err(format!("autopack: failed to start runtime: {e}")))?;
+
+    py.allow_threads(|| rt.block_on(autopack_if_needed(s3_url, shard_mb)))
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+    Ok(())
+}
+
 #[pyfunction]
 #[pyo3(name = "image")]
 #[pyo3(signature = (
@@ -3530,6 +3550,8 @@ fn pack_dir<'py>(
     autotune=None,
     constraints=None,
     runtime=None,
+    autopack=false,
+    autopack_shard_mb=512,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn load(
@@ -3552,6 +3574,8 @@ fn load(
     autotune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    autopack: bool,
+    autopack_shard_mb: u64,
 ) -> PyResult<Py<DataLoader>> {
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
@@ -3655,6 +3679,10 @@ fn load(
         }
     }
 
+    if autopack && dataset_link.starts_with("s3://") && !dataset_link.contains('@') {
+        maybe_autopack(py, &dataset_link, autopack_shard_mb)?;
+    }
+
     let loader = DataLoader::new(
         dataset_link,
         manifest_store,
@@ -3699,6 +3727,8 @@ fn load(
     runtime=None,
     resize_hw=None,
     to_float=true,
+    autopack=false,
+    autopack_shard_mb=512,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn py_image(
@@ -3723,8 +3753,15 @@ fn py_image(
     runtime: Option<Py<RuntimeConfig>>,
     resize_hw: Option<(u32, u32)>,
     to_float: bool,
+    autopack: bool,
+    autopack_shard_mb: u64,
 ) -> PyResult<Py<ImageLoader>> {
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
+
+    if autopack && dataset_link.starts_with("s3://") && !dataset_link.contains('@') {
+        maybe_autopack(py, &dataset_link, autopack_shard_mb)?;
+    }
+
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
     let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
     let selected_profile = AutotuneProfile::from_name(profile.as_deref());

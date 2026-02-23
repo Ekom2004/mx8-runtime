@@ -9,6 +9,7 @@ s3 = [
   "mx8-manifest-store/s3",
   "dep:aws-config",
   "dep:aws-sdk-s3",
+  "dep:futures",
   "dep:tokio",
 ]
 
@@ -17,6 +18,7 @@ anyhow.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 clap.workspace = true
+futures = { workspace = true, optional = true }
 mx8-core = { path = "../mx8-core" }
 mx8-manifest-store = { path = "../mx8-manifest-store" }
 mx8-observe = { path = "../mx8-observe" }
