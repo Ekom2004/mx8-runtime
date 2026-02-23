@@ -87,6 +87,41 @@ loader = mx8.load(
 Each batch exposes `sample_ids`, `offsets`, `payload`, and `label_ids`. Call `batch.to_torch()` to get `(payload_u8, offsets_i64, sample_ids_i64)` as tensors, or `batch.to_torch_with_labels()` to include labels.
 
 
+## Multi-epoch training
+
+Loaders are **single-pass**. When all samples have been delivered the loader raises `StopIteration` and stops permanently — it does not restart on its own. Calling `next()` after exhaustion immediately raises `StopIteration` again.
+
+For multi-epoch training create a new loader at the start of each epoch:
+
+```python
+import mx8
+
+dataset = "s3://bucket/train@refresh"
+
+for epoch in range(10):
+    loader = mx8.load(dataset, batch_size_samples=64, max_ram_gb=8, profile="balanced")
+    for batch in loader:
+        train_step(batch)
+```
+
+To ensure every epoch sees the **exact same snapshot** (i.e. the dataset doesn't change mid-training), pin the manifest hash once before the loop and reuse it:
+
+```python
+import mx8
+
+# Resolve once — captures the dataset state at job start.
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+for epoch in range(10):
+    loader = mx8.load(pinned, batch_size_samples=64, max_ram_gb=8, profile="balanced")
+    for batch in loader:
+        train_step(batch)
+```
+
+`loader.close()` shuts down the background pipeline immediately. It is called automatically by `__del__` when the loader goes out of scope, so explicit cleanup is optional but recommended in long-running processes to release RAM and network connections promptly.
+
+
 ## Loader stats and monitoring
 
 `loader.stats()` returns a plain Python dict. Poll it each step or every N steps to track pipeline health.
