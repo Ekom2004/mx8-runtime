@@ -1,120 +1,123 @@
 # Troubleshooting
 
-For production incidents and rollback flow, see `docs/prod_runbook.md`.
+This page covers common errors and how to fix them. For production incidents and rollback procedures, see `docs/prod_runbook.md`.
 
-## `reqwest` rlib error during build/run
 
-Symptom:
+## reqwest rlib error during build or run
 
-- `error: crate reqwest required to be available in rlib format, but was not found in this form`
+You may see this error during `cargo run` or `./scripts/smoke.sh`:
 
-Fix:
+```
+error: crate reqwest required to be available in rlib format, but was not found in this form
+```
 
-- `cargo clean -p reqwest`
-- rerun your original command (`cargo run ...` or `./scripts/smoke.sh`)
+This is an incremental build artifact issue, not a code problem. Fix it by cleaning the reqwest crate and rerunning:
 
-## `rg: command not found` in demo scripts
+```bash
+cargo clean -p reqwest
+```
 
-Some scripts use `rg` (ripgrep). Install ripgrep, then rerun:
+Then rerun your original command.
 
-- macOS (Homebrew): `brew install ripgrep`
 
-## `permission denied: ./scripts/` or `command not found` with env vars
+## rg: command not found in demo scripts
 
-Common shell typo is splitting the command across lines incorrectly.
+Some scripts use `rg` (ripgrep) for log scanning. Install it with `brew install ripgrep` on macOS, then rerun the script.
+
+
+## permission denied or command not found with environment variables
+
+The most common cause is splitting a command with inline env vars across multiple lines incorrectly. The env vars must be on the same line as the command or exported beforehand.
 
 Correct:
 
-- `MX8_BENCH_WANTS=1,4 WORLD_SIZE=16 ./scripts/demo2_minio_scale.sh`
+```bash
+MX8_BENCH_WANTS=1,4 WORLD_SIZE=16 ./scripts/demo2_minio_scale.sh
+```
 
-Incorrect:
+Incorrect (splits the command):
 
-- `MX8_BENCH_WANTS=1,4 WORLD_SIZE=16 ./`
-- then `scripts/demo2_minio_scale.sh` on next line
+```bash
+MX8_BENCH_WANTS=1,4 WORLD_SIZE=16 ./
+scripts/demo2_minio_scale.sh
+```
 
-## Docker/MinIO startup failure
 
-Symptom:
+## Docker or MinIO startup failure
 
-- `Cannot connect to the Docker daemon ...`
+If you see `Cannot connect to the Docker daemon`, Docker is not running. Start Docker Desktop or the Docker daemon, then rerun the MinIO gate or script.
 
-Fix:
 
-- start Docker Desktop (or Docker daemon)
-- rerun the MinIO gate/script
+## TrustStore native roots panic during MinIO smoke
 
-## `TrustStore configured to enable native roots ...` during MinIO smoke
+You may see a panic from `aws-smithy-http-client` in local debug builds:
 
-Symptom:
+```
+TrustStore configured to enable native roots but no valid root certificates parsed!
+```
 
-- panic from `aws-smithy-http-client` in local dev build path:
-  - `TrustStore configured to enable native roots but no valid root certificates parsed!`
+This is an environment-specific TLS issue in debug builds, not a correctness problem with MX8. Rerun with debug assertions disabled:
 
-Notes:
+```bash
+CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT=1 ./scripts/smoke.sh
+```
 
-- This is an environment-specific TLS/native-roots issue in local debug builds.
-- It was observed while running MinIO gates, not as a correctness issue in MX8 manifest logic.
 
-Workaround:
+## pip install cannot find a specific version
 
-- rerun with dev debug assertions disabled for that environment:
-  - `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT=1 ./scripts/smoke.sh`
+If `pip install mx8==X.Y.Z` fails with no matching distribution, the version may not be published yet. Check available versions with:
 
-## `pip install mx8==X.Y.Z` cannot find version
+```bash
+python -m pip index versions mx8
+```
 
-Symptom:
+Then install an available version, or publish the missing tag if you are the maintainer.
 
-- `No matching distribution found for mx8==...`
-
-Fix:
-
-- verify published versions: `python -m pip index versions mx8`
-- install an available version (or publish the missing tag)
 
 ## Vision decode regression debugging
 
-If you want to compare decode backends or validate Rust decode behavior:
+To compare decode backends or validate Rust decode behavior, set `MX8_DECODE_BACKEND=rust` and configure the Rust path:
 
-- baseline Rust compare: `MX8_DECODE_BACKEND=rust MX8_DECODE_THREADS=4 MX8_RUST_JPEG_CODEC=turbo MX8_RUST_RESIZE_BACKEND=fast ...`
-- full decode env surface is documented in `docs/python_api.md`
+```bash
+MX8_DECODE_BACKEND=rust \
+MX8_DECODE_THREADS=4 \
+MX8_RUST_JPEG_CODEC=turbo \
+MX8_RUST_RESIZE_BACKEND=fast \
+python your_script.py
+```
 
-Default is Python decode in v0.
+The full decode environment surface is documented in `docs/python_api.md`. The default backend in v1.8 is Python/Pillow.
 
-## `Killed: 9` in `demo2_minio.sh` logs
 
-In recovery gates, the script intentionally kills one agent process to verify lease expiry + requeue behavior.
+## Killed: 9 in demo2_minio.sh logs
 
-This line is expected when the gate is configured to test recovery.
+This is expected. The recovery gate script intentionally kills one agent process to verify lease expiry and requeue behavior. The kill signal is part of the test, not an error.
 
-## `byte-aware batching requires byte_length ...`
 
-Symptom:
+## byte-aware batching requires byte_length
 
-- loader fails when `target_batch_bytes` or `max_batch_bytes` is set
+If the loader fails with this message when `target_batch_bytes` or `max_batch_bytes` is set, your manifest rows are missing `byte_length` values. Byte-aware batching requires both `byte_offset` and `byte_length` to be present in the manifest. If your manifest has full-object rows with no offsets, either disable byte-aware batching or repack with explicit byte ranges.
 
-Fix:
-
-- ensure manifest rows include both `byte_offset` and `byte_length`
-- if manifest has full-object rows (`None/None`), disable byte-aware batching or repack/index so lengths are explicit
 
 ## Process OOM protection
 
-MX8 loader surfaces use a default process RSS fail-fast cap. To pin a stricter org-level limit, set:
+MX8 loader surfaces set a default process RSS fail-fast cap. When the process RSS exceeds the cap, MX8 fails fast with a clear error message rather than waiting for the OS to OOM-kill it.
 
-- `MX8_MAX_PROCESS_RSS_BYTES=<bytes>`
+To set an explicit org-level cap:
 
-When process RSS exceeds the cap, MX8 fails fast with a clear `process rss ... exceeds max_process_rss_bytes ...` error.
+```bash
+MX8_MAX_PROCESS_RSS_BYTES=<bytes>
+```
 
-## `mx8-tui` headless probe failures
+The error message will include the current RSS and the configured cap so you can adjust accordingly.
 
-Symptom:
 
-- `lease panel remained empty`
-- `runtime panel remained empty`
-- `manifest panel remained empty`
+## mx8-tui headless probe failures
 
-Fix:
+If the TUI exits with `lease panel remained empty`, `runtime panel remained empty`, or `manifest panel remained empty`, check the following.
 
-- ensure coordinator is reachable (`--coord-url`) and `--job-id` matches active job
-- ensure at least one agent is heartbeating (runtime panel is built from node heartbeat stats)
-- ensure manifest is resolvable from coordinator `manifest_store`; use `--manifest-path` for a local TSV fallback
+For the lease panel: verify the coordinator is reachable at `--coord-url` and that `--job-id` matches the active job.
+
+For the runtime panel: verify at least one agent is heartbeating. The runtime panel is built entirely from node heartbeat stats, so it stays empty if no agents have checked in.
+
+For the manifest panel: verify the manifest exists in the coordinator's `manifest_store`. Use `--manifest-path` to point the TUI at a local TSV file as a fallback.

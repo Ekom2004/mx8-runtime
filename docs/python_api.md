@@ -1,32 +1,30 @@
-# MX8 Python API (v1.8)
+# Python API
 
-This page documents the API that ships today in `mx8==1.8.x`.
+This page documents the API that ships in `mx8==1.8.x`. Install with `pip install mx8`. For vision and training helpers, also install `pillow numpy torch`.
 
-## Install
 
-- `pip install mx8`
-- Vision/training helpers: `pip install pillow numpy torch`
+## Packing and snapshot resolution
 
-## Snapshot + packing
+Before you can load from a dataset at production scale, you typically pack it once to create a precomputed manifest. The packer writes tar shards and a manifest TSV that MX8 uses for all subsequent runs.
 
-- `mx8.resolve_manifest_hash(dataset_link, *, manifest_store=None, manifest_path=None, recursive=True, node_id=None) -> str`
-- `mx8.pack(pack_in, *, out, shard_mb=512, label_mode="auto", require_labels=False) -> dict`
-  - S3 input/output packer (`s3://...`).
-- `mx8.pack_dir(in_dir, *, out, shard_mb=512, label_mode="auto", require_labels=False) -> dict`
-  - Local directory packer.
+`mx8.pack(pack_in, *, out, shard_mb=512, label_mode="auto", require_labels=False)` packs an S3 prefix into a packed dataset at the output prefix.
 
-`label_mode` accepts `auto|none|imagefolder`.
+`mx8.pack_dir(in_dir, *, out, shard_mb=512, label_mode="auto", require_labels=False)` does the same for a local directory.
+
+`mx8.resolve_manifest_hash(dataset_link, *, manifest_store=None, manifest_path=None, recursive=True, node_id=None)` resolves a dataset link to its pinned manifest hash without starting a loader.
+
+`label_mode` accepts `auto`, `none`, or `imagefolder`.
+
 
 ## Core loader
 
-Use `mx8.load(...)` for byte-oriented pipelines (ETL/inference/preprocess).
+`mx8.load` is the foundation for byte-oriented pipelines — ETL, inference, preprocessing. It returns batches of raw bytes with sample IDs and byte offsets.
 
 ```python
 import mx8
 
 loader = mx8.load(
     "s3://bucket/prefix/",
-    recursive=True,  # default
     batch_size_samples=64,
     max_ram_gb=12,
     profile="balanced",
@@ -34,92 +32,121 @@ loader = mx8.load(
 
 for batch in loader:
     sample_ids = batch.sample_ids
-    payload = batch.payload
-    offsets = batch.offsets
+    payload    = batch.payload
+    offsets    = batch.offsets
 ```
 
-### `mx8.load` args
+Arguments:
 
-- `dataset_link` (`plain`, `@refresh`, `@sha256:...`)
-- `manifest_store` (default `/var/lib/mx8/manifests`)
-- `manifest_path` (dev-only local manifest source)
-- `recursive` (default `True`; set `False` to only index top-level objects/files under the prefix)
-- `batch_size_samples`
-- `max_ram_gb` (recommended default cap input)
-- `max_inflight_bytes`
-- `max_queue_batches`
-- `prefetch_batches`
-- `target_batch_bytes`, `max_batch_bytes` (advanced overrides; default byte-aware batching is derived automatically)
-- `start_id`, `end_id` (must be set together)
-- `node_id` (for lock ownership/proof logs)
-- `profile` (`safe|balanced|throughput`)
-- `autotune` (`True|False`)
-- `constraints` (`mx8.Constraints`)
-- `runtime` (`mx8.RuntimeConfig`)
+`dataset_link` is a plain path or prefix, optionally followed by `@refresh` to force a fresh snapshot at job start, or `@sha256:<hash>` to pin an exact snapshot.
 
-### `mx8.Constraints` and `mx8.RuntimeConfig`
+`manifest_store` sets the manifest store root (default `/var/lib/mx8/manifests`). Accepts a filesystem path or an S3 prefix.
+
+`recursive` controls whether subdirectories are indexed (default `True`).
+
+`batch_size_samples` sets how many samples per delivered batch.
+
+`max_ram_gb` is the recommended way to set the memory budget. MX8 derives `max_inflight_bytes` and the process RSS cap from this value based on your profile.
+
+`max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches` are advanced overrides if you need precise control over the pipeline budget.
+
+`target_batch_bytes` and `max_batch_bytes` override the byte-aware batching defaults. MX8 derives these automatically from your inflight cap in most cases.
+
+`start_id` and `end_id` must be set together if you want to load a specific sample ID range.
+
+`profile` selects a preset safety/throughput balance: `safe`, `balanced`, or `throughput`.
+
+`autotune` enables the runtime adaptation loop (default `True`). Set to `False` for fully manual control.
+
+`constraints` accepts an `mx8.Constraints` instance to override specific cap values while keeping autotune active.
+
+`runtime` accepts an `mx8.RuntimeConfig` instance for explicit startup values when `autotune=False`.
 
 ```python
-import mx8
-
+# Autotune with explicit constraint
 loader = mx8.load(
     "s3://bucket/train@refresh",
-    manifest_store="/var/lib/mx8/manifests",
     max_ram_gb=24,
     profile="throughput",
     autotune=True,
     constraints=mx8.Constraints(max_inflight_bytes=512 * 1024 * 1024),
 )
 
-loader_manual = mx8.load(
+# Fully manual
+loader = mx8.load(
     "s3://bucket/train@refresh",
     autotune=False,
     runtime=mx8.RuntimeConfig(prefetch_batches=8, max_queue_batches=32),
 )
 ```
 
-`runtime.want` is currently consumed by `mx8.DistributedDataLoader` (not by single-node `mx8.load`).
+Each batch exposes `sample_ids`, `offsets`, `payload`, and `label_ids`. Call `batch.to_torch()` to get `(payload_u8, offsets_i64, sample_ids_i64)` as tensors, or `batch.to_torch_with_labels()` to include labels.
 
-### `PyBatch` methods/properties
 
-- `sample_ids` (`list[int]`)
-- `offsets` (`list[int]`)
-- `payload` (`bytes`)
-- `label_ids` (`list[int] | None`)
-- `to_torch()` -> `(payload_u8, offsets_i64, sample_ids_i64)`
-- `to_torch_with_labels()` -> `(payload_u8, offsets_i64, sample_ids_i64, labels_i64)`
+## Loader stats and monitoring
 
-### Loader stats
+`loader.stats()` returns a plain Python dict. Poll it each step or every N steps to track pipeline health.
 
-- `loader.stats()` returns:
-  - `delivered_batches_total`
-  - `delivered_samples_total`
-  - `inflight_bytes`
-  - `process_rss_bytes`
-  - `ram_high_water_bytes`
-  - byte-batch jitter metrics:
-    - `batch_payload_bytes_p50`
-    - `batch_payload_bytes_p95`
-    - `batch_payload_bytes_p95_over_p50`
-    - `batch_payload_window_size`
-    - `batch_jitter_slo_breaches_total`
-    - `batch_jitter_band_adjustments_total`
-    - `batch_jitter_band_lower_pct`
-    - `batch_jitter_band_upper_pct`
+Key fields: `delivered_batches_total`, `delivered_samples_total`, `inflight_bytes`, `process_rss_bytes`, `ram_high_water_bytes`.
 
-Byte-aware batching is enabled by default (MX8 auto-derives target/max batch bytes from inflight caps). MX8 applies a tighter internal byte band around the target to reduce high/low batch-byte oscillation, emits a proof event when jitter SLO is breached, and adaptively tightens/relaxes the band with bounded hysteresis.
+Byte-batch jitter fields: `batch_payload_bytes_p50`, `batch_payload_bytes_p95`, `batch_payload_bytes_p95_over_p50`, `batch_payload_window_size`, `batch_jitter_slo_breaches_total`, `batch_jitter_band_adjustments_total`, `batch_jitter_band_lower_pct`, `batch_jitter_band_upper_pct`.
 
-RSS guard defaults on these loaders; set `max_ram_bytes` or `MX8_MAX_PROCESS_RSS_BYTES` to pin an explicit org-level process RSS hard limit.
+MX8 applies a tighter internal byte band around the target batch size to reduce oscillation, emits a proof event when the jitter SLO is breached, and adaptively tightens or relaxes the band with bounded hysteresis.
 
-Current API note:
+A top-level `mx8.stats()` API is planned but not yet shipped in v1.8. Use `loader.stats()` directly.
 
-- Top-level `mx8.stats(loader, raw=False)` is not shipped yet in v1.8.x.
-- Current supported surface is per-loader `loader.stats()` only.
-- Planned follow-up: add module-level `mx8.stats(...)` with human-readable default and raw passthrough mode.
+To wire loader stats into Prometheus:
+
+```python
+from prometheus_client import Gauge, start_http_server
+import mx8
+
+start_http_server(9090)
+
+inflight  = Gauge("mx8_inflight_bytes",       "MX8 pipeline inflight bytes")
+rss       = Gauge("mx8_process_rss_bytes",    "MX8 process RSS bytes")
+hwm       = Gauge("mx8_ram_high_water_bytes", "MX8 RAM high-water mark")
+delivered = Gauge("mx8_delivered_samples",    "MX8 delivered samples total")
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+
+for batch in loader:
+    train_step(batch)
+    s = loader.stats()
+    inflight.set(s["inflight_bytes"])
+    rss.set(s["process_rss_bytes"])
+    hwm.set(s["ram_high_water_bytes"])
+    delivered.set(s["delivered_samples_total"])
+```
+
+To wire into Datadog:
+
+```python
+from datadog import initialize, statsd
+import mx8
+
+initialize()
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    if step % 50 == 0:
+        s = loader.stats()
+        statsd.gauge("mx8.inflight_bytes",       s["inflight_bytes"])
+        statsd.gauge("mx8.process_rss_bytes",    s["process_rss_bytes"])
+        statsd.gauge("mx8.ram_high_water_bytes", s["ram_high_water_bytes"])
+        statsd.gauge("mx8.delivered_samples",    s["delivered_samples_total"])
+```
+
+Alert when `ram_high_water_bytes` approaches your `MX8_MAX_PROCESS_RSS_BYTES` cap, when `batch_jitter_slo_breaches_total` is rising steadily, or when `inflight_bytes` is pegged at the cap for many consecutive steps.
+
+A native Prometheus endpoint on the coordinator and agent is planned for a future release.
+
 
 ## Image loader
 
-Use `mx8.image(...)` when manifests include ImageFolder label hints.
+`mx8.image` delivers decoded images and labels as tensors. Use it when your dataset includes ImageFolder label hints.
 
 ```python
 import mx8
@@ -133,28 +160,23 @@ loader = mx8.image(
 )
 
 print(loader.classes)  # ["cat", "dog", ...] or None
+
 for images, labels in loader:
-    pass
+    pass  # images: [B,C,H,W] float32, labels: [B] int64
 ```
 
-Decode backend behavior:
+The default decode backend in v1.8 is Python/Pillow. To use the experimental Rust decode path, set `MX8_DECODE_BACKEND=rust`. The Rust path supports additional options: `MX8_DECODE_THREADS` for worker count, `MX8_RUST_JPEG_CODEC` for JPEG codec selection (`zune`, `image`, or `turbo`), and `MX8_RUST_RESIZE_BACKEND` for resize algorithm (`fast` or `image`).
 
-- default/recommended in v1.8: Python/Pillow decode path
-- optional Rust path for benchmarking/optimization: set `MX8_DECODE_BACKEND=rust`
-- optional Rust decode worker count: set `MX8_DECODE_THREADS=<n>` (used when `MX8_DECODE_BACKEND=rust`)
-- optional Rust JPEG codec: set `MX8_RUST_JPEG_CODEC=zune|image|turbo` (default: `zune`)
-- optional Rust resize backend: set `MX8_RUST_RESIZE_BACKEND=fast|image` (default: `fast`)
 
-## Video loader (GA current contract)
+## Video loader
 
-Use `mx8.video(...)` for clip-oriented delivery with bounded decode/runtime rails.
+`mx8.video` delivers decoded video clips with bounded decode and runtime rails.
 
 ```python
 import mx8
 
 loader = mx8.video(
     "s3://bucket/video_prefix/",
-    recursive=True,
     clip_len=16,
     stride=8,
     fps=8,
@@ -165,65 +187,24 @@ loader = mx8.video(
 
 for batch in loader:
     clip_ids = batch.clip_ids
-    payload = batch.payload
-    offsets = batch.offsets
+    payload  = batch.payload
+    offsets  = batch.offsets
 ```
 
-Current contract:
+Each batch includes `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offsets`, and `payload`. Batch metadata fields include `frames_per_clip`, `frame_height`, `frame_width`, `channels`, `layout`, `dtype`, `colorspace`, and `strides`. Offsets are monotonic and `offsets[-1] == len(payload)`.
 
-- `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offsets`, `payload`
-- batch metadata: `frames_per_clip`, `frame_height`, `frame_width`, `channels`, `layout`, `dtype`, `colorspace`, `strides`
-- offsets are monotonic and `offsets[-1] == len(payload)`
-- init rejects invalid cap combinations (`batch_size_samples * bytes_per_clip > max_inflight_bytes`)
-- default decode backend uses local `ffmpeg` CLI (`MX8_FFMPEG_BIN` override, default `ffmpeg`)
-- supports startup autotune args (`profile`, `autotune`, `max_ram_gb`, `constraints`) for cap/profile selection
-- runtime autotune is enabled by default (`autotune=False` disables) and adapts `max_inflight_bytes` within safe bounds
-- `runtime` overrides are currently unsupported for `mx8.video(...)`
+The loader rejects invalid cap combinations at init — specifically when `batch_size_samples * bytes_per_clip > max_inflight_bytes`. Runtime autotune is enabled by default and adapts `max_inflight_bytes` within safe bounds. Pass `autotune=False` to disable.
 
-Video decode backend selection (Stage 3A):
+The default decode backend uses a local `ffmpeg` CLI. Override the binary path with `MX8_FFMPEG_BIN`. To use the native FFI path, set `MX8_VIDEO_DECODE_BACKEND=ffi` and build with `RUSTFLAGS="--cfg mx8_video_ffi"`. If the FFI path is requested but not compiled, MX8 falls back to CLI and emits a `video_decode_backend_fallback` proof event.
 
-- `MX8_VIDEO_DECODE_BACKEND=cli` (default): CLI decode path
-- `MX8_VIDEO_DECODE_BACKEND=ffi`: native-FFI decode path (compile-time gated)
-- if `ffi` is requested but not compiled/available, MX8 falls back to `cli` and emits proof log `event="video_decode_backend_fallback"`
+`loader.stats()` for the video loader includes decode contract fields (`video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_clip_bytes`), backend selection (`video_decode_backend`), decode counters (`video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_total`, `video_decode_ms_total`), and autotune counters (`video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`).
 
-Native FFI build notes:
+Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, and `./scripts/video_ga_gate.sh`.
 
-- native ffmpeg backend is only compiled when built with: `RUSTFLAGS="--cfg mx8_video_ffi"`
-- typical prerequisites include `pkg-config` plus ffmpeg development libs
-- Stage 3A parity gate command:
-  - default build path: `./scripts/video_stage3a_backend_gate.sh`
-  - FFI-compiled path: `RUSTFLAGS="--cfg mx8_video_ffi" ./scripts/video_stage3a_backend_gate.sh`
 
-S3 range-streaming status:
+## Distributed loader
 
-- shipped now: deterministic Stage 2D range sidecar/planner contract + gate
-- roadmap: end-to-end S3 `Range` execution + decode from remote range segments
-
-`loader.stats()` also includes video decode contract + reliability counters:
-
-- contract: `video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_stride_t/h/w/c`, `video_clip_bytes`
-- backend: `video_decode_backend` (`cli|ffi`)
-- runtime decode counters: `video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_*_total`, `video_decode_failed_total`, `video_decode_ms_total`
-- runtime autotune counters: `video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`
-
-Video gate checklist:
-
-- `./scripts/video_stage2b_gate.sh`
-- `./scripts/video_stage2b_stress_gate.sh`
-- `./scripts/video_stage2b_clean_env_gate.sh`
-- `./scripts/video_stage2c_perf_gate.sh`
-- `./scripts/video_stage3a_backend_gate.sh`
-- `./scripts/video_ga_gate.sh --quick|--full`
-- `docs/video_ga_checklist.md`
-
-Runtime proof logs (target: `mx8_proof`) now include:
-
-- `event="video_decode_batch"` for delivered decode batches
-- `event="video_decode_failed"` with failure class + media URI context
-
-## Distributed loader (DDP/local multi-rank)
-
-`mx8.DistributedDataLoader` is the distributed control-plane loader used by DDP-style jobs.
+`mx8.DistributedDataLoader` is the distributed control-plane loader for DDP-style jobs. It connects to a running coordinator and participates in the lease protocol.
 
 ```python
 import mx8
@@ -241,21 +222,16 @@ for batch in loader:
     payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
 ```
 
-Important fields:
+`want` sets the max number of concurrent leases this node will request. `progress_interval_ms` controls how often progress is reported to the coordinator (default 500ms). `grpc_max_message_bytes` caps the gRPC message size for manifest and control-path traffic (default 64MB).
 
-- `want`: max concurrent leases per node.
-- `progress_interval_ms`: progress report interval.
-- `grpc_max_message_bytes`: gRPC message cap for manifest/control-path.
-- distributed autotune supports API-driven profile/autotune control:
-  - `profile=safe|balanced|throughput`
-  - `autotune=True|False`
-  - current implementation adjusts `want`, `prefetch_batches`, and `max_queue_batches` inside profile rails.
+Distributed autotune adjusts `want`, `prefetch_batches`, and `max_queue_batches` within the chosen profile rails. Pass `profile` and `autotune=True|False` to control it.
 
-v1.8 training note: distributed data delivery is supported, but v1.8 is non-elastic (DDP rank death terminates training).
+Training note: v1.8 supports distributed data delivery but is non-elastic. If a DDP rank dies, the job terminates. Lease reassignment is for inference and ETL correctness, not elastic training continuation.
 
-## `mx8.mix(...)` (v1.7)
 
-`mx8.mix` provides deterministic weighted blending of multiple loaders under one shared bounded runtime envelope.
+## Mix API
+
+`mx8.mix` blends multiple loaders deterministically under one shared memory envelope. Use it when you want to train on a weighted combination of datasets without managing the interleaving yourself.
 
 ```python
 import mx8
@@ -268,43 +244,14 @@ mixed = mx8.mix(
     weights=[0.7, 0.3],
     seed=17,
     epoch=3,
-    source_exhausted="error",  # default: fail fast
+    source_exhausted="error",
     max_ram_gb=12,
     profile="balanced",
 )
 ```
 
-Arguments:
-- `loaders`: list of `mx8.load(...)` loader instances.
-- `weights`: positive list, same length as `loaders`.
-- `seed`, `epoch`: deterministic scheduling inputs.
-- `starvation_window`: scheduler starvation accounting window.
-- `source_exhausted`: `error|allow` (default `error`).
-- `profile`: `safe|balanced|throughput` profile rails for shared mix defaults.
-- `autotune`: when `True`, applies profile defaults before explicit overrides.
-- `constraints`: optional `mx8.Constraints` override for shared mix cap.
-- `runtime`: optional `mx8.RuntimeConfig` startup overrides (`prefetch_batches`, `max_queue_batches`; `want` is unsupported for `mx8.mix`).
+`weights` is a list of positive floats, normalized internally. `seed` and `epoch` are the deterministic scheduling inputs. `source_exhausted` controls what happens when a source runs out: `error` fails fast (the default), `allow` drains remaining sources. `starvation_window` controls the scheduler starvation accounting window.
 
-Behavior:
-- deterministic replay for fixed manifests/weights/seed/epoch/membership,
-- shared inflight cap safety via global mixed guard,
-- fail-fast source exhaustion by default (`error`) to avoid silent source drop,
-- per-source diagnostics in `mixed.stats()["mix_sources"]` (manifest, delivery counters, configured knobs, and source metrics).
+For a fixed set of manifests, weights, seed, epoch, and frozen membership, the mixed stream order is deterministic and replayable. All sources share one inflight cap — backpressure is global. `mixed.stats()["mix_sources"]` exposes per-source diagnostics including manifest IDs, delivery counters, and configured knobs.
 
-Gate commands:
-- `./scripts/mix_gate.sh`
-- strict mode: `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
-- multi-rank no-overlap gate: `./scripts/mix_multirank_gate.sh`
-- smoke toggle: `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
-- smoke multi-rank toggle: `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
-
-## API modes
-
-MX8 exposes two modes across loader APIs:
-
-- default mode: provide workload intent and cap (`batch_size_samples`, `max_ram_gb`, `profile`) and let MX8 autotune runtime knobs
-- advanced mode: provide explicit overrides (`autotune=False`, `constraints`, `RuntimeConfig`)
-
-Formal contract note:
-
-- `docs/python_api.md` + `docs/memory_contract.md` are the public contract surface.
+Gate commands: `./scripts/mix_gate.sh`, `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`, `./scripts/mix_multirank_gate.sh`.

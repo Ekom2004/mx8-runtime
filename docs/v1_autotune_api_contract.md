@@ -1,19 +1,22 @@
-# MX8 v1 Autotune API Contract (Planned)
+# Autotune API Contract
 
-Status: **active contract direction** for current loader API cleanup.
+This document defines how MX8 autotune works, what it controls, and what it never changes.
 
-## Goals
+Primary implementation: `crates/mx8-py/src/lib.rs` (startup cap derivation and runtime adaptation loop).
 
-- Make default usage frictionless for most users.
-- Keep hard safety limits explicit and enforceable.
-- Keep power-user controls available without polluting the default API.
 
-## Public API shape
+## The problem autotune solves
+
+Choosing the right `max_inflight_bytes`, `prefetch_batches`, and `max_queue_batches` for a given machine, model, and dataset requires trial and error. Set them too low and you starve the GPU. Set them too high and you risk OOM or oscillation.
+
+Autotune removes that guesswork for most users. You tell MX8 how much RAM to use and which profile matches your workload, and it derives safe starting values and adapts them at runtime based on observed pressure and throughput.
+
+
+## API modes
+
+The simple path lets MX8 do the work:
 
 ```python
-import mx8
-
-# Simple path (default)
 loader = mx8.load(
     "s3://bucket/train@refresh",
     profile="balanced",
@@ -21,8 +24,9 @@ loader = mx8.load(
 )
 ```
 
+The constrained path keeps autotune active but pins specific caps:
+
 ```python
-# Constrained autotune path
 loader = mx8.load(
     "s3://bucket/train@refresh",
     profile="throughput",
@@ -34,8 +38,9 @@ loader = mx8.load(
 )
 ```
 
+The manual path disables adaptation entirely:
+
 ```python
-# Advanced manual path
 loader = mx8.load(
     "s3://bucket/train@refresh",
     autotune=False,
@@ -47,154 +52,56 @@ loader = mx8.load(
 )
 ```
 
+
 ## Contract rules
 
-1. `profile` sets defaults (including safety defaults).
-2. `constraints` overrides profile safety defaults.
-3. `autotune=True` adjusts only runtime knobs (`prefetch_batches`, `max_queue_batches`, `want`) within safety constraints.
-4. `autotune` never increases hard caps.
-5. `runtime` is explicit pinning; when `autotune=False`, runtime knobs are not modified by MX8.
-6. If both `runtime` and `autotune=True` are provided, runtime values are treated as initial values and still clamped to constraints.
+`profile` sets the safety defaults including minimum headroom requirements. `constraints` overrides specific profile safety defaults. `autotune=True` adjusts only runtime knobs — `prefetch_batches`, `max_queue_batches`, and `want` — within the safety constraints. Autotune never increases hard caps. When both `runtime` and `autotune=True` are provided, the runtime values are treated as starting points and clamped to constraints.
 
-## Safety invariants
 
-- Hard caps remain authoritative:
-  - `max_inflight_bytes`
-  - optional `max_ram_bytes`
-- Autotune cannot violate cap invariants.
-- Runtime adaptation uses hysteresis/cooldown to avoid oscillation.
+## Startup flow
 
-## Startup flow (user experience)
+When `mx8.load` is called with autotune enabled, MX8 reads the node RAM limit by taking the minimum of physical RAM and any cgroup limit. It determines local rank count from the runtime context, selects default reservation ratios from the profile, warms up briefly to estimate the process baseline RSS, then derives `max_ram_bytes` and `max_inflight_bytes`. It emits a compact startup summary with the computed values.
 
-On `mx8.load(..., profile=..., autotune=True)`:
+Cap derivation uses this chain:
 
-1. Read machine limit:
-   - `node_ram_limit = min(physical_ram, cgroup_limit_if_present)`.
-2. Determine local concurrency:
-   - `local_ranks` from runtime/distributed context (default `1`).
-3. Compute initial per-rank budget from profile:
-   - profile selects default reservation ratios and minimum headroom.
-4. Warm up briefly (small fixed step budget) to estimate:
-   - `base_rss_bytes` (model/framework/process baseline before deep buffering).
-5. Set caps:
-   - `max_ram_bytes` (unless explicitly overridden in `constraints`).
-   - `max_inflight_bytes` (unless explicitly overridden in `constraints`).
-6. Start adaptive loop for runtime knobs:
-   - `prefetch_batches`, `max_queue_batches`, `want`.
+`node_budget_bytes = profile.node_fraction * node_ram_limit - profile.node_reserve_bytes`
 
-Startup must emit one compact summary line with computed values.
+`per_rank_budget_bytes = floor(node_budget_bytes / local_ranks)`
 
-## Cap derivation policy
+`derived_max_ram_bytes = profile.rss_fraction * per_rank_budget_bytes`
 
-Autotune computes caps from budget, then clamps:
+`derived_max_inflight_bytes = min(profile.inflight_fraction * derived_max_ram_bytes, derived_max_ram_bytes - base_rss_bytes - profile.rss_guard_bytes)`
 
-- `node_budget_bytes = profile.node_fraction * node_ram_limit - profile.node_reserve_bytes`
-- `per_rank_budget_bytes = floor(node_budget_bytes / local_ranks)`
-- `derived_max_ram_bytes = profile.rss_fraction * per_rank_budget_bytes`
-- `derived_max_inflight_bytes = min(profile.inflight_fraction * derived_max_ram_bytes, derived_max_ram_bytes - base_rss_bytes - profile.rss_guard_bytes)`
+Explicit `constraints` values override the derived values. Hard profile safety rails clamp any result that falls outside bounds.
 
-Then apply:
 
-- explicit `constraints.max_ram_bytes` if provided
-- explicit `constraints.max_inflight_bytes` if provided
-- hard lower/upper bounds from profile safety rails
+## Runtime adaptation
 
-Rules:
+The adaptation loop runs on a fixed cadence with cooldown between adjustments. It reads data-wait time, queue depth, inflight bytes, RSS headroom, and step-time jitter. It adjusts `prefetch_batches`, `max_queue_batches`, and `want`.
 
-- `max_inflight_bytes <= max_ram_bytes`
-- `max_inflight_bytes >= profile.min_inflight_bytes`
-- If derived values violate rails, clamp and emit warning event.
+The jitter SLO target is `batch_payload_bytes_p95_over_p50 <= 1.25`. When jitter is above target, the loop tightens the byte band. When it is below target and the pipeline has headroom, it relaxes.
 
-## Autotune signals
+The increase path only fires when all of the following are true: the data-wait ratio is above the target threshold, RSS and inflight headroom are above the profile minimum, and queue starvation indicators are present.
 
-Controller inputs (periodic):
+The decrease path fires when any of the following are true: RSS is near `max_ram_bytes`, inflight is near `max_inflight_bytes`, or there is persistent queue saturation without a throughput gain.
 
-- data-wait time in training/consumer loop
-- queue depth
-- inflight bytes and RSS headroom
-- step-time jitter
+Each adjustment is bounded by a step-size percentage, subject to a cooldown window, and limited to one knob change per interval to avoid oscillation.
 
-Controller outputs:
 
-- `prefetch_batches`
-- `max_queue_batches`
-- `want`
+## Mix and video autotune
 
-## Runtime adaptation policy
+The mix runtime autotune runs on a tick-based cadence controlled by `MX8_MIX_AUTOTUNE_PERIOD_TICKS` (default 32 ticks). It adjusts the shared mix cap within safe bounds.
 
-Controller cadence: fixed interval (e.g., 2s) with cooldown.
+The video runtime autotune runs every `MX8_VIDEO_AUTOTUNE_PERIOD_BATCHES` delivered batches (default 16). It adapts `max_inflight_bytes` for the video pipeline within the configured profile rails.
 
-Jitter SLO (byte payload stability): `batch_payload_bytes_p95_over_p50 <= 1.25`.
 
-Increase path (only if all are true):
+## Stats and proof logs
 
-- data-wait ratio above target threshold
-- RSS/inflight headroom above profile minimum
-- queue starvation indicators present
+`loader.stats()` exposes the effective runtime state: `effective.max_ram_bytes`, `effective.max_inflight_bytes`, `effective.prefetch_batches`, `effective.max_queue_batches`, `effective.want`, `observed.process_rss_bytes`, `observed.inflight_bytes`, and autotune decision fields.
 
-Decrease path (any true):
+Proof events emitted to the `mx8_proof` log target: `autotune_startup_caps_selected`, `autotune_runtime_adjustment`, `autotune_cap_clamped`, `autotune_disabled_manual_runtime`, `load_runtime_autotune_initialized`, and `rss_cap_defaulted`.
 
-- RSS near `max_ram_bytes`
-- inflight near `max_inflight_bytes`
-- persistent queue saturation without throughput gain
-
-Each change is bounded step-size (%-based) and subject to:
-
-- cooldown window
-- max one knob change per interval
-- hysteresis band to avoid oscillation
-
-## Stats / debug contract
-
-`loader.stats()` (or debug endpoint) must include:
-
-- `effective.max_ram_bytes`
-- `effective.max_inflight_bytes`
-- `effective.prefetch_batches`
-- `effective.max_queue_batches`
-- `effective.want`
-- `observed.process_rss_bytes`
-- `observed.inflight_bytes`
-- `observed.data_wait_ratio`
-- `observed.step_time_jitter`
-- `autotune.last_decision`
-- `autotune.decision_reason`
-- `autotune.cooldown_remaining_ms`
-
-Proof events (structured logs):
-
-- `autotune_startup_caps_selected`
-- `autotune_runtime_adjustment`
-- `autotune_cap_clamped`
-- `autotune_disabled_manual_runtime`
 
 ## Failure semantics
 
-- If RSS exceeds `max_ram_bytes`, fail fast with explicit error (same safety behavior as v0 watchdog).
-- If autotune cannot find valid settings under constraints, fail with actionable configuration error.
-- Manual mode (`autotune=False`) never mutates runtime knobs.
-
-## Persistence
-
-Autotune may persist learned runtime settings keyed by:
-
-- `manifest_hash`
-- world size
-- batch shape
-- node class / hardware signature
-
-## Observability
-
-Expose effective runtime state in loader stats/debug APIs:
-
-- current `prefetch_batches`, `max_queue_batches`, `want`
-- current safety caps
-- autotune decisions/reasons (compact event stream)
-
-## Acceptance criteria
-
-- Defaults-only runs complete without manual tuning on representative workloads.
-- Data-wait ratio decreases versus static defaults.
-- No cap breaches under autotune.
-- Advanced users can disable autotune and get deterministic pinned behavior.
-- Startup summary and effective config are visible without debug-only tooling.
+If RSS exceeds `max_ram_bytes`, MX8 fails fast with an explicit error. If autotune cannot find valid settings within the constraints, it fails with an actionable configuration error. Manual mode (`autotune=False`) never mutates runtime knobs after startup.

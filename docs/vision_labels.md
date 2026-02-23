@@ -1,27 +1,16 @@
-# Vision Labels and Layouts (v0)
+# Vision Labels and Layouts
 
-This page explains how MX8 handles labels for vision datasets and why label IDs are used.
+This page explains how MX8 handles class labels for vision datasets, why integer label IDs are used instead of strings, and how to control label behavior when packing.
 
-## Why label IDs exist
 
-For large datasets, repeating label strings per sample wastes memory and manifest size.
+## Why label IDs instead of strings
 
-MX8 stores:
+For large datasets with millions of samples, storing a label string per row would waste significant space in the manifest and memory at runtime. MX8 stores a compact integer `label_id` per sample and writes a single shared mapping file at `_mx8/labels.tsv` that maps each `label_id` to its human-readable name. This keeps manifests small and stable regardless of class count.
 
-- per-sample `label_id` (numeric, compact)
-- one shared mapping file `_mx8/labels.tsv` (`label_id<TAB>label`)
-
-This keeps manifests small and stable even with many classes / many samples.
 
 ## How labels are created
 
-Use `mx8.pack` or `mx8.pack_dir` with:
-
-- `label_mode="imagefolder"` to force ImageFolder labeling (`prefix/<label>/<file>`)
-- `label_mode="auto"` to detect layout
-- `require_labels=True` to fail fast if labels cannot be produced
-
-Example:
+Labels are generated during packing. Pass `label_mode="imagefolder"` to `mx8.pack` or `mx8.pack_dir` to enable ImageFolder labeling, where the class name is the name of the immediate parent directory (`prefix/<label>/<file>`).
 
 ```python
 import mx8
@@ -34,30 +23,21 @@ mx8.pack_dir(
 )
 ```
 
+`label_mode="auto"` attempts to detect the layout automatically. `label_mode="none"` produces a manifest with no label information. `require_labels=True` makes the packer fail fast if it cannot produce labels for every sample, which is useful for catching mixed or ambiguous layouts early.
+
+
 ## Mixed layouts
 
-If your input mixes:
+If your input directory has files directly under the root alongside class subdirectories, `label_mode="auto"` may disable ImageFolder labels because the layout is ambiguous. Use `label_mode="imagefolder"` with `require_labels=True` for a strict check that fails if any sample is outside a labeled subdirectory, or use `label_mode="none"` if labels are not needed.
 
-- files directly under the root, and
-- class subfolders (`cat/...`, `dog/...`)
 
-then `label_mode="auto"` may disable ImageFolder labels (ambiguous layout).
+## Training vs inference
 
-Use one of:
+For classification training, labels are typically required. Use `mx8.image` to get decoded images and integer label tensors directly, or call `batch.to_torch_with_labels()` on the raw loader batch.
 
-- `label_mode="imagefolder", require_labels=True` (strict; fail if invalid)
-- `label_mode="none"` (explicitly unlabeled pipeline)
+For inference and ETL, labels are usually optional. Use `mx8.load` and process raw bytes and sample IDs without worrying about label assignment.
 
-## Training vs inference/ETL
 
-- Training/classification: labels typically required; use `mx8.image(...)` or `batch.to_torch_with_labels()`.
-- Inference/ETL: labels optional; use `mx8.load(...)` and process raw bytes / sample IDs.
+## Zero-manifest label assignment
 
-## API contract to users
-
-Document this to users:
-
-- Labels are optional in v0.
-- If labels are enabled, they are represented as stable numeric IDs.
-- Human-readable label names come from `_mx8/labels.tsv`.
-- Enforce labeling only when the workload needs it (`require_labels=True`).
+When using zero-manifest loading (pointing MX8 at a raw S3 prefix without a precomputed manifest), MX8 assigns label IDs on the fly from the directory names during the scan. These IDs are not stable across separate runs. If you need stable label IDs for checkpointing or multi-run comparisons, pack the dataset first. See `docs/zero_manifest.md` for details.

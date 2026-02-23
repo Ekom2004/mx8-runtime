@@ -1,121 +1,80 @@
-# MX8 Coordinator HA Contract and Rollout Plan (v1.9 Target)
+# Coordinator HA Contract
 
-Status: planned, not shipped in v1.8.
+Status: planned for v1.9, not shipped in v1.8.
 
-This document defines what "Coordinator HA" means for MX8, what it does not mean, and what must be true before we mark it production-ready.
+This document defines what coordinator HA means for MX8, what it explicitly does not include, and what must be true before it is marked production-ready.
 
-## Scope
 
-In scope:
-- per-job coordinator high availability for inference/ETL/preprocessing jobs
-- automatic leader failover with lease correctness preserved
-- no-overlap invariant preserved through failover
+## Current behavior in v1.8
 
-Out of scope:
-- training elasticity (DDP rank/node loss tolerance mid-epoch)
-- multi-job scheduling or fairness
+The coordinator is a single process per job. If it dies, the job control plane pauses until the coordinator is restarted and agents reconnect. This is a known limitation. Until v1.9 ships, treat the coordinator as a single point of failure and run it on a stable, non-preemptible node.
 
-## Current v1.8 behavior
+For current incident procedure, see `docs/prod_runbook.md`.
 
-- Single coordinator process per job.
-- If coordinator dies, the job control plane stops/pauses until restart.
-- This is explicitly a known gap in `ARCHITECTURE.MD` and `docs/prod_runbook.md`.
 
-## v1.9 HA target guarantees
+## What HA means in v1.9
 
-1. Single active writer per job:
-- exactly one coordinator leader may mutate lease state at any time
-- stale leaders are fenced and cannot mutate state after leadership loss
+HA covers per-job coordinator availability for inference, ETL, and preprocessing jobs. It does not cover training elasticity — DDP rank or node loss tolerance mid-epoch is out of scope for this contract. Multi-job scheduling and fairness are also out of scope.
 
-2. Durable control-plane state:
-- lease grants, lease expiry, range requeue, membership, and progress cursors survive leader failure
+The v1.9 guarantees:
 
-3. Automatic failover:
-- followers can promote without manual operator intervention
-- agents reconnect and continue progress reporting/lease requests
+Exactly one coordinator leader may mutate lease state at any time. Stale leaders are fenced and cannot write after losing leadership.
 
-4. Invariants preserved during failover:
-- no overlap for live leases
-- idempotent progress/report semantics under retries
+Lease grants, expiry, range requeue, membership, and progress cursors survive leader failure and are recoverable by the new leader.
 
-5. Defined recovery objective:
-- failover target (initial): control-plane recovery in <= 15s p95 in normal cluster conditions
+Followers can promote to leader without manual operator intervention. Agents reconnect to the new leader and continue requesting leases and reporting progress.
 
-## Design plan
+The no-overlap invariant is preserved across leader transitions. Progress report RPCs become idempotent with monotonic cursor enforcement so replays during failover do not corrupt state.
 
-### 1) State abstraction and durability
-- Introduce a `CoordinatorStore` boundary for:
-  - membership
-  - lease index
-  - progress cursor
-  - counters and manifest pin metadata
-- Back with a strongly consistent KV store (etcd recommended).
+The initial failover target is control-plane recovery within 15 seconds at p95 under normal cluster conditions.
 
-### 2) Leader election and fencing
-- Use per-job leader election in the same consistent store.
-- Attach `(term, leader_id)` to mutating operations.
-- Reject writes from stale terms.
 
-### 3) Idempotent write model
-- Progress/report RPC paths become idempotent with monotonic cursor checks.
-- Lease transitions (`granted -> active -> expired/requeued -> completed`) are persisted atomically.
+## Design
 
-### 4) Agent failover behavior
-- Agent accepts coordinator endpoint set (not single URL only).
-- Retry policy: bounded exponential backoff with jitter.
-- On leader move, agent retries register/heartbeat/request/progress against new leader.
+State durability is introduced by abstracting coordinator state behind a `CoordinatorStore` boundary covering membership, the lease index, progress cursors, and counters. This store is backed by a strongly consistent KV store — etcd is the recommended choice.
 
-## Failure behavior contract
+Leader election uses per-job elections in the same consistent store. Every mutating operation carries a `(term, leader_id)` tag. The coordinator rejects writes from stale terms, which enforces the single-writer guarantee and prevents split-brain.
 
-Leader crash/restart:
-- expected: follower promoted, agents reconnect, job continues from durable state.
+Progress and report RPC paths are made idempotent with monotonic cursor checks. Lease state transitions — granted, active, expired, requeued, completed — are persisted atomically.
 
-Leader isolated (partition):
-- expected: isolated leader loses election/lease and is fenced.
-- expected: only quorum side can continue mutating state.
+Agents are updated to accept a coordinator endpoint set rather than a single URL. On leader change, the agent retries register, heartbeat, request, and progress RPCs against the new leader using bounded exponential backoff with jitter.
 
-Backing store quorum loss:
-- expected: control plane enters safe degraded mode (no new lease grants).
-- expected: explicit operator alert; no split-brain writes.
 
-## Acceptance gates (must pass before "HA ready")
+## Failure behavior
 
-1. Leader kill gate:
-- kill active leader during multi-node run with active leases
-- verify failover within target window and job drains
+When the active leader crashes or restarts, a follower is promoted, agents reconnect, and the job continues from the durable state. No manual action is required.
 
-2. No-overlap failover gate:
-- assert no-overlap invariant across leader transition
+When the leader is partitioned from the cluster, it loses the election, gets fenced, and cannot mutate state. Only the quorum side continues processing.
 
-3. Stale leader fencing gate:
-- old leader must fail all mutating attempts after demotion
+When the backing store loses quorum, the control plane enters a safe degraded mode — no new leases are granted, and a clear operator alert is emitted. There are no split-brain writes.
 
-4. Retry/idempotency gate:
-- replay duplicate progress/report requests across failover
-- verify monotonic cursors and consistent completion
 
-5. Soak gate with repeated failovers:
-- repeated leader churn over long run without invariant violation
+## Acceptance gates
 
-## Rollout phases
+Before HA is marked production-ready, all of the following gates must pass:
 
-Phase 0 (docs/design lock):
-- lock this contract in docs and architecture.
+Kill the active leader during a multi-node run with active leases. Verify failover completes within the target window and the job drains correctly.
 
-Phase 1 (internal alpha):
-- enable HA behind feature flag for selected jobs.
-- run kill-leader gates in CI/nightly.
+Assert the no-overlap invariant holds across the full leader transition.
 
-Phase 2 (beta):
-- broaden usage for inference/ETL workloads.
-- monitor failover latency and fence violations.
+Verify that the demoted stale leader fails all mutating operations after losing leadership.
 
-Phase 3 (GA):
-- make HA default for coordinator deployments.
-- keep non-HA fallback documented for rollback.
+Replay duplicate progress and report requests across a failover boundary. Verify monotonic cursors and consistent completion.
 
-## Operator notes until v1.9 ships
+Run repeated leader churn over a long soak run and verify no invariant violations accumulate.
 
-- Treat coordinator as SPOF in v1.8.
-- On coordinator failure, restart coordinator and then agents for the affected job.
-- Do not advertise "no-pause" availability SLA for coordinator failures until HA gates are green.
+
+## Rollout plan
+
+Phase 0 locks this contract in docs and architecture (current state).
+
+Phase 1 enables HA behind a feature flag for selected internal jobs and runs the kill-leader gates in nightly CI.
+
+Phase 2 broadens availability to inference and ETL workloads and monitors failover latency and fence violations.
+
+Phase 3 makes HA the default for new coordinator deployments and keeps the non-HA fallback documented for rollback.
+
+
+## Training note
+
+Even after coordinator HA ships in v1.9, training remains non-elastic unless a separate training elasticity contract is added. The HA contract only covers the control plane recovery path, not the DDP rank membership changes that elastic training requires.

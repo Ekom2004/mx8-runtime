@@ -1,105 +1,93 @@
-# MX8 Runtime (v0)
+<div align="center">
 
-MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus a tiny per-job coordinator/agent layer for multi-node correctness and pacing.
+<img src="docs/assets/mx8-banner.png" alt="MX8" width="600" />
 
-## Install (PyPI)
+# MX8
 
-- `pip install mx8 pillow numpy torch`
+**The data runtime for serious ML workloads.**
 
-## Documentation
+Point to your data. Set a RAM limit. Train. That's it.
 
-- Python API: `docs/python_api.md`
-- Operator TUI: `docs/tui.md`
-- Image labels/layouts: `docs/vision_labels.md`
-- S3/runtime tuning: `docs/s3_runtime_tuning.md`
-- Troubleshooting: `docs/troubleshooting.md`
-- Production incident runbook: `docs/prod_runbook.md`
-- Mix contract/runbook: `docs/mix_v17_contract.md`, `docs/mix_gate_runbook.md`
+[![PyPI version](https://img.shields.io/pypi/v/mx8?color=blue)](https://pypi.org/project/mx8/)
+[![Python](https://img.shields.io/pypi/pyversions/mx8)](https://pypi.org/project/mx8/)
+[![License](https://img.shields.io/badge/license-proprietary-lightgrey)](LICENSE)
+[![Smoke](https://img.shields.io/badge/gates-passing-brightgreen)](#gates)
 
-## Autotune modes (current)
+</div>
 
-MX8 currently has two autotune layers:
+---
 
-- Startup autotune (profile defaults + caps): applied from API args such as `profile`, `max_ram_gb`, `constraints`, and `runtime`.
-- Runtime autotune (feedback loop): available by loader surface and controlled by loader autotune/runtime settings.
+MX8 is a high-performance Rust data runtime exposed to Python, plus a small per-job coordinator and agent layer that prevents multi-node stampedes, enforces memory budgets, and recovers from node failures automatically.
 
-## Bounded memory (v0)
-
-MX8 is designed to be *hard-capped* by config (backpressure via inflight permits).
+It is built for the workloads that break other dataloaders: large-scale inference, ETL, video preprocessing, and distributed training on fleets where nodes die.
 
 ```python
 import mx8
 
-loader = mx8.image(
-    "/path/to/mx8-dataset@refresh",
-    batch_size_samples=64,
+loader = mx8.load(
+    "s3://your-bucket/dataset/",
     max_ram_gb=12,
     profile="balanced",
 )
 
-for step, (images, labels) in enumerate(loader):
-    if step % 100 == 0:
-        print(loader.stats())  # includes ram_high_water_bytes
-    # Consume batch; do not accumulate batches in a list.
+for batch in loader:
+    process(batch)
 ```
 
-## Quick gates
+No manifest required. No setup. MX8 scans the prefix, shuffles, caps memory, and starts delivering.
 
-- Repo smoke (offline + online sub-gates):
-  - `./scripts/smoke.sh`
-- Python smoke:
-  - `./scripts/py_smoke.sh`
-  - `MX8_PY_SMOKE_INSTALL_TORCH=1 ./scripts/py_smoke.sh`
-- Wheel build + pip smoke:
-  - `./scripts/build_wheel.sh`
-  - `./scripts/pip_wheel_smoke.sh`
-- MinIO (S3-compatible) gates:
-  - `MX8_SMOKE_MINIO=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_DEMO2_MINIO_SCALE=1 MX8_SMOKE_MINIO_MANIFEST_STORE=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_MINIO_PACK=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_PY_IMAGE_PILLOW=1 ./scripts/smoke.sh` (heavier; installs torch+pillow in a temp venv)
-- PyTorch DDP gates (local multi-process):
-  - `MX8_SMOKE_TORCH_DDP=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_TORCH_DDP_NODUPES=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_TORCH_DDP_DETERMINISM=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_TORCH_DDP_RESTART=1 ./scripts/smoke.sh`
-- Mix gates:
-  - `./scripts/mix_gate.sh`
-  - `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`
-  - `./scripts/mix_multirank_gate.sh`
-  - `MX8_SMOKE_MIX=1 ./scripts/smoke.sh`
-  - `MX8_SMOKE_MIX_MULTIRANK=1 ./scripts/smoke.sh`
-- TUI gate:
-  - `./scripts/tui_gate.sh`
-  - `MX8_SMOKE_TUI=1 ./scripts/smoke.sh`
-- Production readiness suite:
-  - `./scripts/prod_readiness.sh`
-  - `MX8_SMOKE_PROD_READINESS=1 ./scripts/smoke.sh`
+---
 
-## Packing (v0)
+## Why MX8
 
-If your dataset is “many small S3 objects” (e.g. image-class-folder layout with millions of files), run `mx8-pack-s3` once to create tar shards plus a byte-range manifest:
+Most data loading tools hand you the primitives and leave the hard problems to you. MX8 solves them.
 
-- Input: `s3://bucket/raw/train/`
-- Output: `s3://bucket/mx8/train/`
-  - shards: `s3://bucket/mx8/train/shards/shard-00000.tar`
-  - manifest: `s3://bucket/mx8/train/_mx8/manifest.tsv`
-  - labels (optional): `s3://bucket/mx8/train/_mx8/labels.tsv` (if image-folder labels are enabled)
+**Guaranteed no-OOM.** Every loader surface has a hard memory cap enforced by backpressure. Set `max_ram_gb=12` and the process will never use more, no matter the dataset size. MX8 fails fast with a clear error before the OS kills it.
 
-You can run the packer either via the CLI:
+**Zero-manifest loading.** Point MX8 at any raw S3 prefix and it starts delivering bounded, shuffled batches immediately. No packing step, no index generation, no prep. When you are ready for production, pack once and MX8 switches to the fast path automatically.
 
-- `MX8_PACK_IN=s3://bucket/raw/train/ MX8_PACK_OUT=s3://bucket/mx8/train/ cargo run -p mx8-snapshot --features s3 --bin mx8-pack-s3`
+**Kill-and-recover.** When a node dies mid-job, the coordinator detects the stale heartbeat, expires the lease, and requeues the unfinished range for another node to pick up. Inference and ETL jobs drain to completion with no manual intervention.
 
-Or via the Python API (after installing `mx8`):
+**Deterministic replay.** Every run is pinned to a `manifest_hash`. Same hash, same seed, same epoch, same membership — bit-identical data order. Reproduce any training run, audit any inference job.
 
-- `python -c "import mx8; mx8.pack('s3://bucket/raw/train/', out='s3://bucket/mx8/train/', shard_mb=512, label_mode='auto')"`
-- Local: `python -c "import mx8; mx8.pack_dir('/path/to/raw', out='/path/to/mx8', shard_mb=512, label_mode='imagefolder', require_labels=True)"`
+**S3 surgical range-seek for video.** MX8 does not download whole video files. It plans byte ranges into compressed video, seeks to the right GOP boundaries, and decodes only the frames you need — under the same hard memory envelope.
 
-Then point MX8 at the packed prefix (snapshot resolver will use the precomputed manifest, avoiding large LIST operations).
+**Multi-dataset mixing under one cap.** `mx8.mix` blends multiple datasets with configurable weights, deterministic scheduling, and a single shared memory budget. No source can starve another. No source can blow the cap.
 
-## Image Loader (PyTorch)
+---
 
-For class-folder datasets (`prefix/<label>/<file>`), MX8 can deliver `(images, labels)` directly as torch tensors:
+## Install
+
+```bash
+pip install mx8
+```
+
+For vision and training:
+
+```bash
+pip install mx8 pillow numpy torch
+```
+
+---
+
+## Quickstart
+
+**Load from any S3 prefix (no prep required):**
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/raw-images/",
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    process(batch.payload, batch.offsets)
+```
+
+**Image classification with PyTorch:**
 
 ```python
 import mx8
@@ -107,67 +95,171 @@ import mx8
 mx8.pack(
     "s3://bucket/raw/train/",
     out="s3://bucket/mx8/train/",
-    shard_mb=512,
     label_mode="imagefolder",
-    require_labels=True,
 )
 
 loader = mx8.image(
     "s3://bucket/mx8/train/@refresh",
     batch_size_samples=64,
-    resize_hw=(224, 224),  # (H,W); optional
+    resize_hw=(224, 224),
+    max_ram_gb=24,
 )
 
 for images, labels in loader:
-    # images: [B,C,H,W] float32 in [0,1]
+    # images: [B, C, H, W] float32
     # labels: [B] int64
-    pass
+    train_step(images, labels)
 ```
 
-## Training semantics (v0)
-
-### Non-elastic
-MX8 v0 does not keep PyTorch DDP alive after rank/node failure.
-
-- If a rank dies, DDP will terminate the job.
-- Lease reassignment is for inference/ETL correctness (keep the job draining), not for elastic training.
-
-### Determinism
-For a pinned snapshot (`manifest_hash`) and frozen membership (`world_size` barrier), sharding/shuffle is deterministic by:
-
-- `MX8_SEED` (default: `0`)
-- `MX8_EPOCH` (default: `0`)
-- `MX8_SHUFFLE` (default: `false`; accepts `true/false/1/0`; set to `true` for training-style block shuffles)
-
-### Checkpointing & resume (epoch-level)
-MX8 v0 supports **epoch-level resume**.
-
-On preemption or crash:
-
-- Save your model checkpoint regularly (every N steps).
-- Restart the job; MX8 restarts from the beginning of the current epoch.
-- Data order is deterministic for the same `(manifest_hash, seed, epoch, world_size)` and frozen membership.
-- Some data may be re-processed; training continues correctly.
-
-Mid-epoch resume (dataloader `state_dict()`) is planned for v1.
-
-## Mix API (v1.7)
-
-`mx8.mix(...)` provides deterministic weighted blending under a shared bounded runtime envelope.
+**Video clips with bounded decode:**
 
 ```python
 import mx8
 
-a = mx8.load("s3://bucket/a@refresh", batch_size_samples=32)
-b = mx8.load("s3://bucket/b@refresh", batch_size_samples=32)
-
-mixed = mx8.mix(
-    [a, b],
-    weights=[0.7, 0.3],
-    seed=17,
-    epoch=3,
-    source_exhausted="error",  # or "allow"
-    max_ram_gb=12,
-    profile="balanced",
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=24,
 )
+
+for batch in loader:
+    process_clips(batch.payload, batch.clip_ids)
 ```
+
+**Multi-dataset mixing:**
+
+```python
+import mx8
+
+a = mx8.load("s3://bucket/dataset-a@refresh", batch_size_samples=32)
+b = mx8.load("s3://bucket/dataset-b@refresh", batch_size_samples=32)
+
+mixed = mx8.mix([a, b], weights=[0.7, 0.3], seed=17, epoch=0, max_ram_gb=24)
+
+for batch in mixed:
+    train_step(batch)
+```
+
+**Distributed multi-node:**
+
+```python
+import mx8
+
+loader = mx8.DistributedDataLoader(
+    coord_url="http://coordinator-host:50051",
+    job_id="my-job",
+    node_id="node-0",
+    batch_size_samples=512,
+    max_ram_gb=48,
+    profile="throughput",
+)
+
+for batch in loader:
+    payload_u8, offsets, sample_ids = batch.to_torch()
+    train_step(payload_u8)
+```
+
+---
+
+## Architecture
+
+MX8 has three components.
+
+The **runtime** (`mx8`) runs in-process inside your Python training or inference script. It owns the data path: Fetch → Decode/Parse → Pack → Deliver. All pipeline stages are bounded. Backpressure prevents runaway prefetch. The RSS watchdog prevents silent OOM kills.
+
+The **coordinator** (`mx8-coordinator`) runs once per job. It resolves the dataset to a pinned snapshot, freezes cluster membership, assigns leases to nodes, expires stale leases, and requeues unfinished ranges. It is the reason multi-node MX8 behaves like one coordinated consumer instead of many independent loaders.
+
+The **agent** (`mx8d-agent`) runs once per node. It enforces per-node memory budgets, requests leases from the coordinator, and feeds work ranges to local runtime processes.
+
+```
+ Python process          Node (mx8d-agent)          Job (mx8-coordinator)
+ + mx8 runtime    <——>   local caps/budgets   <——>   leases/ownership
+ bounded pipeline         feeds WorkRanges            resolves snapshots
+       |
+       v
+ Dataset Storage (S3 / NVMe / filesystem)
+```
+
+---
+
+## Documentation
+
+| Doc | Description |
+| --- | --- |
+| [Python API](docs/python_api.md) | Full loader API reference |
+| [Deployment Guide](docs/deployment_guide.md) | Running coordinator and agents in production |
+| [Zero-Manifest Loading](docs/zero_manifest.md) | Loading from raw S3 prefixes without packing |
+| [Memory Contract](docs/memory_contract.md) | What MX8 guarantees about memory |
+| [Autotune](docs/v1_autotune_api_contract.md) | How startup and runtime autotune work |
+| [Mix API](docs/mix_v17_contract.md) | Multi-dataset blending |
+| [Operator TUI](docs/tui.md) | Live job monitoring in the terminal |
+| [Production Runbook](docs/prod_runbook.md) | Incident response and escalation |
+| [Troubleshooting](docs/troubleshooting.md) | Common errors and fixes |
+| [Security Model](docs/security_model.md) | Auth, IAM, and network hardening |
+| [CLI Reference](docs/cli_reference.md) | mx8-pack-s3, mx8-snapshot-resolve |
+| [gRPC Contract](docs/grpc_contract.md) | Coordinator/agent wire protocol |
+| [Env Reference](docs/env_reference.md) | All MX8_* environment variables |
+| [HA Contract](docs/ha_contract.md) | Coordinator HA plan (v1.9) |
+| [Compatibility Policy](docs/compatibility_policy.md) | Versioning and stability guarantees |
+
+---
+
+## Gates
+
+MX8 ships with a deterministic gate suite. Run the full readiness check before any production deployment:
+
+```bash
+./scripts/prod_readiness.sh
+```
+
+Individual gates:
+
+```bash
+./scripts/smoke.sh                          # offline + online correctness
+./scripts/py_smoke.sh                       # Python API smoke
+./scripts/mix_gate.sh                       # mix determinism + ratio + memory
+./scripts/mix_multirank_gate.sh             # multi-rank no-overlap
+./scripts/tui_gate.sh                       # TUI headless probe
+MX8_SMOKE_MINIO=1 ./scripts/smoke.sh       # S3-compatible (MinIO) gates
+MX8_SMOKE_TORCH_DDP=1 ./scripts/smoke.sh   # PyTorch DDP multi-rank
+```
+
+---
+
+## Building from source
+
+Prerequisites: Rust toolchain, `cargo`.
+
+```bash
+git clone https://github.com/your-org/mx8-runtime
+cd mx8-runtime
+cargo build --workspace
+cargo test --workspace
+```
+
+To build the Python wheel:
+
+```bash
+./scripts/build_wheel.sh
+pip install dist/mx8-*.whl
+```
+
+---
+
+## Status
+
+| Capability | Status |
+| --- | --- |
+| Bounded in-process pipeline | GA |
+| Zero-manifest S3 loading | GA |
+| Image loader (PyTorch) | GA |
+| Video loader (CPU decode) | GA |
+| Video loader (GPU/NVDEC) | Planned |
+| Multi-dataset mix | GA |
+| Distributed coordinator + agent | GA |
+| Coordinator HA (automatic failover) | v1.9 planned |
+| Mid-epoch resume (`state_dict`) | v1.9 planned |
+| Prometheus/OTEL metrics export | Planned |

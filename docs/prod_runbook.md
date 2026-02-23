@@ -1,96 +1,19 @@
-# MX8 Production Incident Runbook (v1.8)
+# Production Incident Runbook
 
-This runbook maps common operator symptoms to exact checks, mitigations, and rollback actions.
-
-## Preflight
-
-Run from repo root:
+This runbook maps common operator symptoms to checks, actions, and escalation paths. Keep it open during production jobs. Before any new deployment, run the readiness suite:
 
 ```bash
 ./scripts/prod_readiness.sh
 ```
 
-For live jobs, keep these identifiers ready:
+Have these identifiers ready when investigating a live job: `MX8_COORD_URL`, `MX8_JOB_ID`, the node IDs or ranks involved, and the pinned `manifest_hash`.
 
-- `MX8_COORD_URL`
-- `MX8_JOB_ID`
-- node IDs/ranks involved
-- pinned `manifest_hash`
 
-## 1) Stale heartbeat
+## Stale heartbeat
 
-Symptom:
+One or more nodes show a stale heartbeat age in the TUI or operator logs. Progress slows while active leases remain open.
 
-- one or more nodes show stale heartbeat age in operator output/TUI
-- coordinator counters progress slows while active leases remain
-
-Checks:
-
-```bash
-cargo run -p mx8-tui -- --coord-url "$MX8_COORD_URL" --job-id "$MX8_JOB_ID" --headless-polls 6 --poll-ms 300
-```
-
-Look for:
-
-- stale node heartbeat age (`hb_age_ms` above threshold)
-- `active_leases > 0` with minimal progress counter movement
-
-Action:
-
-1. Verify node process health and network reachability to coordinator.
-2. Restart only stale node workers/agent.
-3. Wait for lease TTL expiry + requeue.
-
-Expected outcome:
-
-- stale node count drops
-- coordinator `ranges_requeued_total` increments
-- progress resumes
-
-Rollback/escalation:
-
-- if stale persists across `2 * lease_ttl`, drain job and restart coordinator + agents for that job.
-
-## 2) Lease stall (active leases, no progress)
-
-Symptom:
-
-- leases remain active, but progress counter/cursor does not advance
-
-Checks:
-
-```bash
-RUST_LOG=info \
-MX8_TOTAL_SAMPLES=12000 \
-MX8_DEV_BLOCK_SIZE=1000 \
-MX8_SINK_SLEEP_MS=25 \
-MX8_KILL_AFTER_MS=25 \
-cargo run -p mx8-runtime --bin mx8-demo2
-```
-
-Action:
-
-1. Confirm workers are delivering (not only fetching/decoding).
-2. Force restart of stuck worker process on affected node.
-3. Let coordinator expire lease and reassign remainder.
-
-Expected outcome:
-
-- `leases_expired_total` and `ranges_requeued_total` rise
-- job returns to progressing/drained state
-
-Rollback/escalation:
-
-- if cursor remains unchanged after requeue, stop job and relaunch from pinned snapshot.
-
-## 3) Manifest fetch failure
-
-Symptom:
-
-- TUI/clients show manifest fetch errors
-- startup fails to resolve manifest or stream chunks
-
-Checks:
+Start by checking the TUI:
 
 ```bash
 cargo run -p mx8-tui -- \
@@ -100,11 +23,37 @@ cargo run -p mx8-tui -- \
   --poll-ms 300
 ```
 
-Action:
+Look for nodes with `hb_age_ms` above the stale threshold and active leases with no progress counter movement.
 
-1. Validate manifest exists in configured `manifest_store`.
-2. Verify coordinator can serve `GetManifestStream`.
-3. Use local fallback manifest path only as temporary mitigation:
+If you find stale nodes, verify that the node process is alive and that it has network reachability to the coordinator. Restart only the stale node's agent. Then wait for the lease TTL to expire and the coordinator to requeue the remainder. You should see `ranges_requeued_total` increment and progress resume.
+
+If stale heartbeats persist across two full lease TTL cycles, drain the job and restart the coordinator and agents for that job.
+
+
+## Lease stall
+
+Leases are active but the progress cursor is not advancing. The job appears to be running but no data is being delivered.
+
+First confirm that workers are delivering, not just fetching and decoding. A lease can show activity at the fetch stage while being stalled at delivery. Force-restart the stuck worker process on the affected node and let the coordinator expire and reassign the lease. You should see `leases_expired_total` and `ranges_requeued_total` rise and the job return to a progressing or drained state.
+
+If the cursor remains unchanged after the lease is requeued and reassigned, stop the job and relaunch from the pinned snapshot.
+
+
+## Manifest fetch failure
+
+The TUI or client logs show manifest fetch errors. Startup fails to resolve the manifest or stream chunks.
+
+Check the TUI:
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url "$MX8_COORD_URL" \
+  --job-id "$MX8_JOB_ID" \
+  --headless-polls 6 \
+  --poll-ms 300
+```
+
+Validate that the manifest exists in the configured `manifest_store` and that the coordinator can serve `GetManifestStream`. As a temporary mitigation, point the TUI at a local manifest file:
 
 ```bash
 cargo run -p mx8-tui -- \
@@ -113,85 +62,32 @@ cargo run -p mx8-tui -- \
   --manifest-path /path/to/manifest.tsv
 ```
 
-Expected outcome:
+If the manifest panel populates with the local file, the issue is with the coordinator's access to the manifest store, not the manifest itself. If you suspect manifest mismatch or corruption, restart the run from an explicit pinned link using `@sha256:<manifest_hash>`.
 
-- manifest panel populates
-- workers resume normal range processing
 
-Rollback/escalation:
+## RSS breach and memory pressure
 
-- if manifest mismatch/corruption is suspected, restart run from explicit pinned `@sha256:<manifest_hash>`.
+The loader fails fast with an error like `process rss ... exceeds max_process_rss_bytes`. This is expected behavior — MX8 is protecting the process from being OOM-killed by the OS.
 
-## 4) RSS breach / memory pressure
+First find the cap source by checking the loader startup logs for `MX8_MAX_PROCESS_RSS_BYTES`, `max_ram_bytes`, or the derived default. Then reduce pressure: lower `max_inflight_bytes`, lower `prefetch_batches`, lower `max_queue_batches`, and lower `want` on distributed loaders. Rerun with the corrected values.
 
-Symptom:
+If you need to raise the cap to maintain throughput, raise it in bounded increments and rerun the readiness gates each time.
 
-- fail-fast error: `process rss ... exceeds max_process_rss_bytes ...`
 
-Checks:
+## Coordinator failure
 
-```bash
-cargo test -p mx8-runtime process_rss_cap_fails_fast_when_too_small
-```
+In v1.8, the coordinator is a single process per job with no automatic failover. If it dies, the control plane pauses until it is restarted.
 
-Action:
-
-1. Confirm cap source (`max_ram_bytes`, `MX8_MAX_PROCESS_RSS_BYTES`, or derived default in loader startup logs).
-2. Reduce pressure knobs first:
-   - lower `max_inflight_bytes`
-   - lower `prefetch_batches`
-   - lower `max_queue_batches`
-   - lower distributed `want`
-3. Re-run with corrected caps.
-
-Expected outcome:
-
-- no RSS breach
-- stable `inflight_bytes` and `ram_high_water_bytes`
-
-Rollback/escalation:
-
-- if cap must be raised to keep throughput, raise in bounded increments and re-run readiness gates.
-
-## Coordinator HA and training elasticity
-
-Current v1.8 contract:
-
-- coordinator HA is not provided in default architecture
-- training is non-elastic (node-loss-tolerant continuation is not guaranteed)
-
-Coordinator failure action (v1.8):
-
-1. Restart coordinator for the affected job.
-2. Restart affected agents/workers if they do not reconnect cleanly.
-3. Verify lease/progress recovery from fresh coordinator state.
-
-Checks:
+Restart the coordinator for the affected job. Restart affected agents if they do not reconnect on their own. Then verify recovery in the TUI:
 
 ```bash
-cargo run -p mx8-tui -- --coord-url "$MX8_COORD_URL" --job-id "$MX8_JOB_ID" --headless-polls 6 --poll-ms 300
+cargo run -p mx8-tui -- \
+  --coord-url "$MX8_COORD_URL" \
+  --job-id "$MX8_JOB_ID" \
+  --headless-polls 6 \
+  --poll-ms 300
 ```
 
-Expected outcome:
+You should see nodes re-register, heartbeats resume, and progress counters start moving again. If the coordinator repeatedly fails or the job cannot resume progress, drain it and relaunch from a pinned `@sha256:<manifest_hash>`.
 
-- coordinator responds to snapshot RPCs
-- nodes re-register and heartbeat resumes
-- progress counters move again or job drains
-
-Rollback/escalation:
-
-- if coordinator repeatedly fails or job cannot resume progress, drain and relaunch from pinned `@sha256:<manifest_hash>`.
-
-Planned v1.9 HA scope:
-
-- single-writer leader with fencing
-- durable lease/progress state
-- automatic leader failover for inference/ETL jobs
-
-Canonical HA plan and acceptance gates:
-
-- `docs/ha_contract.md`
-
-Training note:
-
-- even after coordinator HA ships, training remains non-elastic unless explicitly upgraded in a later contract.
+The v1.9 HA plan — single-writer leader with fencing, durable lease state, and automatic failover for inference and ETL jobs — is documented in `docs/ha_contract.md`. Training remains non-elastic even after coordinator HA ships.
