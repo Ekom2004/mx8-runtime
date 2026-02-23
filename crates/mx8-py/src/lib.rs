@@ -1266,6 +1266,37 @@ impl DataLoader {
         Ok(out.into_any())
     }
 
+    /// Print a single human-readable summary line to stderr.
+    /// Call inside your training loop whenever you want a quick health check
+    /// without building your own stat formatter.
+    ///
+    /// Example output:
+    ///   [mx8] batches=128 samples=8192 inflight=45.2MB rss=234.1MB hwm=256.0MB
+    fn print_stats(&self, py: Python<'_>) -> PyResult<()> {
+        let s = self.stats(py)?;
+        let s = s.downcast::<pyo3::types::PyDict>()?;
+        let get_u64 = |key: &str| -> u64 {
+            s.get_item(key)
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let batches = get_u64("delivered_batches_total");
+        let samples = get_u64("delivered_samples_total");
+        let inflight = get_u64("inflight_bytes");
+        let rss = get_u64("process_rss_bytes");
+        let hwm = get_u64("ram_high_water_bytes");
+        eprintln!(
+            "[mx8] batches={batches} samples={samples} inflight={:.1}MB rss={:.1}MB hwm={:.1}MB",
+            mb(inflight),
+            mb(rss),
+            mb(hwm),
+        );
+        Ok(())
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -3046,6 +3077,10 @@ impl ImageLoader {
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.loader.stats(py)
+    }
+
+    fn print_stats(&self, py: Python<'_>) -> PyResult<()> {
+        self.loader.print_stats(py)
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

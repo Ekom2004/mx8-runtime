@@ -605,6 +605,10 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
     let mut shard_offset: u64 = 0;
     let mut total_shards: u64 = 0;
     let mut wrote_any_in_shard = false;
+    let total_objects = objects.len();
+    let pack_started = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
+    let progress_interval = std::time::Duration::from_secs(2);
 
     // Helper: build the S3 key for the current shard index.
     let shard_out_key = |idx: u64| -> String {
@@ -630,6 +634,28 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
                 size,
                 label,
             } = fetched?;
+
+            // Print a progress line to stderr every 2 seconds so the user
+            // knows the pack is running and hasn't hung.
+            if last_progress.elapsed() >= progress_interval {
+                let done = records.len() + 1;
+                let elapsed = pack_started.elapsed().as_secs_f64();
+                let eta = if done > 0 {
+                    let rate = done as f64 / elapsed;
+                    let remaining = total_objects.saturating_sub(done);
+                    if rate > 0.0 {
+                        format!("eta={:.0}s", remaining as f64 / rate)
+                    } else {
+                        "eta=?".to_string()
+                    }
+                } else {
+                    "eta=?".to_string()
+                };
+                eprintln!(
+                    "[mx8-pack] {done}/{total_objects} files  {total_shards} shards  elapsed={elapsed:.0}s  {eta}"
+                );
+                last_progress = std::time::Instant::now();
+            }
 
             let ext = infer_ext(&key)
                 .map(|e| format!(".{e}"))
@@ -778,6 +804,11 @@ pub async fn pack_s3(cfg: PackS3Config) -> Result<PackS3Result> {
     } else {
         (None, None)
     };
+
+    let elapsed_total = pack_started.elapsed().as_secs_f64();
+    eprintln!(
+        "[mx8-pack] done  {total_objects} files  {total_shards} shards  elapsed={elapsed_total:.0}s  manifest={manifest_key}"
+    );
 
     info!(
         target: "mx8_proof",
