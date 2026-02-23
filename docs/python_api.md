@@ -7,7 +7,7 @@ This page documents the API that ships in `mx8==1.8.x`. Install with `pip instal
 
 Before you can load from a dataset at production scale, you typically pack it once to create a precomputed manifest. The packer writes tar shards and a manifest TSV that MX8 uses for all subsequent runs.
 
-`mx8.pack(pack_in, *, out, shard_mb=512, label_mode="auto", require_labels=False)` packs an S3 prefix into a packed dataset at the output prefix.
+`mx8.pack(pack_in, *, out, shard_mb=512, label_mode="auto", require_labels=False, parallel_fetches=128)` packs an S3 prefix into tar shards at the output prefix and writes a manifest. `parallel_fetches` controls how many S3 GET requests run concurrently during packing (override with `MX8_PACK_PARALLEL_FETCHES`). Part size for the multipart upload defaults to 16MB and is tunable via `MX8_PACK_PART_MB`.
 
 `mx8.pack_dir(in_dir, *, out, shard_mb=512, label_mode="auto", require_labels=False)` does the same for a local directory.
 
@@ -53,6 +53,10 @@ Arguments:
 `target_batch_bytes` and `max_batch_bytes` override the byte-aware batching defaults. MX8 derives these automatically from your inflight cap in most cases.
 
 `start_id` and `end_id` must be set together if you want to load a specific sample ID range.
+
+`node_id` sets the node identity used in proof logs. Auto-generated from hostname + PID if not set.
+
+`autopack` (default `False`) — if `True` and `dataset_link` is a bare S3 prefix with no manifest, MX8 runs a full pack in-place before starting the loader. The packed shards and manifest are written to the same prefix. Subsequent runs skip the pack step automatically. Use `autopack_shard_mb` (default `512`) to control shard size.
 
 `profile` selects a preset safety/throughput balance: `safe`, `balanced`, or `throughput`.
 
@@ -164,6 +168,16 @@ print(loader.classes)  # ["cat", "dog", ...] or None
 for images, labels in loader:
     pass  # images: [B,C,H,W] float32, labels: [B] int64
 ```
+
+Image loader arguments:
+
+`resize_hw` — `(height, width)` tuple to resize all images before batching (e.g. `resize_hw=(224, 224)`). If not set, images are returned at their original size. All images in a batch must have the same decoded dimensions; mixed-size batches are an error.
+
+`to_float` (default `True`) — normalize pixel values to `float32` in `[0, 1]`. Set `to_float=False` to get raw `uint8` tensors.
+
+`node_id` — same as the core loader; auto-generated if not set.
+
+`autopack` and `autopack_shard_mb` — same as the core loader.
 
 The default decode backend in v1.8 is Python/Pillow. To use the experimental Rust decode path, set `MX8_DECODE_BACKEND=rust`. The Rust path supports additional options: `MX8_DECODE_THREADS` for worker count, `MX8_RUST_JPEG_CODEC` for JPEG codec selection (`zune`, `image`, or `turbo`), and `MX8_RUST_RESIZE_BACKEND` for resize algorithm (`fast` or `image`).
 
