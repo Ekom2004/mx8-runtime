@@ -117,7 +117,7 @@ Refresh scope:
 - Configured location for manifests, locks, and intent pointers.
 - Supports both:
   - S3-backed store: `s3://bucket/prefix/...`
-  - Filesystem-backed store: `/var/lib/mx8/manifests` (or any path)
+  - Filesystem-backed store: `~/.mx8/manifests` (default; any path accepted)
 
 Portability rule (multi-node):
 - Do **not** assume filesystem paths are shared/mounted identically across nodes.

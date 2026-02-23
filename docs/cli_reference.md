@@ -59,7 +59,7 @@ Resolves a dataset link to a pinned snapshot and prints the `manifest_hash`. Use
 ```bash
 cargo run -p mx8-snapshot --features s3 --bin mx8-snapshot-resolve -- \
   --dataset-link 's3://my-bucket/mx8/train/@refresh' \
-  --manifest-store-root '/var/lib/mx8/manifests'
+  --manifest-store-root '~/.mx8/manifests'
 ```
 
 On success, it prints:
@@ -71,7 +71,7 @@ manifest_hash: <sha256>
 | CLI argument | Environment variable | Default | Description |
 | --- | --- | --- | --- |
 | `--dataset-link` | `MX8_DATASET_LINK` | required | plain path, `@refresh`, or `@sha256:<hash>` |
-| `--manifest-store-root` | `MX8_MANIFEST_STORE_ROOT` | `/var/lib/mx8/manifests` | filesystem path or S3 prefix |
+| `--manifest-store-root` | `MX8_MANIFEST_STORE_ROOT` | `~/.mx8/manifests` | filesystem path or S3 prefix |
 | `--dev-manifest-path` | `MX8_DEV_MANIFEST_PATH` | unset | dev manifest bootstrap path |
 | `--node-id` | `MX8_NODE_ID` | `resolver` | lock owner identity for proof logs |
 | `--snapshot-lock-stale-ms` | `MX8_SNAPSHOT_LOCK_STALE_MS` | `60000` | how long before a stale lock is reaped |

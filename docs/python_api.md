@@ -40,7 +40,7 @@ Arguments:
 
 `dataset_link` is a plain path or prefix, optionally followed by `@refresh` to force a fresh snapshot at job start, or `@sha256:<hash>` to pin an exact snapshot.
 
-`manifest_store` sets the manifest store root (default `/var/lib/mx8/manifests`). Accepts a filesystem path or an S3 prefix.
+`manifest_store` sets the manifest store root (default `~/.mx8/manifests`). Accepts a filesystem path or an S3 prefix.
 
 `recursive` controls whether subdirectories are indexed (default `True`).
 

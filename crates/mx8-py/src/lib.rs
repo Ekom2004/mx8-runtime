@@ -1007,7 +1007,7 @@ impl DataLoader {
 
         let root = manifest_store
             .or(env_path("MX8_MANIFEST_STORE_ROOT"))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
+            .unwrap_or_else(default_manifest_store);
 
         let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
@@ -3218,7 +3218,7 @@ fn resolve_manifest_hash(
 ) -> PyResult<String> {
     let root = manifest_store
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
-        .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
+        .unwrap_or_else(default_manifest_store);
     let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
     let store = std::sync::Arc::new(FsManifestStore::new(root));
@@ -3276,7 +3276,7 @@ fn internal_video_index_build<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let root = manifest_store
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
-        .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
+        .unwrap_or_else(default_manifest_store);
     let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
 
     let store = std::sync::Arc::new(FsManifestStore::new(root));
@@ -3899,7 +3899,7 @@ fn video(
     }
     let root = manifest_store
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
-        .unwrap_or_else(|| PathBuf::from("/var/lib/mx8/manifests"));
+        .unwrap_or_else(default_manifest_store);
     let dev_manifest_path = manifest_path.or(env_path("MX8_DEV_MANIFEST_PATH"));
     let store = std::sync::Arc::new(FsManifestStore::new(root));
     let resolver = SnapshotResolver::new(
@@ -4490,6 +4490,16 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Returns the user-local manifest store root: `$HOME/.mx8/manifests`.
+/// Falls back to `/tmp/.mx8/manifests` on systems where HOME is unset
+/// (e.g. some container environments). Never uses `/var/lib/...` which
+/// requires root and fails silently on developer machines.
+fn default_manifest_store() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".mx8/manifests"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/.mx8/manifests"))
 }
 
 fn env_u64(name: &str) -> Option<u64> {

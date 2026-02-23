@@ -17,12 +17,9 @@ struct Args {
     #[arg(long, env = "MX8_DATASET_LINK")]
     dataset_link: String,
 
-    #[arg(
-        long,
-        env = "MX8_MANIFEST_STORE_ROOT",
-        default_value = "/var/lib/mx8/manifests"
-    )]
-    manifest_store_root: String,
+    /// Defaults to `~/.mx8/manifests` when not set.
+    #[arg(long, env = "MX8_MANIFEST_STORE_ROOT")]
+    manifest_store_root: Option<String>,
 
     #[arg(long, env = "MX8_DEV_MANIFEST_PATH")]
     dev_manifest_path: Option<PathBuf>,
@@ -44,8 +41,16 @@ fn main() -> Result<()> {
     mx8_observe::logging::init_tracing();
     let args = Args::parse();
 
+    let manifest_store_root = args
+        .manifest_store_root
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".mx8/manifests"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.mx8/manifests"))
+        });
     let store: Arc<dyn ManifestStore> = Arc::from(mx8_manifest_store::open_from_root(
-        &args.manifest_store_root,
+        &manifest_store_root.to_string_lossy(),
     )?);
 
     let cfg = SnapshotResolverConfig {

@@ -74,7 +74,7 @@ Every CLI argument has a corresponding environment variable. All timing values a
 | `--heartbeat-interval-ms` | `MX8_HEARTBEAT_INTERVAL_MS` | `1000` | returned to agents as the heartbeat cadence |
 | `--lease-ttl-ms` | `MX8_LEASE_TTL_MS` | `10000` | how long before a silent lease is expired |
 | `--dataset-link` | `MX8_DATASET_LINK` | unset | plain path, `@refresh`, or `@sha256:<hash>` |
-| `--manifest-store-root` | `MX8_MANIFEST_STORE_ROOT` | `/var/lib/mx8/manifests` | filesystem path or S3 prefix |
+| `--manifest-store-root` | `MX8_MANIFEST_STORE_ROOT` | `~/.mx8/manifests` | filesystem path or S3 prefix |
 | `--snapshot-lock-stale-ms` | `MX8_SNAPSHOT_LOCK_STALE_MS` | `60000` | stale threshold for snapshot locks |
 | `--snapshot-wait-timeout-ms` | `MX8_SNAPSHOT_WAIT_TIMEOUT_MS` | `30000` | how long to wait for a concurrent indexer |
 | `--shuffle` | `MX8_SHUFFLE` | `false` | enable deterministic block shuffle |

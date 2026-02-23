@@ -30,7 +30,7 @@ Current inventory size: `237` variables.
 | `MX8_HEARTBEAT_INTERVAL_MS` | `1000` | coordinator | integer >= 1 | stable |
 | `MX8_LEASE_TTL_MS` | `10000` | coordinator | integer >= 1 | stable |
 | `MX8_DATASET_LINK` | unset | coordinator/resolver | plain path/prefix, `@refresh`, `@sha256:<hash>` | stable |
-| `MX8_MANIFEST_STORE_ROOT` | `/var/lib/mx8/manifests` | coordinator/resolver/python loaders | filesystem path or `s3://...` prefix | stable |
+| `MX8_MANIFEST_STORE_ROOT` | `~/.mx8/manifests` | coordinator/resolver/python loaders | filesystem path or `s3://...` prefix | stable |
 | `MX8_SNAPSHOT_LOCK_STALE_MS` | `60000` | coordinator/resolver | integer >= 1 | stable |
 | `MX8_SNAPSHOT_WAIT_TIMEOUT_MS` | `30000` | coordinator/resolver | integer >= 1 | stable |
 | `MX8_SNAPSHOT_RECURSIVE` | `true` (resolver CLI) | snapshot resolver | bool (`true/false/1/0`) | stable |
