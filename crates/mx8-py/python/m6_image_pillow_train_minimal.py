@@ -22,9 +22,8 @@ def main() -> None:
         link,
         manifest_store=root,
         batch_size_samples=batch_size,
-        max_inflight_bytes=128 * 1024 * 1024,
-        max_queue_batches=32,
-        prefetch_batches=4,
+        max_ram_gb=4,
+        profile="balanced",
         node_id=os.environ.get("MX8_NODE_ID", "py_train"),
         to_float=True,
     )

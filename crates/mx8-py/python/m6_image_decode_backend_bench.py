@@ -69,9 +69,8 @@ def run_once(
             dataset_link,
             manifest_store=store_root,
             batch_size_samples=batch_size,
-            max_inflight_bytes=256 * 1024 * 1024,
-            max_queue_batches=64,
-            prefetch_batches=4,
+            max_ram_gb=8,
+            profile="throughput",
             node_id=f"py_decode_bench_{backend}",
             to_float=True,
         )

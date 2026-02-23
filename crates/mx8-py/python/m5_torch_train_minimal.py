@@ -25,9 +25,8 @@ def main() -> None:
         manifest_store=root,
         manifest_path=dev_manifest,
         batch_size_samples=32,
-        max_inflight_bytes=8 * 1024 * 1024,
-        max_queue_batches=16,
-        prefetch_batches=4,
+        max_ram_gb=4,
+        profile="balanced",
     )
 
     model = None

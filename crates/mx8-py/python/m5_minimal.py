@@ -15,9 +15,8 @@ def main() -> None:
         manifest_store=root,
         manifest_path=dev_manifest,
         batch_size_samples=8,
-        max_inflight_bytes=64 * 1024,
-        max_queue_batches=16,
-        prefetch_batches=4,
+        max_ram_gb=1,
+        profile="safe",
     )
 
     print("manifest_hash:", loader.manifest_hash)

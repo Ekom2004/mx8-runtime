@@ -69,10 +69,8 @@ def _run_backend(
         batch_size_samples=batch_size,
         seed=seed,
         epoch=epoch,
-        constraints=mx8.Constraints(
-            max_inflight_bytes=128 * 1024 * 1024,
-            max_ram_bytes=None,
-        ),
+        max_ram_gb=4,
+        profile="balanced",
     )
 
     clip_ids = []

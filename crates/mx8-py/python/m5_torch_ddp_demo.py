@@ -60,9 +60,8 @@ def _run_worker(
         job_id=job_id,
         node_id=node_id,
         batch_size_samples=32,
-        max_inflight_bytes=8 * 1024 * 1024,
-        max_queue_batches=16,
-        prefetch_batches=2,
+        max_ram_gb=4,
+        profile="balanced",
         want=1,
         progress_interval_ms=200,
     )
