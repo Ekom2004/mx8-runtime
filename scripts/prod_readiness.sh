@@ -43,6 +43,9 @@ echo "[mx8] prod_readiness: leader fencing semantics"
 echo "[mx8] prod_readiness: durable state store roundtrip"
 ./scripts/state_store_gate.sh
 
+echo "[mx8] prod_readiness: HA leader failover continuity"
+./scripts/ha_failover_gate.sh
+
 echo "[mx8] prod_readiness: coordinator restart recovery"
 ./scripts/coordinator_restart_gate.sh
 

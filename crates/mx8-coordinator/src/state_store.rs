@@ -128,7 +128,16 @@ impl FileCoordinatorStore {
             }
         }
 
-        let tmp = PathBuf::from(format!("{}.tmp", self.path.display()));
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = PathBuf::from(format!(
+            "{}.{}.{}.tmp",
+            self.path.display(),
+            std::process::id(),
+            now_nanos
+        ));
         let bytes = serde_json::to_vec(snapshot)?;
         let mut file = tokio::fs::File::create(&tmp).await?;
         file.write_all(&bytes).await?;

@@ -15,6 +15,8 @@ v1.8.4 foundation: optional lease-file leader election + term fencing (`MX8_COOR
 
 v1.8.5 foundation: optional durable coordinator state snapshots (`MX8_COORD_STATE_STORE_ENABLE=1`, auto-enabled with HA) persist membership, lease index, progress cursors, completed ranges, and counters to a shared file path. New leaders replay this snapshot on startup/term-change before accepting mutating work.
 
+v1.8.6 foundation: deterministic kill-leader failover gates (`./scripts/ha_failover_gate.sh`) validate follower promotion continuity, no-overlap for newly issued leases after promotion, and duplicate progress replay acceptance across failover.
+
 For current incident procedure, see `docs/prod_runbook.md`.
 
 
@@ -79,6 +81,10 @@ Phase 0.5 ships durable restart replay (`C` + `P` lease log lines) and a determi
 Phase 0.6 ships lease-file leader election + term fencing and a deterministic gate (`./scripts/leader_fencing_gate.sh`).
 
 Phase 0.7 ships durable coordinator state snapshot/replay in the running coordinator (`MX8_COORD_STATE_STORE_*`) and persists state on mutating operations + maintenance ticks.
+
+Phase 0.8 ships a deterministic kill-leader gate (`./scripts/ha_failover_gate.sh`) that verifies follower promotion, replayed lease cursor continuity, and continued progress acceptance on the promoted leader.
+
+Phase 0.9 expands the deterministic failover gate to include no-overlap lease issuance checks and duplicate-progress replay checks across the failover boundary.
 
 Phase 1 enables HA behind a feature flag for selected internal jobs and runs the kill-leader gates in nightly CI.
 
