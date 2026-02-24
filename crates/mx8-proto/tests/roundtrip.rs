@@ -13,6 +13,7 @@ fn register_node_request_prost_roundtrip() {
             max_inflight_bytes: 3,
             max_ram_bytes: 4,
         }),
+        resume_from: Vec::new(),
     };
 
     let bytes = msg.encode_to_vec();

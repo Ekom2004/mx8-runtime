@@ -559,6 +559,7 @@ async fn main() -> Result<()> {
                 job_id: args.job_id.clone(),
                 node_id: args.node_id.clone(),
                 caps: caps.clone(),
+                resume_from: Vec::new(),
             })
             .await?
             .into_inner();
@@ -570,6 +571,7 @@ async fn main() -> Result<()> {
                     job_id: args.job_id.clone(),
                     node_id: args.node_id.clone(),
                     caps: caps.clone(),
+                    resume_from: Vec::new(),
                 })
                 .await?
                 .into_inner();
@@ -834,9 +836,10 @@ mod tests {
     use mx8_proto::v0::coordinator_server::{Coordinator, CoordinatorServer};
     use mx8_proto::v0::{
         GetJobSnapshotRequest, GetJobSnapshotResponse, GetManifestRequest, GetManifestResponse,
-        HeartbeatRequest, HeartbeatResponse, Lease, ManifestChunk, RegisterNodeRequest,
-        RegisterNodeResponse, ReportProgressRequest, ReportProgressResponse, RequestLeaseRequest,
-        RequestLeaseResponse, WorkRange,
+        GetResumeCheckpointRequest, GetResumeCheckpointResponse, HeartbeatRequest,
+        HeartbeatResponse, Lease, ManifestChunk, RegisterNodeRequest, RegisterNodeResponse,
+        ReportProgressRequest, ReportProgressResponse, RequestLeaseRequest, RequestLeaseResponse,
+        WorkRange,
     };
     use mx8_runtime::pipeline::{Pipeline, RuntimeCaps};
     use std::pin::Pin;
@@ -930,6 +933,13 @@ mod tests {
             &self,
             _request: Request<GetJobSnapshotRequest>,
         ) -> Result<Response<GetJobSnapshotResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn get_resume_checkpoint(
+            &self,
+            _request: Request<GetResumeCheckpointRequest>,
+        ) -> Result<Response<GetResumeCheckpointResponse>, Status> {
             Err(Status::unimplemented("not used by this test"))
         }
     }

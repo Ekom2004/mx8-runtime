@@ -74,6 +74,21 @@ First find the cap source by checking the loader startup logs for `MX8_MAX_PROCE
 If you need to raise the cap to maintain throughput, raise it in bounded increments and rerun the readiness gates each time.
 
 
+## Resume token rejection
+
+`RegisterNode` fails with errors like `invalid resume_from token`, `resume_from manifest_hash mismatch`, `resume_from epoch mismatch`, `conflicting resume_from token`, or `cannot apply resume checkpoint after lease issuance has started`.
+
+First verify coordinator counters in the TUI. A rising `resume_reject` confirms bad or late resume tokens. `resume_ok` should increase only when the checkpoint is accepted.
+
+Then enforce one token source for the whole job. Every rank must load the exact same checkpoint artifact and pass the same `resume_from` bytes at loader construction time.
+
+If the error says leases were already issued, stop all ranks, restart the coordinator for a clean run, and relaunch all ranks with `resume_from` set before any data requests.
+
+If the error says manifest/epoch mismatch, ensure the restart uses the same pinned dataset (`@sha256:<manifest_hash>`) and epoch as the checkpoint-producing run.
+
+If rejections continue, relaunch without `resume_from` and treat it as a fresh epoch run. Preserve the failed token and coordinator log for incident review.
+
+
 ## Coordinator failure
 
 In v1.8, the coordinator is a single process per job with no automatic failover. If it dies, the control plane pauses until it is restarted.

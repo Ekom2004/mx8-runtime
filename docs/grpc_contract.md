@@ -14,9 +14,9 @@ The coordinator speaks gRPC over HTTP/2. It binds to `0.0.0.0:50051` by default,
 
 ## RPCs
 
-The `Coordinator` service exposes seven RPCs.
+The `Coordinator` service exposes eight RPCs.
 
-`RegisterNode` registers or re-registers a node. It is idempotent for the same `job_id` and `node_id` combination and updates node caps on re-register. It requires non-empty IDs and a `caps` payload, and it respects the membership barrier and frozen membership rules.
+`RegisterNode` registers or re-registers a node. It is idempotent for the same `job_id` and `node_id` combination and updates node caps on re-register. It requires non-empty IDs and a `caps` payload, and it respects the membership barrier and frozen membership rules. `resume_from` is an optional distributed resume token; when provided it is validated and applied before lease issuance.
 
 `Heartbeat` reports node liveness and stats. It is idempotent with last-write-wins semantics. The node must be registered before sending heartbeats.
 
@@ -27,6 +27,8 @@ The `Coordinator` service exposes seven RPCs.
 `GetManifest` fetches manifest bytes by hash as a single unary response. `GetManifestStream` fetches the same data as a sequence of ordered 1MB chunks. Both are read-only and idempotent. If an agent receives `UNIMPLEMENTED` on `GetManifestStream`, it falls back to the unary `GetManifest` call automatically.
 
 `GetJobSnapshot` returns a read-only cluster snapshot for operators and tooling. It includes cluster liveness state, lease counts, per-node heartbeat and stats, and coordinator event counters.
+
+`GetResumeCheckpoint` returns an opaque distributed checkpoint token representing globally committed lease ranges for the job.
 
 
 ## Error codes
@@ -51,6 +53,18 @@ Lease ranges are half-open intervals `[start_id, end_id)`. When `RequestLeaseRes
 The cursor advances only after delivery to the consumer — not after fetch or decode. Lease completion is triggered when `cursor >= end_id`. The coordinator removes the lease and marks that range done.
 
 The manifest stream emits ordered chunks with a `schema_version` field. The client concatenates them to reconstruct the canonical manifest bytes. Schema mismatches or truncated streams are fail-closed.
+
+Distributed resume token contract:
+
+`GetResumeCheckpoint` returns an opaque token that encodes `manifest_hash`, `epoch`, and completed lease ranges. The wire format is coordinator-owned and may change between major versions.
+
+`RegisterNode.resume_from` is only valid before the coordinator has issued any lease for that run. Late tokens are rejected with `FAILED_PRECONDITION`.
+
+If multiple nodes send `resume_from`, all tokens must be byte-equivalent in content (same checkpoint fingerprint). Conflicting tokens are rejected with `FAILED_PRECONDITION`.
+
+A token is rejected when `manifest_hash` or `epoch` does not match the active run, when the token is malformed, or when a token range does not map to pending work.
+
+`GetJobSnapshot.counters` exposes resume observability: `resume_checkpoint_applied_total`, `resume_checkpoint_rejected_total`, and `resume_ranges_applied_total`.
 
 
 ## Retry guidance

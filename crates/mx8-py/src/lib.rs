@@ -28,6 +28,7 @@ use mx8_manifest_store::LockOwner;
 use mx8_manifest_store::ManifestStore;
 use mx8_proto::v0::coordinator_client::CoordinatorClient;
 use mx8_proto::v0::GetManifestRequest;
+use mx8_proto::v0::GetResumeCheckpointRequest;
 use mx8_proto::v0::HeartbeatRequest;
 use mx8_proto::v0::NodeCaps;
 use mx8_proto::v0::NodeStats;
@@ -68,6 +69,9 @@ type TorchBatch4<'py> = (
 const VIDEO_LAYOUT: &str = "thwc";
 const VIDEO_DTYPE: &str = "u8";
 const VIDEO_COLORSPACE: &str = "rgb24";
+const DATA_CHECKPOINT_MAGIC: &str = "mx8_checkpoint_v1";
+const DATA_CHECKPOINT_KIND: &str = "data_loader";
+const DATA_CHECKPOINT_EPOCH: u32 = 0;
 
 #[derive(Debug, Clone, Copy)]
 enum VideoDecodeBackend {
@@ -132,6 +136,127 @@ struct DataLoader {
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     autotune_task: Option<tokio::task::JoinHandle<()>>,
     rt: tokio::runtime::Runtime,
+    checkpoint_supported: bool,
+    checkpoint_schema_version: u32,
+    checkpoint_epoch: u32,
+    checkpoint_next_sample_id: u64,
+    checkpoint_end_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct DataLoaderCheckpointToken {
+    manifest_hash: String,
+    schema_version: u32,
+    epoch: u32,
+    next_sample_id: u64,
+    end_id: u64,
+}
+
+impl DataLoaderCheckpointToken {
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "{DATA_CHECKPOINT_MAGIC}\nkind={DATA_CHECKPOINT_KIND}\nmanifest_hash={}\nschema_version={}\nepoch={}\nnext_sample_id={}\nend_id={}\n",
+            self.manifest_hash,
+            self.schema_version,
+            self.epoch,
+            self.next_sample_id,
+            self.end_id
+        )
+        .into_bytes()
+    }
+
+    fn decode(raw: &[u8]) -> Result<Self> {
+        let text = std::str::from_utf8(raw)?;
+        let mut lines = text.lines();
+        let magic = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty checkpoint token"))?;
+        anyhow::ensure!(
+            magic == DATA_CHECKPOINT_MAGIC,
+            "unsupported checkpoint token format"
+        );
+
+        let mut kv = HashMap::<String, String>::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                anyhow::bail!("invalid checkpoint token line: {line}");
+            };
+            kv.insert(k.trim().to_string(), v.trim().to_string());
+        }
+        let kind = kv
+            .get("kind")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing kind"))?;
+        anyhow::ensure!(
+            kind == DATA_CHECKPOINT_KIND,
+            "unsupported checkpoint kind {kind}"
+        );
+
+        let manifest_hash = kv
+            .get("manifest_hash")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing manifest_hash"))?
+            .to_string();
+        let schema_version = kv
+            .get("schema_version")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing schema_version"))?
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("invalid checkpoint schema_version"))?;
+        let epoch = kv
+            .get("epoch")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing epoch"))?
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("invalid checkpoint epoch"))?;
+        let next_sample_id = kv
+            .get("next_sample_id")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing next_sample_id"))?
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid checkpoint next_sample_id"))?;
+        let end_id = kv
+            .get("end_id")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing end_id"))?
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid checkpoint end_id"))?;
+        anyhow::ensure!(
+            next_sample_id <= end_id,
+            "invalid checkpoint token range (next_sample_id > end_id)"
+        );
+        Ok(Self {
+            manifest_hash,
+            schema_version,
+            epoch,
+            next_sample_id,
+            end_id,
+        })
+    }
+}
+
+fn manifest_schema_version_and_sample_count(manifest_bytes: &[u8]) -> Result<(u32, u64)> {
+    let manifest = std::str::from_utf8(manifest_bytes)?;
+    let mut lines = manifest.lines();
+    let first = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("manifest header missing schema_version"))?;
+    let Some((k, v)) = first.split_once('=') else {
+        anyhow::bail!("manifest header must be schema_version=<n>");
+    };
+    anyhow::ensure!(
+        k.trim() == "schema_version",
+        "manifest header must be schema_version=<n>"
+    );
+    let schema_version = v
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid schema_version"))?;
+
+    let mut sample_count = 0u64;
+    for line in lines {
+        if !line.trim().is_empty() {
+            sample_count = sample_count.saturating_add(1);
+        }
+    }
+    Ok((schema_version, sample_count))
 }
 
 #[pyclass]
@@ -969,6 +1094,7 @@ impl DataLoader {
         max_ram_bytes=None,
         start_id=None,
         end_id=None,
+        resume_from=None,
         node_id=None,
         profile=None,
         autotune=None,
@@ -988,11 +1114,17 @@ impl DataLoader {
         max_ram_bytes: Option<u64>,
         start_id: Option<u64>,
         end_id: Option<u64>,
+        resume_from: Option<Vec<u8>>,
         node_id: Option<String>,
         profile: Option<String>,
         autotune: Option<bool>,
     ) -> PyResult<Self> {
         let parsed = mx8_core::dataset_link::DatasetLink::parse(&dataset_link)
+            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        let resume_token = resume_from
+            .as_deref()
+            .map(DataLoaderCheckpointToken::decode)
+            .transpose()
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
         let dataset_base = match &parsed {
             mx8_core::dataset_link::DatasetLink::Plain(b) => b.clone(),
@@ -1101,6 +1233,11 @@ impl DataLoader {
         };
 
         if should_use_zero_manifest_scan(&parsed, &dataset_base) {
+            if resume_token.is_some() {
+                return Err(PyValueError::new_err(
+                    "resume_from is not supported for zero-manifest scan datasets; pack/pin first",
+                ));
+            }
             let reservoir_size = env_usize("MX8_ZERO_MANIFEST_RESERVOIR", 100_000).max(1);
             match rt.block_on(async {
                 pipeline
@@ -1135,6 +1272,11 @@ impl DataLoader {
                         task: Some(task),
                         autotune_task,
                         rt,
+                        checkpoint_supported: false,
+                        checkpoint_schema_version: mx8_core::types::MANIFEST_SCHEMA_VERSION,
+                        checkpoint_epoch: DATA_CHECKPOINT_EPOCH,
+                        checkpoint_next_sample_id: 0,
+                        checkpoint_end_id: None,
                     });
                 }
                 Err(err) => {
@@ -1186,23 +1328,75 @@ impl DataLoader {
             snapshot.manifest_bytes_materialized = true;
         }
 
+        let (schema_version, total_samples) =
+            manifest_schema_version_and_sample_count(&snapshot.manifest_bytes)
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        if schema_version != mx8_core::types::MANIFEST_SCHEMA_VERSION {
+            return Err(PyValueError::new_err(format!(
+                "unsupported schema_version {schema_version}"
+            )));
+        }
+
+        if start_id.is_some() ^ end_id.is_some() {
+            return Err(PyValueError::new_err(
+                "start_id and end_id must be set together",
+            ));
+        }
+        let requested_start = start_id.unwrap_or(0);
+        let requested_end = end_id.unwrap_or(total_samples);
+        if requested_start > requested_end {
+            return Err(PyValueError::new_err("invalid range (start_id > end_id)"));
+        }
+        if requested_end > total_samples {
+            return Err(PyValueError::new_err("end_id out of range"));
+        }
+
+        let mut effective_start = requested_start;
+        if let Some(token) = &resume_token {
+            if token.schema_version != schema_version {
+                return Err(PyValueError::new_err(format!(
+                    "resume_from schema_version mismatch: token={} current={}",
+                    token.schema_version, schema_version
+                )));
+            }
+            if token.epoch != DATA_CHECKPOINT_EPOCH {
+                return Err(PyValueError::new_err(format!(
+                    "resume_from epoch mismatch: token={} current={}",
+                    token.epoch, DATA_CHECKPOINT_EPOCH
+                )));
+            }
+            if token.manifest_hash != snapshot.manifest_hash.0 {
+                return Err(PyValueError::new_err(format!(
+                    "resume_from manifest_hash mismatch: token={} current={}",
+                    token.manifest_hash, snapshot.manifest_hash.0
+                )));
+            }
+            if token.end_id != requested_end {
+                return Err(PyValueError::new_err(format!(
+                    "resume_from end_id mismatch: token={} current={}",
+                    token.end_id, requested_end
+                )));
+            }
+            if token.next_sample_id < requested_start || token.next_sample_id > requested_end {
+                return Err(PyValueError::new_err(format!(
+                    "resume_from next_sample_id {} out of requested range [{}, {})",
+                    token.next_sample_id, requested_start, requested_end
+                )));
+            }
+            effective_start = token.next_sample_id;
+        }
+
         let pipeline_for_stream = pipeline.clone();
         let manifest_bytes = snapshot.manifest_bytes;
         let (rx, task) = rt
             .block_on(async move {
-                match (start_id, end_id) {
-                    (Some(s), Some(e)) => {
-                        pipeline_for_stream
-                            .spawn_manifest_bytes_range_stream(manifest_bytes, s, e)
-                            .await
-                    }
-                    (None, None) => {
-                        pipeline_for_stream
-                            .spawn_manifest_bytes_stream(manifest_bytes)
-                            .await
-                    }
-                    _ => anyhow::bail!("start_id and end_id must be set together"),
-                }
+                pipeline_for_stream
+                    .spawn_manifest_bytes_range_stream(
+                        manifest_bytes,
+                        effective_start,
+                        requested_end,
+                    )
+                    .await
             })
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
@@ -1220,6 +1414,11 @@ impl DataLoader {
             task: Some(task),
             autotune_task,
             rt,
+            checkpoint_supported: true,
+            checkpoint_schema_version: schema_version,
+            checkpoint_epoch: DATA_CHECKPOINT_EPOCH,
+            checkpoint_next_sample_id: effective_start,
+            checkpoint_end_id: Some(requested_end),
         })
     }
 
@@ -1306,6 +1505,7 @@ impl DataLoader {
         let lease = py.allow_threads(|| self.rt.block_on(async { self.rx.recv().await }));
         let out = match lease {
             Some(lease) => {
+                self.on_batch_delivered(&lease);
                 let out = Py::new(py, PyBatch { lease })?;
                 Ok(out.into_bound(py).into_any())
             }
@@ -1325,6 +1525,25 @@ impl DataLoader {
         };
         self.autotune.on_wait(wait_started.elapsed());
         out
+    }
+
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        if !self.checkpoint_supported {
+            return Err(PyRuntimeError::new_err(
+                "checkpoint is unavailable for zero-manifest scan loaders; use packed/pinned datasets",
+            ));
+        }
+        let end_id = self
+            .checkpoint_end_id
+            .ok_or_else(|| PyRuntimeError::new_err("checkpoint end_id unavailable"))?;
+        let token = DataLoaderCheckpointToken {
+            manifest_hash: self.manifest_hash.clone(),
+            schema_version: self.checkpoint_schema_version,
+            epoch: self.checkpoint_epoch,
+            next_sample_id: self.checkpoint_next_sample_id.min(end_id),
+            end_id,
+        };
+        Ok(PyBytes::new_bound(py, &token.encode()))
     }
 
     fn close(&mut self) {
@@ -1480,6 +1699,18 @@ impl MixedDataLoader {
 }
 
 impl DataLoader {
+    fn on_batch_delivered(&mut self, lease: &BatchLease) {
+        if !self.checkpoint_supported {
+            return;
+        }
+        if let Some(max_sample_id) = lease.batch.sample_ids.iter().copied().max() {
+            let next = max_sample_id.saturating_add(1);
+            if next > self.checkpoint_next_sample_id {
+                self.checkpoint_next_sample_id = next;
+            }
+        }
+    }
+
     fn apply_runtime_overrides(
         &mut self,
         prefetch_batches: Option<usize>,
@@ -2977,6 +3208,7 @@ impl ImageLoader {
         max_ram_bytes=None,
         start_id=None,
         end_id=None,
+        resume_from=None,
         node_id=None,
         profile=None,
         autotune=None,
@@ -2998,6 +3230,7 @@ impl ImageLoader {
         max_ram_bytes: Option<u64>,
         start_id: Option<u64>,
         end_id: Option<u64>,
+        resume_from: Option<Vec<u8>>,
         node_id: Option<String>,
         profile: Option<String>,
         autotune: Option<bool>,
@@ -3018,6 +3251,7 @@ impl ImageLoader {
             max_ram_bytes,
             start_id,
             end_id,
+            resume_from,
             node_id,
             profile,
             autotune,
@@ -3079,6 +3313,10 @@ impl ImageLoader {
         self.loader.stats(py)
     }
 
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.loader.checkpoint(py)
+    }
+
     fn print_stats(&self, py: Python<'_>) -> PyResult<()> {
         self.loader.print_stats(py)
     }
@@ -3108,6 +3346,7 @@ impl ImageLoader {
             };
         };
 
+        self.loader.on_batch_delivered(&lease);
         match self.decode_backend {
             DecodeBackend::Rust => self.next_rust_decode(py, lease),
             DecodeBackend::Python => self.next_python_decode(py, lease),
@@ -3579,6 +3818,7 @@ fn maybe_autopack(py: Python<'_>, s3_url: &str, shard_mb: u64) -> PyResult<()> {
     max_batch_bytes=None,
     start_id=None,
     end_id=None,
+    resume_from=None,
     node_id=None,
     max_ram_gb=None,
     profile=None,
@@ -3603,6 +3843,7 @@ fn load(
     max_batch_bytes: Option<u64>,
     start_id: Option<u64>,
     end_id: Option<u64>,
+    resume_from: Option<Vec<u8>>,
     node_id: Option<String>,
     max_ram_gb: Option<f64>,
     profile: Option<String>,
@@ -3732,6 +3973,7 @@ fn load(
         effective_max_process_rss_bytes,
         start_id,
         end_id,
+        resume_from,
         node_id,
         profile.clone(),
         autotune,
@@ -3754,6 +3996,7 @@ fn load(
     max_batch_bytes=None,
     start_id=None,
     end_id=None,
+    resume_from=None,
     node_id=None,
     max_ram_gb=None,
     profile=None,
@@ -3780,6 +4023,7 @@ fn py_image(
     max_batch_bytes: Option<u64>,
     start_id: Option<u64>,
     end_id: Option<u64>,
+    resume_from: Option<Vec<u8>>,
     node_id: Option<String>,
     max_ram_gb: Option<f64>,
     profile: Option<String>,
@@ -3880,6 +4124,7 @@ fn py_image(
         effective_max_process_rss_bytes,
         start_id,
         end_id,
+        resume_from,
         node_id,
         profile,
         autotune,
@@ -5693,6 +5938,9 @@ async fn run_lease_and_stream_batches(
 
 #[pyclass]
 struct DistributedDataLoader {
+    coord_url: String,
+    job_id: String,
+    grpc_max_message_bytes: usize,
     manifest_hash: String,
     assigned_rank: u32,
     world_size: u32,
@@ -5728,6 +5976,7 @@ impl DistributedDataLoader {
         runtime=None,
         progress_interval_ms=500,
         grpc_max_message_bytes=DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+        resume_from=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -5749,6 +5998,7 @@ impl DistributedDataLoader {
         runtime: Option<Py<RuntimeConfig>>,
         progress_interval_ms: u64,
         grpc_max_message_bytes: usize,
+        resume_from: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
         let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
@@ -5841,6 +6091,7 @@ impl DistributedDataLoader {
                         job_id: job_id.clone(),
                         node_id: node_id.clone(),
                         caps: caps.clone(),
+                        resume_from: resume_from.clone().unwrap_or_default(),
                     })
                     .await?
                     .into_inner();
@@ -5852,6 +6103,7 @@ impl DistributedDataLoader {
                             job_id: job_id.clone(),
                             node_id: node_id.clone(),
                             caps: caps.clone(),
+                            resume_from: resume_from.clone().unwrap_or_default(),
                         })
                         .await?
                         .into_inner();
@@ -5967,6 +6219,8 @@ impl DistributedDataLoader {
         let manifest_bytes = Arc::new(manifest_bytes);
         let autotune_for_requests = autotune.clone();
         let pipeline_for_requests = pipeline.clone();
+        let job_id_for_task = job_id.clone();
+        let node_id_for_task = node_id.clone();
         let task = rt.spawn(async move {
             let mut next_request_at = tokio::time::Instant::now();
             loop {
@@ -5985,8 +6239,8 @@ impl DistributedDataLoader {
                     .max_encoding_message_size(grpc_max_message_bytes);
                 let resp = client
                     .request_lease(RequestLeaseRequest {
-                        job_id: job_id.clone(),
-                        node_id: node_id.clone(),
+                        job_id: job_id_for_task.clone(),
+                        node_id: node_id_for_task.clone(),
                         want,
                     })
                     .await;
@@ -6014,8 +6268,8 @@ impl DistributedDataLoader {
                         grpc_max_message_bytes,
                         pipeline_for_requests.clone(),
                         manifest_bytes.clone(),
-                        job_id.clone(),
-                        node_id.clone(),
+                        job_id_for_task.clone(),
+                        node_id_for_task.clone(),
                         core_lease,
                         tx.clone(),
                         progress_interval_ms,
@@ -6026,6 +6280,9 @@ impl DistributedDataLoader {
         });
 
         Ok(Self {
+            coord_url,
+            job_id,
+            grpc_max_message_bytes,
             manifest_hash,
             assigned_rank,
             world_size,
@@ -6088,6 +6345,29 @@ impl DistributedDataLoader {
             self.autotune.cooldown_ticks.load(Ordering::Relaxed),
         )?;
         Ok(out.into_any())
+    }
+
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py.allow_threads(|| {
+            self.rt.block_on(async {
+                let channel = Channel::from_shared(self.coord_url.clone())?
+                    .connect()
+                    .await?;
+                let mut client = CoordinatorClient::new(channel)
+                    .max_decoding_message_size(self.grpc_max_message_bytes)
+                    .max_encoding_message_size(self.grpc_max_message_bytes);
+                let resp = client
+                    .get_resume_checkpoint(GetResumeCheckpointRequest {
+                        job_id: self.job_id.clone(),
+                    })
+                    .await?;
+                Ok::<Vec<u8>, anyhow::Error>(resp.into_inner().checkpoint)
+            })
+        });
+        match bytes {
+            Ok(bytes) => Ok(PyBytes::new_bound(py, &bytes)),
+            Err(err) => Err(PyRuntimeError::new_err(format!("{err}"))),
+        }
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

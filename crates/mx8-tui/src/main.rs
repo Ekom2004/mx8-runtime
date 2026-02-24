@@ -467,7 +467,7 @@ fn render(stdout: &mut Terminal<CrosstermBackend<Stdout>>, app: &App) -> Result<
                     ));
                 }
                 lines.push(format!(
-                    "counters: register={} hb={} lease_req={} granted={} expired={} requeued={} progress={}",
+                    "counters: register={} hb={} lease_req={} granted={} expired={} requeued={} progress={} resume_ok={} resume_reject={} resume_ranges={}",
                     counters.map(|c| c.register_total).unwrap_or(0),
                     counters.map(|c| c.heartbeat_total).unwrap_or(0),
                     counters.map(|c| c.request_lease_total).unwrap_or(0),
@@ -475,6 +475,13 @@ fn render(stdout: &mut Terminal<CrosstermBackend<Stdout>>, app: &App) -> Result<
                     counters.map(|c| c.leases_expired_total).unwrap_or(0),
                     counters.map(|c| c.ranges_requeued_total).unwrap_or(0),
                     counters.map(|c| c.progress_total).unwrap_or(0),
+                    counters
+                        .map(|c| c.resume_checkpoint_applied_total)
+                        .unwrap_or(0),
+                    counters
+                        .map(|c| c.resume_checkpoint_rejected_total)
+                        .unwrap_or(0),
+                    counters.map(|c| c.resume_ranges_applied_total).unwrap_or(0),
                 ));
                 lines.push(format!(
                     "live_lease_ids: {}",

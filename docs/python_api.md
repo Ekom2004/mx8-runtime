@@ -54,6 +54,8 @@ Arguments:
 
 `start_id` and `end_id` must be set together if you want to load a specific sample ID range.
 
+`resume_from` (default `None`) accepts an opaque checkpoint token from `loader.checkpoint()`. When set, MX8 resumes from the token cursor within the requested range. Validation is strict: `manifest_hash`, `schema_version`, `epoch`, and `end_id` must match the current run.
+
 `node_id` sets the node identity used in proof logs. Auto-generated from hostname + PID if not set.
 
 `autopack` (default `False`) — if `True` and `dataset_link` is a bare S3 prefix with no manifest, MX8 runs a full pack in-place before starting the loader. The packed shards and manifest are written to the same prefix. Subsequent runs skip the pack step automatically. Use `autopack_shard_mb` (default `512`) to control shard size.
@@ -85,6 +87,25 @@ loader = mx8.load(
 ```
 
 Each batch exposes `sample_ids`, `offsets`, `payload`, and `label_ids`. Call `batch.to_torch()` to get `(payload_u8, offsets_i64, sample_ids_i64)` as tensors, or `batch.to_torch_with_labels()` to include labels.
+
+Checkpoint and resume example:
+
+```python
+import mx8
+import torch
+
+loader = mx8.load("s3://bucket/train@sha256:...", batch_size_samples=64)
+state = {"model": model.state_dict(), "mx8": loader.checkpoint()}
+torch.save(state, "ckpt.pt")
+
+ckpt = torch.load("ckpt.pt")
+model.load_state_dict(ckpt["model"])
+loader = mx8.load(
+    "s3://bucket/train@sha256:...",
+    batch_size_samples=64,
+    resume_from=ckpt["mx8"],
+)
+```
 
 
 ## Multi-epoch training
@@ -344,9 +365,38 @@ loader = mx8.DistributedDataLoader(
 
 `want` sets the max number of concurrent leases this node will request. `progress_interval_ms` controls how often progress is reported to the coordinator (default 500ms). `grpc_max_message_bytes` caps the gRPC message size for manifest and control-path traffic (default 64MB).
 
+`resume_from` (default `None`) accepts an opaque distributed checkpoint token from `DistributedDataLoader.checkpoint()`. The token is validated and applied by the coordinator before lease issuance. Every rank should pass the same token on restart.
+
+Distributed resume rules:
+
+`resume_from` must be produced by `DistributedDataLoader.checkpoint()` from the same `manifest_hash` and `epoch`.
+
+All ranks must pass the same token content. Conflicting tokens are rejected.
+
+`resume_from` is a startup input only. If the run has already issued leases, the coordinator rejects late resume tokens.
+
+The token is intentionally opaque and versioned by MX8. Treat it as a byte blob and store it alongside the model checkpoint.
+
 Distributed autotune adjusts `want`, `prefetch_batches`, and `max_queue_batches` within the chosen profile rails. Pass `profile` and `autotune=True|False` to control it.
 
 Training note: v1.8 supports distributed data delivery but is non-elastic. If a DDP rank dies, the job terminates. Lease reassignment is for inference and ETL correctness, not elastic training continuation.
+
+Distributed checkpoint example:
+
+```python
+loader = mx8.DistributedDataLoader(coord_url=coord.url, job_id="train", node_id=f"rank{rank}")
+token = loader.checkpoint()
+# save token with model checkpoint
+
+loader = mx8.DistributedDataLoader(
+    coord_url=coord.url,
+    job_id="train",
+    node_id=f"rank{rank}",
+    resume_from=token,
+)
+```
+
+Gate command: `./scripts/distributed_resume_gate.sh`.
 
 
 ## Mix API

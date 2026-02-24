@@ -4,6 +4,7 @@
 mod lease_log;
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -27,6 +28,8 @@ use mx8_snapshot::{SnapshotResolver, SnapshotResolverConfig};
 
 const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MANIFEST_CHUNK_BYTES: usize = 1024 * 1024;
+const DIST_CHECKPOINT_MAGIC: &str = "mx8_checkpoint_v1";
+const DIST_CHECKPOINT_KIND: &str = "distributed_loader";
 
 #[derive(Debug, Parser)]
 #[command(name = "mx8-coordinator")]
@@ -160,6 +163,127 @@ fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> 
     Ok(n)
 }
 
+#[derive(Debug, Clone)]
+struct DistributedResumeToken {
+    manifest_hash: String,
+    epoch: u32,
+    completed_ranges: Vec<(u64, u64)>,
+}
+
+impl DistributedResumeToken {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = format!(
+            "{DIST_CHECKPOINT_MAGIC}\nkind={DIST_CHECKPOINT_KIND}\nmanifest_hash={}\nepoch={}\nrange_count={}\n",
+            self.manifest_hash,
+            self.epoch,
+            self.completed_ranges.len()
+        );
+        for (start_id, end_id) in &self.completed_ranges {
+            out.push_str(&format!("C {start_id} {end_id}\n"));
+        }
+        out.into_bytes()
+    }
+
+    fn decode(raw: &[u8]) -> anyhow::Result<Self> {
+        let text = std::str::from_utf8(raw)?;
+        let mut lines = text.lines();
+        let magic = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty resume token"))?;
+        anyhow::ensure!(
+            magic == DIST_CHECKPOINT_MAGIC,
+            "unsupported resume token format"
+        );
+
+        let mut manifest_hash: Option<String> = None;
+        let mut epoch: Option<u32> = None;
+        let mut declared_range_count: Option<usize> = None;
+        let mut seen_kind = false;
+        let mut ranges = std::collections::BTreeSet::<(u64, u64)>::new();
+
+        for raw_line in lines {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("C ") {
+                let mut parts = rest.split_whitespace();
+                let start_id = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("resume token range missing start_id"))?
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("invalid resume token start_id"))?;
+                let end_id = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("resume token range missing end_id"))?
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("invalid resume token end_id"))?;
+                anyhow::ensure!(
+                    start_id < end_id,
+                    "invalid resume token range [{start_id}, {end_id})"
+                );
+                ranges.insert((start_id, end_id));
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                anyhow::bail!("invalid resume token line: {line}");
+            };
+            match k.trim() {
+                "kind" => {
+                    anyhow::ensure!(
+                        v.trim() == DIST_CHECKPOINT_KIND,
+                        "unsupported resume token kind {}",
+                        v.trim()
+                    );
+                    seen_kind = true;
+                }
+                "manifest_hash" => manifest_hash = Some(v.trim().to_string()),
+                "epoch" => {
+                    epoch = Some(
+                        v.trim()
+                            .parse::<u32>()
+                            .map_err(|_| anyhow::anyhow!("invalid resume token epoch"))?,
+                    )
+                }
+                "range_count" => {
+                    declared_range_count = Some(
+                        v.trim()
+                            .parse::<usize>()
+                            .map_err(|_| anyhow::anyhow!("invalid resume token range_count"))?,
+                    )
+                }
+                _ => anyhow::bail!("unknown resume token field {}", k.trim()),
+            }
+        }
+
+        anyhow::ensure!(seen_kind, "resume token missing kind");
+        let manifest_hash =
+            manifest_hash.ok_or_else(|| anyhow::anyhow!("resume token missing manifest_hash"))?;
+        let epoch = epoch.ok_or_else(|| anyhow::anyhow!("resume token missing epoch"))?;
+        if let Some(n) = declared_range_count {
+            anyhow::ensure!(
+                n == ranges.len(),
+                "resume token range_count mismatch: declared {} actual {}",
+                n,
+                ranges.len()
+            );
+        }
+        Ok(Self {
+            manifest_hash,
+            epoch,
+            completed_ranges: ranges.into_iter().collect(),
+        })
+    }
+
+    fn fingerprint(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.manifest_hash.hash(&mut h);
+        self.epoch.hash(&mut h);
+        self.completed_ranges.hash(&mut h);
+        h.finish()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct NodeEntry {
     caps: Option<NodeCaps>,
@@ -187,6 +311,10 @@ struct CoordinatorState {
     departed_nodes: std::collections::BTreeSet<String>,
     leases: std::collections::BTreeMap<String, Lease>,
     progress: std::collections::BTreeMap<(String, String), u64>,
+    /// Completed ranges from lease progress and recovered WAL state.
+    completed_ranges: HashSet<(u64, u64)>,
+    /// Fingerprint of an applied distributed resume token, if any.
+    resume_checkpoint_fingerprint: Option<u64>,
     next_lease_id: u64,
     drained_emitted: bool,
 }
@@ -200,6 +328,9 @@ struct CoordinatorMetrics {
     leases_expired_total: Counter,
     ranges_requeued_total: Counter,
     progress_total: Counter,
+    resume_checkpoint_applied_total: Counter,
+    resume_checkpoint_rejected_total: Counter,
+    resume_ranges_applied_total: Counter,
     active_leases: Gauge,
     registered_nodes: Gauge,
 }
@@ -285,6 +416,9 @@ impl CoordinatorSvc {
             leases_expired_total: self.metrics.leases_expired_total.get(),
             ranges_requeued_total: self.metrics.ranges_requeued_total.get(),
             progress_total: self.metrics.progress_total.get(),
+            resume_checkpoint_applied_total: self.metrics.resume_checkpoint_applied_total.get(),
+            resume_checkpoint_rejected_total: self.metrics.resume_checkpoint_rejected_total.get(),
+            resume_ranges_applied_total: self.metrics.resume_ranges_applied_total.get(),
         });
         let capacity = state
             .frozen_membership
@@ -447,6 +581,137 @@ impl CoordinatorSvc {
         None
     }
 
+    fn remove_exact_range(
+        q: &mut std::collections::VecDeque<WorkRange>,
+        start_id: u64,
+        end_id: u64,
+    ) -> bool {
+        let mut removed = false;
+        q.retain(|r| {
+            let is_match = r.start_id == start_id && r.end_id == end_id;
+            if is_match {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn apply_resume_token_locked(
+        &self,
+        state: &mut CoordinatorState,
+        raw_token: &[u8],
+    ) -> Result<(), Status> {
+        let rejected = |metrics: &CoordinatorMetrics, status: Status| -> Result<(), Status> {
+            metrics.resume_checkpoint_rejected_total.inc();
+            Err(status)
+        };
+        if raw_token.is_empty() {
+            return Ok(());
+        }
+        if state.next_lease_id > 0 || !state.leases.is_empty() {
+            return rejected(
+                self.metrics.as_ref(),
+                Status::failed_precondition(
+                    "cannot apply resume checkpoint after lease issuance has started",
+                ),
+            );
+        }
+        let token = DistributedResumeToken::decode(raw_token).map_err(|e| {
+            self.metrics.resume_checkpoint_rejected_total.inc();
+            Status::invalid_argument(format!("invalid resume_from token: {e}"))
+        })?;
+        if token.manifest_hash != self.manifest_hash {
+            return rejected(
+                self.metrics.as_ref(),
+                Status::failed_precondition(format!(
+                    "resume_from manifest_hash mismatch: token={} current={}",
+                    token.manifest_hash, self.manifest_hash
+                )),
+            );
+        }
+        if token.epoch != self.epoch {
+            return rejected(
+                self.metrics.as_ref(),
+                Status::failed_precondition(format!(
+                    "resume_from epoch mismatch: token={} current={}",
+                    token.epoch, self.epoch
+                )),
+            );
+        }
+
+        let fingerprint = token.fingerprint();
+        if let Some(existing) = state.resume_checkpoint_fingerprint {
+            if existing != fingerprint {
+                return rejected(
+                    self.metrics.as_ref(),
+                    Status::failed_precondition(
+                        "conflicting resume_from token submitted by different node",
+                    ),
+                );
+            }
+            return Ok(());
+        }
+
+        let mut applied = 0u64;
+        for (start_id, end_id) in token.completed_ranges {
+            if state.completed_ranges.contains(&(start_id, end_id)) {
+                continue;
+            }
+            let mut removed =
+                Self::remove_exact_range(&mut state.available_ranges, start_id, end_id);
+            if !removed {
+                if let Some(rank_ranges) = state.rank_ranges.as_mut() {
+                    for q in rank_ranges {
+                        if Self::remove_exact_range(q, start_id, end_id) {
+                            removed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !removed {
+                return rejected(
+                    self.metrics.as_ref(),
+                    Status::failed_precondition(format!(
+                        "resume_from range [{start_id}, {end_id}) not found in pending work"
+                    )),
+                );
+            }
+            state.completed_ranges.insert((start_id, end_id));
+            applied = applied.saturating_add(1);
+        }
+
+        state.resume_checkpoint_fingerprint = Some(fingerprint);
+        self.metrics.resume_checkpoint_applied_total.inc();
+        self.metrics.resume_ranges_applied_total.inc_by(applied);
+        tracing::info!(
+            target: "mx8_proof",
+            event = "resume_checkpoint_applied",
+            manifest_hash = %self.manifest_hash,
+            epoch = self.epoch,
+            applied_ranges = applied,
+            total_completed_ranges = state.completed_ranges.len() as u64,
+            "applied distributed resume checkpoint"
+        );
+        Ok(())
+    }
+
+    async fn build_resume_checkpoint(&self) -> Vec<u8> {
+        let state = self.state.read().await;
+        let mut completed = state.completed_ranges.iter().copied().collect::<Vec<_>>();
+        completed.sort_unstable();
+        let token = DistributedResumeToken {
+            manifest_hash: self.manifest_hash.clone(),
+            epoch: self.epoch,
+            completed_ranges: completed,
+        };
+        token.encode()
+    }
+
     fn unix_time_ms() -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -471,6 +736,9 @@ impl CoordinatorSvc {
             leases_expired_total = self.metrics.leases_expired_total.get(),
             ranges_requeued_total = self.metrics.ranges_requeued_total.get(),
             progress_total = self.metrics.progress_total.get(),
+            resume_checkpoint_applied_total = self.metrics.resume_checkpoint_applied_total.get(),
+            resume_checkpoint_rejected_total = self.metrics.resume_checkpoint_rejected_total.get(),
+            resume_ranges_applied_total = self.metrics.resume_ranges_applied_total.get(),
             active_leases = self.metrics.active_leases.get(),
             registered_nodes = self.metrics.registered_nodes.get(),
             world_size = self.world_size,
@@ -759,6 +1027,9 @@ impl Coordinator for CoordinatorSvc {
         let (assigned_rank, active_nodes, capacity, became_ready) = {
             let mut state = self.state.write().await;
             let now_ms = Self::unix_time_ms();
+            if !req.resume_from.is_empty() {
+                self.apply_resume_token_locked(&mut state, &req.resume_from)?;
+            }
 
             if state.frozen_membership.is_some() {
                 // ── Post-freeze path ──────────────────────────────────────────────────────
@@ -1172,6 +1443,13 @@ impl Coordinator for CoordinatorSvc {
         if completed {
             let removed = state.leases.remove(&req.lease_id);
             state.progress.retain(|(_, id), _| id != &req.lease_id);
+            if let Some(removed_lease) = &removed {
+                if let Some(range) = &removed_lease.range {
+                    state
+                        .completed_ranges
+                        .insert((range.start_id, range.end_id));
+                }
+            }
             // Drop the write lock BEFORE async operations to avoid deadlock.
             // update_gauges() needs a read lock; holding write + requesting read = deadlock.
             drop(state);
@@ -1327,6 +1605,18 @@ impl Coordinator for CoordinatorSvc {
         }
         Ok(Response::new(self.build_snapshot().await))
     }
+
+    async fn get_resume_checkpoint(
+        &self,
+        request: Request<GetResumeCheckpointRequest>,
+    ) -> Result<Response<GetResumeCheckpointResponse>, Status> {
+        let req = request.into_inner();
+        if let Some(status) = Self::validate_id("job_id", &req.job_id) {
+            return Err(status);
+        }
+        let checkpoint = self.build_resume_checkpoint().await;
+        Ok(Response::new(GetResumeCheckpointResponse { checkpoint }))
+    }
 }
 
 #[tokio::main]
@@ -1480,6 +1770,8 @@ async fn main() -> Result<()> {
                 departed_nodes: std::collections::BTreeSet::new(),
                 leases: std::collections::BTreeMap::new(),
                 progress: std::collections::BTreeMap::new(),
+                completed_ranges,
+                resume_checkpoint_fingerprint: None,
                 next_lease_id: 0,
                 // tick_once will emit job_drained on the first tick if all ranges were
                 // already completed when the coordinator was resumed.
@@ -1571,6 +1863,7 @@ mod tests {
                 job_id: "".to_string(),
                 node_id: "node".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await
             .unwrap_err();
@@ -1599,6 +1892,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node2".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -1610,6 +1904,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node1".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -1621,6 +1916,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node2".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -1650,6 +1946,7 @@ mod tests {
             job_id: "job".to_string(),
             node_id: "node".to_string(),
             caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
         }))
         .await
         .unwrap();
@@ -1774,6 +2071,8 @@ mod tests {
             departed_nodes: std::collections::BTreeSet::new(),
             leases: std::collections::BTreeMap::new(),
             progress: std::collections::BTreeMap::new(),
+            completed_ranges: HashSet::new(),
+            resume_checkpoint_fingerprint: None,
             next_lease_id: 0,
             drained_emitted: false,
         }));
@@ -1797,6 +2096,7 @@ mod tests {
             job_id: "job".to_string(),
             node_id: "node".to_string(),
             caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
         }))
         .await?;
 
@@ -1868,6 +2168,8 @@ mod tests {
             departed_nodes: std::collections::BTreeSet::new(),
             leases: std::collections::BTreeMap::new(),
             progress: std::collections::BTreeMap::new(),
+            completed_ranges: HashSet::new(),
+            resume_checkpoint_fingerprint: None,
             next_lease_id: 0,
             drained_emitted: false,
         }));
@@ -1891,6 +2193,7 @@ mod tests {
             job_id: "job".to_string(),
             node_id: "node".to_string(),
             caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
         }))
         .await?;
 
@@ -1981,6 +2284,8 @@ mod tests {
                     departed_nodes: std::collections::BTreeSet::new(),
                     leases: std::collections::BTreeMap::new(),
                     progress: std::collections::BTreeMap::new(),
+                    completed_ranges: HashSet::new(),
+                    resume_checkpoint_fingerprint: None,
                     next_lease_id: 0,
                     drained_emitted: false,
                 })),
@@ -2001,6 +2306,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?;
 
@@ -2069,6 +2375,226 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn resume_token_skips_completed_ranges_before_leases() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([
+                    WorkRange {
+                        start_id: 0,
+                        end_id: 100,
+                        epoch: 0,
+                        seed: 0,
+                    },
+                    WorkRange {
+                        start_id: 100,
+                        end_id: 200,
+                        epoch: 0,
+                        seed: 0,
+                    },
+                    WorkRange {
+                        start_id: 200,
+                        end_id: 300,
+                        epoch: 0,
+                        seed: 0,
+                    },
+                ]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        let resume = DistributedResumeToken {
+            manifest_hash: "dev".to_string(),
+            epoch: 0,
+            completed_ranges: vec![(0, 100), (100, 200)],
+        }
+        .encode();
+
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            caps: Some(NodeCaps::default()),
+            resume_from: resume,
+        }))
+        .await?;
+
+        let lease = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner()
+            .leases
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected lease after resume"))?;
+        let range = lease
+            .range
+            .ok_or_else(|| anyhow::anyhow!("expected lease range"))?;
+        assert_eq!(range.start_id, 200);
+        assert_eq!(range.end_id, 300);
+        assert_eq!(svc.metrics.resume_checkpoint_applied_total.get(), 1);
+        assert_eq!(svc.metrics.resume_ranges_applied_total.get(), 2);
+        assert_eq!(svc.metrics.resume_checkpoint_rejected_total.get(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reject_counter_increments_on_invalid_resume_token() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([WorkRange {
+                    start_id: 0,
+                    end_id: 100,
+                    epoch: 0,
+                    seed: 0,
+                }]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        let err = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                caps: Some(NodeCaps::default()),
+                resume_from: b"not-a-valid-token".to_vec(),
+            }))
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected invalid resume token to fail"))?;
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(svc.metrics.resume_checkpoint_rejected_total.get(), 1);
+        assert_eq!(svc.metrics.resume_checkpoint_applied_total.get(), 0);
+        assert_eq!(svc.metrics.resume_ranges_applied_total.get(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_resume_checkpoint_contains_completed_ranges() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([WorkRange {
+                    start_id: 0,
+                    end_id: 100,
+                    epoch: 0,
+                    seed: 0,
+                }]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
+        }))
+        .await?;
+
+        let lease = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner()
+            .leases
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected lease"))?;
+        let range = lease
+            .range
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("expected lease range"))?;
+        svc.report_progress(Request::new(ReportProgressRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            lease_id: lease.lease_id,
+            cursor: range.end_id,
+            delivered_samples: range.end_id.saturating_sub(range.start_id),
+            delivered_bytes: 0,
+            unix_time_ms: CoordinatorSvc::unix_time_ms(),
+        }))
+        .await?;
+
+        let ckpt = svc
+            .get_resume_checkpoint(Request::new(GetResumeCheckpointRequest {
+                job_id: "job".to_string(),
+            }))
+            .await?
+            .into_inner()
+            .checkpoint;
+        let decoded = DistributedResumeToken::decode(&ckpt)?;
+        assert_eq!(decoded.manifest_hash, "dev");
+        assert_eq!(decoded.epoch, 0);
+        assert_eq!(decoded.completed_ranges, vec![(0, 100)]);
+        Ok(())
+    }
+
     // ── Step 2: dynamic membership tests ─────────────────────────────────────
 
     /// A node that times out is marked departed; a replacement node fills its slot
@@ -2089,6 +2615,8 @@ mod tests {
                 departed_nodes: std::collections::BTreeSet::new(),
                 leases: std::collections::BTreeMap::new(),
                 progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -2111,6 +2639,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node-a".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -2143,6 +2672,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node-b".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -2188,6 +2718,7 @@ mod tests {
             job_id: "job".to_string(),
             node_id: "node-a".to_string(),
             caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
         }))
         .await?;
 
@@ -2197,6 +2728,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node-b".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await
             .unwrap_err();
@@ -2229,6 +2761,8 @@ mod tests {
                 departed_nodes: std::collections::BTreeSet::new(),
                 leases: std::collections::BTreeMap::new(),
                 progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -2250,6 +2784,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node-a".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -2262,6 +2797,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node-b".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -2307,6 +2843,8 @@ mod tests {
                 departed_nodes: std::collections::BTreeSet::new(),
                 leases: std::collections::BTreeMap::new(),
                 progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -2329,6 +2867,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node-a".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();
@@ -2373,6 +2912,7 @@ mod tests {
             job_id: "job".to_string(),
             node_id: "node-a".to_string(),
             caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
         }))
         .await?;
 
@@ -2397,6 +2937,7 @@ mod tests {
                 job_id: "job".to_string(),
                 node_id: "node-a".to_string(),
                 caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
             }))
             .await?
             .into_inner();

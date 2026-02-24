@@ -21,6 +21,8 @@ service Coordinator {
   rpc GetManifestStream(GetManifestRequest) returns (stream ManifestChunk);
   // Read-only snapshot for local operator/TUI views.
   rpc GetJobSnapshot(GetJobSnapshotRequest) returns (GetJobSnapshotResponse);
+  // Returns an opaque distributed resume token representing globally committed lease ranges.
+  rpc GetResumeCheckpoint(GetResumeCheckpointRequest) returns (GetResumeCheckpointResponse);
 }
 
 message NodeCaps {
@@ -34,6 +36,9 @@ message RegisterNodeRequest {
   string job_id = 1;
   string node_id = 2;
   NodeCaps caps = 3;
+  // Optional distributed resume token. If provided, coordinator validates and applies it
+  // before lease issuance. Repeated identical submissions are allowed.
+  bytes resume_from = 4;
 }
 
 message RegisterNodeResponse {
@@ -133,6 +138,14 @@ message GetJobSnapshotRequest {
   string job_id = 1;
 }
 
+message GetResumeCheckpointRequest {
+  string job_id = 1;
+}
+
+message GetResumeCheckpointResponse {
+  bytes checkpoint = 1;
+}
+
 message NodeSnapshot {
   string node_id = 1;
   uint32 assigned_rank = 2;
@@ -149,6 +162,9 @@ message CoordinatorCounters {
   uint64 leases_expired_total = 5;
   uint64 ranges_requeued_total = 6;
   uint64 progress_total = 7;
+  uint64 resume_checkpoint_applied_total = 8;
+  uint64 resume_checkpoint_rejected_total = 9;
+  uint64 resume_ranges_applied_total = 10;
 }
 
 message GetJobSnapshotResponse {

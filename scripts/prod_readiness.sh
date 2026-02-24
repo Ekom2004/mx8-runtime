@@ -56,6 +56,9 @@ RUST_LOG=info \
 echo "[mx8] prod_readiness: deterministic autotune pressure simulation"
 ./scripts/autotune_memory_pressure_sim.sh
 
+echo "[mx8] prod_readiness: distributed checkpoint/resume gate"
+./scripts/distributed_resume_gate.sh
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "[mx8] prod_readiness failed: docker is required for MinIO soak gate" >&2
   exit 1

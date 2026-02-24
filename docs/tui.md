@@ -18,7 +18,7 @@ The TUI connects to the coordinator, polls for state, and refreshes the display 
 
 ## Panels
 
-The coordinator and lease panel shows job readiness and drain state, registered node count, active lease count, available range count, coordinator event counters (register, heartbeat, lease, progress), a derived cluster health signal (`healthy`, `degraded`, or `stalled`), stale heartbeat count, and cluster-wide memory envelope totals.
+The coordinator and lease panel shows job readiness and drain state, registered node count, active lease count, available range count, coordinator event counters (register, heartbeat, lease, progress), distributed resume counters (`resume_ok`, `resume_reject`, `resume_ranges`), a derived cluster health signal (`healthy`, `degraded`, or `stalled`), stale heartbeat count, and cluster-wide memory envelope totals.
 
 The runtime panel shows per-node heartbeat age and state, per-node `inflight_bytes` and `ram_high_water_bytes` with cap ratios, fetch, decode, and pack queue depths from the latest heartbeat, and autotune fields when available: `autotune_enabled`, `effective_want`, `effective_prefetch_batches`, `effective_max_queue_batches`, `autotune_pressure_milli`, `autotune_cooldown_ticks`, `batch_payload_p95_over_p50_milli`, and `batch_jitter_slo_breaches_total`. Fields show as zero when the heartbeat does not carry them.
 
