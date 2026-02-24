@@ -9,6 +9,10 @@ This document defines what coordinator HA means for MX8, what it explicitly does
 
 The coordinator is a single process per job. If it dies, the job control plane pauses until the coordinator is restarted and agents reconnect. This is a known limitation. Until v1.9 ships, treat the coordinator as a single point of failure and run it on a stable, non-preemptible node.
 
+v1.8.3 foundation: coordinator restart recovery replays durable completion and durable cursor progress from the lease log. This reduces replay after restart.
+
+v1.8.4 foundation: optional lease-file leader election + term fencing (`MX8_COORD_HA_ENABLE=1`) fences mutating RPCs on stale coordinators. This enforces single-writer control-plane semantics but still does not provide shared-state continuity after leader switch.
+
 For current incident procedure, see `docs/prod_runbook.md`.
 
 
@@ -67,6 +71,10 @@ Run repeated leader churn over a long soak run and verify no invariant violation
 ## Rollout plan
 
 Phase 0 locks this contract in docs and architecture (current state).
+
+Phase 0.5 ships durable restart replay (`C` + `P` lease log lines) and a deterministic restart gate (`./scripts/coordinator_restart_gate.sh`).
+
+Phase 0.6 ships lease-file leader election + term fencing and a deterministic gate (`./scripts/leader_fencing_gate.sh`).
 
 Phase 1 enables HA behind a feature flag for selected internal jobs and runs the kill-leader gates in nightly CI.
 

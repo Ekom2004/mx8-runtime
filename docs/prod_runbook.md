@@ -105,4 +105,8 @@ cargo run -p mx8-tui -- \
 
 You should see nodes re-register, heartbeats resume, and progress counters start moving again. If the coordinator repeatedly fails or the job cannot resume progress, drain it and relaunch from a pinned `@sha256:<manifest_hash>`.
 
+When lease logging is enabled (default for non-dev manifest hashes), restart recovery replays durable completion and durable progress cursors. This means partially completed ranges should resume near their previous cursor instead of restarting from the full block.
+
+If `MX8_COORD_HA_ENABLE=1` is enabled, mutating RPCs are fenced on followers/stale leaders with `FAILED_PRECONDITION` and a `not leader for mutating operation` message. In that case, direct agents to the active lease holder or wait for leader lease transition before retrying.
+
 The v1.9 HA plan — single-writer leader with fencing, durable lease state, and automatic failover for inference and ETL jobs — is documented in `docs/ha_contract.md`. Training remains non-elastic even after coordinator HA ships.

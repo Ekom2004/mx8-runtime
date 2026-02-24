@@ -37,6 +37,12 @@ readonly DDP_WORLD_SIZE=4
 echo "[mx8] prod_readiness: static checks"
 ./scripts/check.sh
 
+echo "[mx8] prod_readiness: leader fencing semantics"
+./scripts/leader_fencing_gate.sh
+
+echo "[mx8] prod_readiness: coordinator restart recovery"
+./scripts/coordinator_restart_gate.sh
+
 echo "[mx8] prod_readiness: jitter guardrail"
 cargo test -p mx8-runtime jitter_guardrail
 

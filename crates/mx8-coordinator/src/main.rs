@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+mod leader_lease;
 mod lease_log;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -30,6 +32,10 @@ const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MANIFEST_CHUNK_BYTES: usize = 1024 * 1024;
 const DIST_CHECKPOINT_MAGIC: &str = "mx8_checkpoint_v1";
 const DIST_CHECKPOINT_KIND: &str = "distributed_loader";
+const DEFAULT_HA_LEASE_TTL_MS: u64 = 5000;
+const DEFAULT_HA_RENEW_INTERVAL_MS: u64 = 1000;
+
+static HA_GATE: OnceLock<Arc<leader_lease::LeaderGate>> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "mx8-coordinator")]
@@ -137,6 +143,43 @@ struct Args {
         default_value_t = DEFAULT_GRPC_MAX_MESSAGE_BYTES
     )]
     grpc_max_message_bytes: usize,
+
+    /// Enable lease-based leader election + term fencing for mutating RPCs.
+    #[arg(
+        long,
+        env = "MX8_COORD_HA_ENABLE",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    ha_enable: bool,
+
+    /// Leader lease file path used for election/fencing when HA is enabled.
+    ///
+    /// Defaults to `<manifest_store_root>/../ha/<manifest_hash>.lease`.
+    #[arg(long, env = "MX8_COORD_HA_LEASE_PATH")]
+    ha_lease_path: Option<String>,
+
+    /// Coordinator leader identity used in lease records.
+    ///
+    /// Defaults to `<hostname>-<pid>`.
+    #[arg(long, env = "MX8_COORD_HA_LEADER_ID")]
+    ha_leader_id: Option<String>,
+
+    /// Leader lease TTL in milliseconds.
+    #[arg(
+        long,
+        env = "MX8_COORD_HA_LEASE_TTL_MS",
+        default_value_t = DEFAULT_HA_LEASE_TTL_MS
+    )]
+    ha_lease_ttl_ms: u64,
+
+    /// Leader lease renew interval in milliseconds.
+    #[arg(
+        long,
+        env = "MX8_COORD_HA_RENEW_INTERVAL_MS",
+        default_value_t = DEFAULT_HA_RENEW_INTERVAL_MS
+    )]
+    ha_renew_interval_ms: u64,
 }
 
 fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> {
@@ -161,6 +204,93 @@ fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> 
             .ok_or_else(|| anyhow::anyhow!("manifest row count overflow"))?;
     }
     Ok(n)
+}
+
+fn build_available_ranges_with_recovery(
+    total_samples: u64,
+    block_size: u64,
+    epoch: u32,
+    seed: u64,
+    completed_ranges: &mut HashSet<(u64, u64)>,
+    progress_by_end: &HashMap<u64, u64>,
+) -> (std::collections::VecDeque<WorkRange>, u64, u64, u64) {
+    let mut available_ranges = std::collections::VecDeque::new();
+    let mut skipped_completed: u64 = 0;
+    let mut resumed_partial: u64 = 0;
+    let mut skipped_terminal_progress: u64 = 0;
+
+    if total_samples == 0 || block_size == 0 {
+        return (
+            available_ranges,
+            skipped_completed,
+            resumed_partial,
+            skipped_terminal_progress,
+        );
+    }
+
+    let mut start_id = 0u64;
+    while start_id < total_samples {
+        let end_id = (start_id + block_size).min(total_samples);
+        if completed_ranges.contains(&(start_id, end_id)) {
+            skipped_completed = skipped_completed.saturating_add(1);
+            start_id = end_id;
+            continue;
+        }
+
+        if let Some(cursor) = progress_by_end.get(&end_id).copied() {
+            if cursor >= end_id {
+                // A terminal cursor was durably reported; treat range as complete even if a
+                // matching `C` line was not flushed yet.
+                completed_ranges.insert((start_id, end_id));
+                skipped_terminal_progress = skipped_terminal_progress.saturating_add(1);
+                start_id = end_id;
+                continue;
+            }
+            if cursor > start_id {
+                available_ranges.push_back(WorkRange {
+                    start_id: cursor,
+                    end_id,
+                    epoch,
+                    seed,
+                });
+                resumed_partial = resumed_partial.saturating_add(1);
+                start_id = end_id;
+                continue;
+            }
+        }
+
+        available_ranges.push_back(WorkRange {
+            start_id,
+            end_id,
+            epoch,
+            seed,
+        });
+        start_id = end_id;
+    }
+
+    (
+        available_ranges,
+        skipped_completed,
+        resumed_partial,
+        skipped_terminal_progress,
+    )
+}
+
+fn default_leader_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    format!("{host}-{}", std::process::id())
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_write_leader() -> Result<(), Status> {
+    if let Some(gate) = HA_GATE.get() {
+        if !gate.is_leader() {
+            return Err(Status::failed_precondition(gate.fence_message()));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1011,6 +1141,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<RegisterNodeResponse>, Status> {
+        ensure_write_leader()?;
         self.metrics.register_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1237,6 +1368,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        ensure_write_leader()?;
         self.metrics.heartbeat_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1262,6 +1394,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<RequestLeaseRequest>,
     ) -> Result<Response<RequestLeaseResponse>, Status> {
+        ensure_write_leader()?;
         self.metrics.request_lease_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1362,6 +1495,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<ReportProgressRequest>,
     ) -> Result<Response<ReportProgressResponse>, Status> {
+        ensure_write_leader()?;
         self.metrics.progress_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1437,6 +1571,7 @@ impl Coordinator for CoordinatorSvc {
         let completed = existing_range
             .as_ref()
             .is_some_and(|range| req.cursor >= range.end_id);
+        let mut progress_to_log: Option<(u64, u64, u64)> = None;
 
         state.progress.insert(progress_key, req.cursor);
 
@@ -1497,6 +1632,29 @@ impl Coordinator for CoordinatorSvc {
             lease.cursor = req.cursor;
             lease.expires_unix_time_ms =
                 Self::unix_time_ms().saturating_add(self.lease_ttl_ms as u64);
+        }
+        if req.cursor > existing_cursor {
+            if let Some(range) = &existing_range {
+                if req.cursor >= range.start_id && req.cursor < range.end_id {
+                    progress_to_log = Some((range.start_id, range.end_id, req.cursor));
+                }
+            }
+        }
+        drop(state);
+
+        if let Some((start_id, end_id, cursor)) = progress_to_log {
+            if let Some(log) = &self.lease_log {
+                let mut log = log.lock().await;
+                if let Err(e) = log.append_progress(start_id, end_id, cursor).await {
+                    tracing::error!(
+                        error = %e,
+                        path = %log.path().display(),
+                        lease_id = %req.lease_id,
+                        cursor = cursor,
+                        "lease log progress write failed; durability degraded for this range"
+                    );
+                }
+            }
         }
 
         tracing::info!(
@@ -1668,6 +1826,68 @@ async fn main() -> Result<()> {
             anyhow::bail!("MX8_DEV_BLOCK_SIZE must be > 0 when MX8_DEV_TOTAL_SAMPLES > 0");
         }
 
+        // --- Leader election + term fencing (optional) -----------------------
+        if args.ha_enable {
+            let lease_path_default = manifest_store_root
+                .parent()
+                .unwrap_or(&manifest_store_root)
+                .join("ha")
+                .join(format!("{resolved_manifest_hash}.leader_lease"));
+            let raw_lease_path = args
+                .ha_lease_path
+                .clone()
+                .unwrap_or_else(|| lease_path_default.to_string_lossy().to_string());
+            let leader_id = args.ha_leader_id.clone().unwrap_or_else(default_leader_id);
+            let cfg = leader_lease::LeaderLeaseConfig {
+                lease_path: PathBuf::from(raw_lease_path.clone()),
+                leader_id: leader_id.clone(),
+                lease_ttl_ms: args.ha_lease_ttl_ms.max(1),
+                renew_interval_ms: args.ha_renew_interval_ms.max(1),
+            };
+            let gate = Arc::new(leader_lease::LeaderGate::new(leader_id.clone()));
+            match leader_lease::tick_once(&cfg) {
+                Ok(tick) => {
+                    gate.apply_tick(tick.clone());
+                    match tick {
+                        leader_lease::LeaderTick::Leader { term } => {
+                            info!(
+                                leader_id = %leader_id,
+                                term = term,
+                                lease_path = %raw_lease_path,
+                                "leader lease acquired"
+                            );
+                        }
+                        leader_lease::LeaderTick::Follower { observed } => {
+                            info!(
+                                leader_id = %leader_id,
+                                observed_term = observed.as_ref().map(|o| o.term).unwrap_or(0),
+                                observed_leader_id = observed
+                                    .as_ref()
+                                    .map(|o| o.leader_id.as_str())
+                                    .unwrap_or("unknown"),
+                                lease_path = %raw_lease_path,
+                                "coordinator started as follower; mutating APIs fenced"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        leader_id = %leader_id,
+                        lease_path = %raw_lease_path,
+                        "leader lease initial tick failed; mutating APIs fenced"
+                    );
+                    gate.apply_tick(leader_lease::LeaderTick::Follower { observed: None });
+                }
+            }
+            if HA_GATE.set(gate.clone()).is_err() {
+                tracing::warn!("HA gate already initialized; keeping existing global gate");
+            }
+            tokio::spawn(leader_lease::run_loop(cfg, gate));
+        }
+        // ---------------------------------------------------------------------
+
         // --- Lease write-ahead log -------------------------------------------
         // Derive the default log path from the manifest store root.
         let lease_log_path_default = manifest_store_root
@@ -1686,18 +1906,28 @@ async fn main() -> Result<()> {
             && raw_lease_log_path != "none"
             && resolved_manifest_hash != "dev";
 
-        type LeaseLogState = (Option<Arc<Mutex<lease_log::LeaseLog>>>, HashSet<(u64, u64)>);
-        let (lease_log_arc, completed_ranges): LeaseLogState = if lease_log_enabled {
+        type LeaseLogState = (
+            Option<Arc<Mutex<lease_log::LeaseLog>>>,
+            HashSet<(u64, u64)>,
+            HashMap<u64, u64>,
+        );
+        let (lease_log_arc, mut completed_ranges, progress_by_end): LeaseLogState = if lease_log_enabled {
             let log_path = PathBuf::from(raw_lease_log_path);
             match lease_log::LeaseLog::open(&log_path, &resolved_manifest_hash).await {
-                Ok((log, completed)) => {
-                    let recovered = completed.len();
+                Ok((log, recovered)) => {
+                    let recovered_completed = recovered.completed_ranges.len();
+                    let recovered_progress = recovered.progress_by_end.len();
                     info!(
                         path = %log_path.display(),
-                        recovered_ranges = recovered,
+                        recovered_completed_ranges = recovered_completed,
+                        recovered_progress_ranges = recovered_progress,
                         "lease log opened"
                     );
-                    (Some(Arc::new(Mutex::new(log))), completed)
+                    (
+                        Some(Arc::new(Mutex::new(log))),
+                        recovered.completed_ranges,
+                        recovered.progress_by_end,
+                    )
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -1708,11 +1938,10 @@ async fn main() -> Result<()> {
                 }
             }
         } else {
-            (None, HashSet::new())
+            (None, HashSet::new(), HashMap::new())
         };
         // ---------------------------------------------------------------------
 
-        let mut available_ranges = std::collections::VecDeque::new();
         let total_samples = if args.dev_total_samples > 0 {
             args.dev_total_samples
         } else if resolved_manifest_hash != "dev" {
@@ -1727,28 +1956,21 @@ async fn main() -> Result<()> {
             0
         };
 
-        let mut skipped_ranges: u64 = 0;
-        if total_samples > 0 {
-            let mut start_id = 0u64;
-            while start_id < total_samples {
-                let end_id = (start_id + args.dev_block_size).min(total_samples);
-                if completed_ranges.contains(&(start_id, end_id)) {
-                    skipped_ranges = skipped_ranges.saturating_add(1);
-                } else {
-                    available_ranges.push_back(WorkRange {
-                        start_id,
-                        end_id,
-                        epoch: 0,
-                        seed: 0,
-                    });
-                }
-                start_id = end_id;
-            }
-        }
+        let (available_ranges, skipped_ranges, resumed_ranges, terminal_progress_completed) =
+            build_available_ranges_with_recovery(
+                total_samples,
+                args.dev_block_size,
+                args.epoch,
+                args.seed,
+                &mut completed_ranges,
+                &progress_by_end,
+            );
 
-        if skipped_ranges > 0 {
+        if skipped_ranges > 0 || resumed_ranges > 0 || terminal_progress_completed > 0 {
             info!(
                 skipped_ranges,
+                resumed_ranges,
+                terminal_progress_completed,
                 remaining_ranges = available_ranges.len(),
                 "coordinator resumed: skipped already-completed ranges"
             );
@@ -2250,8 +2472,9 @@ mod tests {
 
         // -- Run 1: complete all 3 ranges [0,100), [100,200), [200,300) --
         {
-            let (log, completed) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
-            assert!(completed.is_empty());
+            let (log, recovered) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
+            assert!(recovered.completed_ranges.is_empty());
+            assert!(recovered.progress_by_end.is_empty());
             let log_arc = Arc::new(Mutex::new(log));
 
             let available_ranges = std::collections::VecDeque::from([
@@ -2341,34 +2564,138 @@ mod tests {
 
         // -- Run 2: replay log, build available_ranges (should be empty) --
         {
-            let (_log2, completed) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
+            let (_log2, recovered) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
+            let mut completed = recovered.completed_ranges;
             assert_eq!(completed.len(), 3, "expected 3 completed ranges in log");
             assert!(completed.contains(&(0, 100)));
             assert!(completed.contains(&(100, 200)));
             assert!(completed.contains(&(200, 300)));
 
-            // Simulate what main() does: filter completed ranges out.
-            let block_size = 100u64;
-            let total_samples = 300u64;
-            let mut available: std::collections::VecDeque<WorkRange> =
-                std::collections::VecDeque::new();
-            let mut start_id = 0u64;
-            while start_id < total_samples {
-                let end_id = (start_id + block_size).min(total_samples);
-                if !completed.contains(&(start_id, end_id)) {
-                    available.push_back(WorkRange {
-                        start_id,
-                        end_id,
-                        epoch: 0,
-                        seed: 0,
-                    });
-                }
-                start_id = end_id;
-            }
+            // Simulate main() range reconstruction.
+            let (available, _skipped, resumed, terminal_progress_completed) =
+                build_available_ranges_with_recovery(
+                    300,
+                    100,
+                    0,
+                    0,
+                    &mut completed,
+                    &recovered.progress_by_end,
+                );
             assert!(
                 available.is_empty(),
                 "all ranges should be filtered out after restart"
             );
+            assert_eq!(resumed, 0);
+            assert_eq!(terminal_progress_completed, 0);
+        }
+
+        let _ = std::fs::remove_file(&log_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lease_log_restart_resumes_from_logged_cursor() -> anyhow::Result<()> {
+        let log_path = std::env::temp_dir().join(format!(
+            "mx8-lease-log-restart-progress-test-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+
+        // Run 1: grant one lease and durably report partial progress.
+        {
+            let (log, recovered) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
+            assert!(recovered.completed_ranges.is_empty());
+            assert!(recovered.progress_by_end.is_empty());
+            let log_arc = Arc::new(Mutex::new(log));
+
+            let svc = CoordinatorSvc {
+                state: Arc::new(RwLock::new(CoordinatorState {
+                    nodes: std::collections::BTreeMap::new(),
+                    available_ranges: std::collections::VecDeque::from([WorkRange {
+                        start_id: 0,
+                        end_id: 100,
+                        epoch: 0,
+                        seed: 0,
+                    }]),
+                    rank_ranges: None,
+                    frozen_membership: None,
+                    departed_nodes: std::collections::BTreeSet::new(),
+                    leases: std::collections::BTreeMap::new(),
+                    progress: std::collections::BTreeMap::new(),
+                    completed_ranges: HashSet::new(),
+                    resume_checkpoint_fingerprint: None,
+                    next_lease_id: 0,
+                    drained_emitted: false,
+                })),
+                metrics: Arc::new(CoordinatorMetrics::default()),
+                world_size: 1,
+                min_world_size: 1,
+                heartbeat_interval_ms: 1000,
+                lease_ttl_ms: 10_000,
+                shuffle: false,
+                seed: 0,
+                epoch: 0,
+                manifest_hash: "testhash".to_string(),
+                manifest_store: None,
+                lease_log: Some(log_arc),
+            };
+
+            svc.register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node".to_string(),
+                caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
+            }))
+            .await?;
+
+            let lease = svc
+                .request_lease(Request::new(RequestLeaseRequest {
+                    job_id: "job".to_string(),
+                    node_id: "node".to_string(),
+                    want: 1,
+                }))
+                .await?
+                .into_inner()
+                .leases
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("expected lease"))?;
+            svc.report_progress(Request::new(ReportProgressRequest {
+                job_id: "job".to_string(),
+                node_id: "node".to_string(),
+                lease_id: lease.lease_id,
+                cursor: 42,
+                delivered_samples: 42,
+                delivered_bytes: 0,
+                unix_time_ms: CoordinatorSvc::unix_time_ms(),
+            }))
+            .await?;
+        }
+
+        // Run 2: verify startup replay resumes at cursor 42.
+        {
+            let (_log2, recovered) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
+            assert!(recovered.completed_ranges.is_empty());
+            assert_eq!(recovered.progress_by_end.get(&100).copied(), Some(42));
+            let mut completed = recovered.completed_ranges;
+            let (available, skipped, resumed, terminal_progress_completed) =
+                build_available_ranges_with_recovery(
+                    100,
+                    100,
+                    0,
+                    0,
+                    &mut completed,
+                    &recovered.progress_by_end,
+                );
+            assert_eq!(skipped, 0);
+            assert_eq!(resumed, 1);
+            assert_eq!(terminal_progress_completed, 0);
+            assert_eq!(available.len(), 1);
+            let front = available
+                .front()
+                .ok_or_else(|| anyhow::anyhow!("missing range"))?;
+            assert_eq!(front.start_id, 42);
+            assert_eq!(front.end_id, 100);
         }
 
         let _ = std::fs::remove_file(&log_path);

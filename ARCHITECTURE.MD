@@ -28,6 +28,7 @@ Coordinator HA is planned for v1.9 and is not part of the v1.8 shipped contract.
 
 - v1.8 contract: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
 - v1.9 target: leader failover with durable lease/progress state and single-writer fencing.
+- v1.8.4 foundation: optional lease-file leader election + term fencing for mutating RPCs (`MX8_COORD_HA_ENABLE=1`). This enforces single-writer behavior but does not yet provide shared-state failover continuity.
 
 ### Dynamic Membership (shipped in v1.8.2)
 
@@ -41,19 +42,19 @@ The coordinator supports elastic membership changes after the initial barrier is
 - **No slot available**: if a new node ID registers after freeze and membership has already reached `world_size`, the request is rejected with `FailedPrecondition`.
 - **Determinism note**: fixed-membership runs are deterministic. Any post-freeze membership change (replacement or scale-out) may reorder unissued work at the boundary.
 
-### Durable Lease Log (shipped in v1.8.1)
+### Durable Lease Log (shipped in v1.8.3)
 
-The coordinator writes an **append-only write-ahead log** to disk as each lease range is fully
-completed.  On restart, the log is replayed and already-completed ranges are skipped, so the
-job does not re-deliver work that was already cleanly finished.
+The coordinator writes an **append-only write-ahead log** to disk for both lease completion and
+accepted cursor progress. On restart, the log is replayed so completed ranges are skipped and
+partially progressed ranges resume from the last durable cursor.
 
-- **Format**: newline-delimited text.  `H v1 <manifest_hash>` header + one `C <start_id> <end_id>` line per completed range.
+- **Format**: newline-delimited text.  `H v1 <manifest_hash>` header + `C <start_id> <end_id>` for completed ranges + `P <start_id> <end_id> <cursor>` for durable progress.
 - **Default path**: `~/.mx8/lease_logs/<manifest_hash>.log`  (configurable via `--lease-log-path` / `MX8_LEASE_LOG_PATH`; set to `none` to disable).
 - **Fail-closed startup**: if the log cannot be opened/replayed while enabled, coordinator startup fails (explicitly set `--lease-log-path=none` to opt out).
 - **Header safety**: replay validates the on-disk header manifest hash against the requested run hash; mismatch is a startup error.
 - **Durability**: each append calls `sync_data()` before returning.
-- **Crash window**: the narrow gap between removing a lease from memory and flushing to the log means at most one range per crash may be re-delivered.  This is safe: agents receive `NotFound` for stale lease IDs and re-request.
-- **Invariant**: completed ranges are never re-issued after coordinator restart.
+- **Crash window**: if a crash happens after an accepted progress update but before the durable `P` write, replay resumes from the last durable cursor (not beyond). Bounded replay is at most the unflushed progress interval for affected ranges.
+- **Invariant**: completed ranges are never re-issued after coordinator restart, and partially progressed ranges resume from durable cursor when present.
 
 Canonical plan and acceptance gates are defined in:
 - `docs/ha_contract.md`

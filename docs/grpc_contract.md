@@ -37,6 +37,8 @@ The `Coordinator` service exposes eight RPCs.
 
 `FAILED_PRECONDITION` is returned when a precondition is not met — node not registered, job not ready, membership frozen violations, or cursor regression on a progress report.
 
+When coordinator leader fencing is enabled (`MX8_COORD_HA_ENABLE=1`), mutating RPCs (`RegisterNode`, `Heartbeat`, `RequestLease`, `ReportProgress`) return `FAILED_PRECONDITION` on followers or stale leaders with a `not leader for mutating operation` message.
+
 `NOT_FOUND` is returned for unknown lease IDs or missing manifest hashes.
 
 `UNAVAILABLE` signals a transient server issue. Clients should retry with backoff.
