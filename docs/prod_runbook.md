@@ -91,7 +91,7 @@ If rejections continue, relaunch without `resume_from` and treat it as a fresh e
 
 ## Coordinator failure
 
-In v1.8, the coordinator is a single process per job with no automatic failover. If it dies, the control plane pauses until it is restarted.
+In default v1.8 deployments, the coordinator is run as a single process per job. If it dies, the control plane pauses until restart. Optional HA foundations (`MX8_COORD_HA_ENABLE=1`) can promote a follower, but require shared lease/state paths and are still an operator-managed rollout.
 
 Restart the coordinator for the affected job. Restart affected agents if they do not reconnect on their own. Then verify recovery in the TUI:
 

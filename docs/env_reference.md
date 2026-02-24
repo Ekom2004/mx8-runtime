@@ -13,7 +13,7 @@ Generation command:
 rg -o --no-filename "MX8_[A-Z0-9_]+" crates scripts | sort -u
 ```
 
-Current inventory size: `237` variables.
+Current inventory size: `250` variables.
 
 ## Stability Classes
 
@@ -36,6 +36,8 @@ Current inventory size: `237` variables.
 | `MX8_WORLD_SIZE` | `1` | coordinator | integer >= 1 | stable |
 | `MX8_HEARTBEAT_INTERVAL_MS` | `1000` | coordinator | integer >= 1 | stable |
 | `MX8_LEASE_TTL_MS` | `10000` | coordinator | integer >= 1 | stable |
+| `MX8_LEASE_LOG_PATH` | `<manifest_store_root>/../lease_logs/<manifest_hash>.log` | coordinator | filesystem path (`none` disables) | stable |
+| `MX8_MIN_WORLD_SIZE` | `0` (interpreted as `world_size`) | coordinator | integer >= 0 | stable |
 | `MX8_DATASET_LINK` | unset | coordinator/resolver | plain path/prefix, `@refresh`, `@sha256:<hash>` | stable |
 | `MX8_MANIFEST_STORE_ROOT` | `~/.mx8/manifests` | coordinator/resolver/python loaders | filesystem path or `s3://...` prefix | stable |
 | `MX8_SNAPSHOT_LOCK_STALE_MS` | `60000` | coordinator/resolver | integer >= 1 | stable |
@@ -106,6 +108,8 @@ Current inventory size: `237` variables.
 | `MX8_RUST_JPEG_CODEC` | `zune` | Python image loader | `zune|image|turbo` | experimental |
 | `MX8_RUST_RESIZE_BACKEND` | `fast` | Python image loader | `fast|image` | experimental |
 | `MX8_DECODE_THREADS` | host parallelism | Python image loader | integer >= 1 | experimental |
+| `MX8_PACK_PARALLEL_FETCHES` | `128` | `mx8.pack` / S3 packer | integer >= 1 | experimental |
+| `MX8_PACK_PART_MB` | `16` | S3 packer multipart upload | integer >= 1 | experimental |
 
 ## Internal and Gate Variables (`internal`)
 
@@ -125,6 +129,7 @@ Common internal families:
 - `MX8_IMAGE_BENCH_*`
 - `MX8_VIDEO_STAGE2A_*`, `MX8_VIDEO_STAGE2B_*`, `MX8_VIDEO_STAGE3A_*`
 - `MX8_MIX_GATE_*`
+- `MX8_MAX_BATCHES`, `MX8_PHASE1_BATCHES` (distributed resume gate controls)
 - `MX8_DEV_*` beyond explicitly documented operator usage
 
 ## Full Inventory (All `MX8_*` names found in repo)
@@ -188,6 +193,7 @@ MX8_JOB_ID_RESTART
 MX8_KEEP_ARTIFACTS
 MX8_KILL_AFTER_MS
 MX8_KILL_NODE_INDEX
+MX8_LEASE_LOG_PATH
 MX8_LEASE_TTL_MS
 MX8_LOG
 MX8_MANIFEST_CACHE_DIR
@@ -195,6 +201,7 @@ MX8_MANIFEST_HASH
 MX8_MANIFEST_STORE_BUCKET
 MX8_MANIFEST_STORE_PREFIX
 MX8_MANIFEST_STORE_ROOT
+MX8_MAX_BATCHES
 MX8_MAX_BATCH_BYTES
 MX8_MAX_INFLIGHT_BYTES
 MX8_MAX_PROCESS_RSS_BYTES
@@ -208,6 +215,7 @@ MX8_MINIO_OUT_PREFIX
 MX8_MINIO_PORT
 MX8_MINIO_PREFIX
 MX8_MINIO_RAW_PREFIX
+MX8_MIN_WORLD_SIZE
 MX8_MIX_AUTOTUNE_PERIOD_TICKS
 MX8_MIX_DDP_STEPS
 MX8_MIX_GATE_CHECK_EXHAUSTION
@@ -226,8 +234,11 @@ MX8_MIX_SNAPSHOT_PERIOD_TICKS
 MX8_NODE_ID
 MX8_PACK_IN
 MX8_PACK_OUT
+MX8_PACK_PARALLEL_FETCHES
+MX8_PACK_PART_MB
 MX8_PACK_REQUIRE_LABELS
 MX8_PACK_SHARD_MB
+MX8_PHASE1_BATCHES
 MX8_PREFETCH_BATCHES
 MX8_PREFETCH_COMPARE
 MX8_PROGRESS_INTERVAL_MS

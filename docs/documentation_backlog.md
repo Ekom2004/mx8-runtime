@@ -3,6 +3,11 @@
 Status: active backlog  
 Scope: product documentation completeness for shipped MX8 capabilities and near-term roadmap items.
 
+Latest alignment audit: 2026-02-24
+- Synced `docs/env_reference.md` inventory to `crates/` + `scripts/` (`250` vars, exact symbol match).
+- Synced CLI/env tables with code for: coordinator + agent (`docs/deployment_guide.md`), TUI (`docs/tui.md`), and snapshot tools (`docs/cli_reference.md`).
+- Synced coordinator HA wording across `ARCHITECTURE.MD`, `docs/ha_contract.md`, `docs/deployment_guide.md`, and `docs/prod_runbook.md` to reflect v1.8 baseline + HA foundations.
+
 ## Purpose
 
 This backlog tracks documentation work required to make MX8 operationally usable and contract-clear for users and operators.
@@ -81,7 +86,7 @@ Goals:
   - Deliverable: expand `docs/python_api.md` and `docs/v1_autotune_api_contract.md`
   - Must include: inputs, runtime signals, rails, emitted stats fields.
 
-- [ ] `DOC-106` TUI args and thresholds completeness
+- [x] `DOC-106` TUI args and thresholds completeness
   - Missing: full CLI/env arg coverage and stale/stall threshold semantics.
   - Deliverable: update `docs/tui.md`
   - Must include: every CLI arg, env mapping, threshold interpretation.
@@ -101,7 +106,7 @@ Goals:
   - Deliverable: update `docs/memory_contract.md`
   - Must include: detection order (`cgroup -> /proc/meminfo -> sysctl`), caveats.
 
-- [ ] `DOC-110` DistributedDataLoader arg completeness
+- [x] `DOC-110` DistributedDataLoader arg completeness
   - Missing: `progress_interval_ms` and `grpc_max_message_bytes` contract clarity.
   - Deliverable: update `docs/python_api.md`
   - Must include: defaults, tuning guidance, failure implications.

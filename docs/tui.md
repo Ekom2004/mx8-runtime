@@ -41,6 +41,7 @@ The manifest explorer shows sample ID, byte length, and location rows from the m
 | `--manifest-hash` | `MX8_TUI_MANIFEST_HASH` | unset | optional initial manifest hash |
 | `--search` | `MX8_TUI_SEARCH` | `""` | initial search filter for manifest panel |
 | `--rows-per-page` | `MX8_TUI_ROWS_PER_PAGE` | `12` | manifest rows per page |
+| `--grpc-max-message-bytes` | `MX8_GRPC_MAX_MESSAGE_BYTES` | `67108864` | gRPC message size cap (must match coordinator) |
 | `--manifest-path` | `MX8_TUI_MANIFEST_PATH` | unset | local TSV fallback when coordinator manifest is unavailable |
 | `--stale-heartbeat-ms` | `MX8_TUI_STALE_HEARTBEAT_MS` | `5000` | heartbeat age threshold to mark a node stale |
 | `--lease-stall-ms` | `MX8_TUI_LEASE_STALL_MS` | `10000` | no-progress threshold with active leases before marking job stalled |

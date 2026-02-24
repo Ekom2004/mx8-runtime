@@ -51,6 +51,11 @@ samples=<n> shards=<n> manifest_key=<key> manifest_hash=<sha256>
 | `--label-mode` | `MX8_S3_LABEL_MODE` | `auto` | `auto`, `none`, or `imagefolder` |
 | `--require-labels` | `MX8_PACK_REQUIRE_LABELS` | `false` | fail if any key is not ImageFolder-compatible |
 
+Runtime env overrides (no CLI flag):
+
+- `MX8_PACK_PARALLEL_FETCHES` (default `128`): S3 GET parallelism used by the packer.
+- `MX8_PACK_PART_MB` (default `16`): multipart upload part size in MiB.
+
 
 ## mx8-snapshot-resolve
 

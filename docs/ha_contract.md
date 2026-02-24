@@ -7,7 +7,7 @@ This document defines what coordinator HA means for MX8, what it explicitly does
 
 ## Current behavior in v1.8
 
-The coordinator is a single process per job. If it dies, the job control plane pauses until the coordinator is restarted and agents reconnect. This is a known limitation. Until v1.9 ships, treat the coordinator as a single point of failure and run it on a stable, non-preemptible node.
+The baseline v1.8 operating mode is a single coordinator process per job. If it dies, the job control plane pauses until the coordinator is restarted and agents reconnect. Optional HA foundations are available behind `MX8_COORD_HA_ENABLE=1`, but until the full v1.9 contract ships, treat HA rollout as controlled/opt-in and keep coordinators on stable, non-preemptible nodes.
 
 v1.8.3 foundation: coordinator restart recovery replays durable completion and durable cursor progress from the lease log. This reduces replay after restart.
 
