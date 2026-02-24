@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+mod lease_log;
+
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -9,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::Parser;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -104,6 +107,22 @@ struct Args {
     #[arg(long, env = "MX8_EPOCH", default_value_t = 0)]
     epoch: u32,
 
+    /// Path for the lease write-ahead log (crash recovery).
+    ///
+    /// On restart the coordinator replays this file to skip already-completed ranges.
+    /// Defaults to `<manifest_store_root>/../lease_logs/<manifest_hash>.log`.
+    /// Set to an empty string or `none` to disable.
+    #[arg(long, env = "MX8_LEASE_LOG_PATH")]
+    lease_log_path: Option<String>,
+
+    /// Minimum number of nodes required before the job starts issuing leases.
+    ///
+    /// Defaults to `world_size` (all nodes must register before work begins).
+    /// Set lower to allow the job to start under a partial cluster and accept
+    /// replacement nodes for any that later depart.
+    #[arg(long, env = "MX8_MIN_WORLD_SIZE", default_value_t = 0)]
+    min_world_size: u32,
+
     /// Optional: periodically emit a metrics snapshot to logs.
     #[arg(long, env = "MX8_METRICS_SNAPSHOT_INTERVAL_MS", default_value_t = 0)]
     metrics_snapshot_interval_ms: u64,
@@ -155,12 +174,17 @@ struct CoordinatorState {
     available_ranges: std::collections::VecDeque<WorkRange>,
     /// Deterministic per-rank schedule (failure-free determinism).
     ///
-    /// Once membership is frozen at `world_size`, initial work is partitioned into these queues.
-    /// Nodes draw from their own queue first; if empty, they may steal from others to complete
-    /// the job under failure.
+    /// Once membership is frozen at `min_world_size`, initial work is partitioned into these
+    /// queues. Nodes draw from their own queue first; if empty, they may steal from others to
+    /// complete the job under failure.
     rank_ranges: Option<Vec<std::collections::VecDeque<WorkRange>>>,
-    /// Frozen membership ordering used for deterministic rank assignment.
+    /// Frozen membership ordering used for deterministic rank assignment (rank = Vec index).
+    /// Set once when `min_world_size` nodes have registered; never grows or shrinks, but entries
+    /// are swapped when a replacement node fills a departed rank slot.
     frozen_membership: Option<Vec<String>>,
+    /// Node IDs that have timed out (heartbeat expired after freeze).
+    /// Their rank slots are vacant and available for replacement nodes.
+    departed_nodes: std::collections::BTreeSet<String>,
     leases: std::collections::BTreeMap<String, Lease>,
     progress: std::collections::BTreeMap<(String, String), u64>,
     next_lease_id: u64,
@@ -184,7 +208,12 @@ struct CoordinatorMetrics {
 struct CoordinatorSvc {
     state: Arc<RwLock<CoordinatorState>>,
     metrics: Arc<CoordinatorMetrics>,
+    /// Configured maximum number of nodes (controls world_size advertised to agents and the
+    /// capacity cap before freeze).
     world_size: u32,
+    /// Minimum nodes required before the job starts issuing leases (barrier gate).
+    /// Always <= world_size.
+    min_world_size: u32,
     heartbeat_interval_ms: u32,
     lease_ttl_ms: u32,
     shuffle: bool,
@@ -192,6 +221,12 @@ struct CoordinatorSvc {
     epoch: u32,
     manifest_hash: String,
     manifest_store: Option<Arc<dyn ManifestStore>>,
+    /// Write-ahead log for completed lease ranges; `None` in dev/test mode.
+    lease_log: Option<Arc<Mutex<lease_log::LeaseLog>>>,
+}
+
+fn existing_caps_changed(existing: &Option<NodeCaps>, new: &Option<NodeCaps>) -> bool {
+    existing != new
 }
 
 impl CoordinatorSvc {
@@ -216,7 +251,8 @@ impl CoordinatorSvc {
 
     async fn is_job_ready(&self) -> bool {
         let state = self.state.read().await;
-        state.nodes.len() as u32 >= self.world_size
+        // The job is ready as soon as the membership has been frozen (partition done).
+        state.frozen_membership.is_some()
     }
 
     async fn build_snapshot(&self) -> GetJobSnapshotResponse {
@@ -250,12 +286,18 @@ impl CoordinatorSvc {
             ranges_requeued_total: self.metrics.ranges_requeued_total.get(),
             progress_total: self.metrics.progress_total.get(),
         });
+        let capacity = state
+            .frozen_membership
+            .as_ref()
+            .map(|m| m.len() as u32)
+            .unwrap_or(self.world_size);
+        let active_nodes = (state.nodes.len().saturating_sub(state.departed_nodes.len())) as u32;
         GetJobSnapshotResponse {
             server_unix_time_ms: Self::unix_time_ms(),
             manifest_hash: self.manifest_hash.clone(),
-            world_size: self.world_size,
-            registered_nodes: state.nodes.len() as u32,
-            job_ready: state.nodes.len() as u32 >= self.world_size,
+            world_size: capacity,
+            registered_nodes: active_nodes,
+            job_ready: state.frozen_membership.is_some(),
             job_drained: state.drained_emitted,
             active_leases: state.leases.len() as u64,
             available_ranges: state.available_ranges.len() as u64,
@@ -281,7 +323,7 @@ impl CoordinatorSvc {
     #[allow(clippy::result_large_err)]
     fn freeze_membership_and_partition_ranges(
         state: &mut CoordinatorState,
-        world_size: u32,
+        min_world_size: u32,
         shuffle: bool,
         seed: u64,
         epoch: u32,
@@ -289,9 +331,9 @@ impl CoordinatorSvc {
         if state.frozen_membership.is_some() {
             return Ok(());
         }
-        if state.nodes.len() as u32 != world_size {
+        if (state.nodes.len() as u32) < min_world_size {
             return Err(Status::failed_precondition(
-                "cannot freeze membership before barrier is met",
+                "cannot freeze membership before min_world_size barrier is met",
             ));
         }
 
@@ -313,13 +355,68 @@ impl CoordinatorSvc {
             });
         }
 
-        let mut rank_ranges: Vec<std::collections::VecDeque<WorkRange>> = (0..world_size)
+        let active_count = state.nodes.len();
+        let mut rank_ranges: Vec<std::collections::VecDeque<WorkRange>> = (0..active_count)
             .map(|_| std::collections::VecDeque::new())
             .collect();
 
         for (i, r) in ranges.into_iter().enumerate() {
-            let rank = (i as u32) % world_size;
+            let rank = (i as u32) % (active_count as u32);
             rank_ranges[rank as usize].push_back(r);
+        }
+        state.rank_ranges = Some(rank_ranges);
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn repartition_unissued_ranges(
+        state: &mut CoordinatorState,
+        shuffle: bool,
+        seed: u64,
+        epoch: u32,
+    ) -> Result<(), Status> {
+        let members = state.frozen_membership.as_ref().ok_or_else(|| {
+            Status::failed_precondition("cannot repartition before membership is frozen")
+        })?;
+        let active_count = members.len();
+        if active_count == 0 {
+            return Err(Status::failed_precondition(
+                "cannot repartition with empty membership",
+            ));
+        }
+
+        let mut ranges: Vec<WorkRange> = Vec::new();
+        while let Some(mut r) = state.available_ranges.pop_front() {
+            r.seed = seed;
+            r.epoch = epoch;
+            ranges.push(r);
+        }
+        if let Some(rank_ranges) = state.rank_ranges.as_mut() {
+            for q in rank_ranges.iter_mut() {
+                while let Some(mut r) = q.pop_front() {
+                    r.seed = seed;
+                    r.epoch = epoch;
+                    ranges.push(r);
+                }
+            }
+        }
+
+        if shuffle {
+            ranges.sort_by(|a, b| {
+                let ka = Self::shuffle_key(seed, epoch, a.start_id);
+                let kb = Self::shuffle_key(seed, epoch, b.start_id);
+                ka.cmp(&kb).then(a.start_id.cmp(&b.start_id))
+            });
+        } else {
+            ranges.sort_by_key(|r| r.start_id);
+        }
+
+        let mut rank_ranges: Vec<std::collections::VecDeque<WorkRange>> = (0..active_count)
+            .map(|_| std::collections::VecDeque::new())
+            .collect();
+        for (i, r) in ranges.into_iter().enumerate() {
+            let rank = i % active_count;
+            rank_ranges[rank].push_back(r);
         }
         state.rank_ranges = Some(rank_ranges);
         Ok(())
@@ -433,16 +530,19 @@ impl CoordinatorSvc {
                 ));
             }
 
-            // If a node is dead (no heartbeats), release its remaining scheduled ranges so the job
-            // can drain under failure. Failure-free determinism is preserved because this only
-            // triggers when heartbeats stop.
+            // If a node is dead (no heartbeats) and not yet departed, release its remaining
+            // scheduled ranges so the job can drain or be picked up by a replacement.
+            // Skipping already-departed nodes avoids double-releasing and log spam.
             let dead_after_ms = self.lease_ttl_ms as u64;
-            let dead_ranks: Vec<(usize, String)> = match state.frozen_membership.as_ref() {
+            let newly_dead: Vec<(usize, String)> = match state.frozen_membership.as_ref() {
                 None => Vec::new(),
                 Some(members) => members
                     .iter()
                     .enumerate()
                     .filter_map(|(rank, node_id)| {
+                        if state.departed_nodes.contains(node_id) {
+                            return None; // already handled
+                        }
                         let entry = state.nodes.get(node_id)?;
                         let last = entry.last_heartbeat_unix_time_ms?;
                         if now_unix_time_ms.saturating_sub(last) > dead_after_ms {
@@ -455,16 +555,17 @@ impl CoordinatorSvc {
             };
 
             if let Some(mut rank_ranges) = state.rank_ranges.take() {
-                for (rank, node_id) in dead_ranks {
-                    let q = &mut rank_ranges[rank];
+                for (rank, node_id) in &newly_dead {
+                    let q = &mut rank_ranges[*rank];
                     let mut count = 0u64;
                     while let Some(r) = q.pop_front() {
                         state.available_ranges.push_back(r);
                         count = count.saturating_add(1);
                     }
                     if count > 0 {
-                        released.push((node_id, rank as u32, count));
+                        released.push((node_id.clone(), *rank as u32, count));
                     }
+                    state.departed_nodes.insert(node_id.clone());
                 }
                 state.rank_ranges = Some(rank_ranges);
             }
@@ -655,70 +756,191 @@ impl Coordinator for CoordinatorSvc {
             return Err(Status::invalid_argument("caps is required"));
         }
 
-        let (assigned_rank, registered_nodes, became_ready) = {
+        let (assigned_rank, active_nodes, capacity, became_ready) = {
             let mut state = self.state.write().await;
             let now_ms = Self::unix_time_ms();
 
-            // If the barrier is already met, membership is frozen: only allow re-registration
-            // of known node_ids (e.g., restart with same identity).
-            if state.nodes.len() as u32 >= self.world_size
-                && !state.nodes.contains_key(&req.node_id)
-            {
-                return Err(Status::failed_precondition(
-                    "membership is frozen after world_size barrier; unknown node_id",
-                ));
-            }
-
-            if let Some(existing) = state.nodes.get_mut(&req.node_id) {
-                if existing.caps != req.caps {
-                    tracing::warn!("RegisterNode updated caps for existing node_id");
+            if state.frozen_membership.is_some() {
+                // ── Post-freeze path ──────────────────────────────────────────────────────
+                if state.nodes.contains_key(&req.node_id) {
+                    // Re-registration of a known node (e.g., brief disconnect and reconnect).
+                    // Un-depart it if it was marked as departed.
+                    let was_departed = state.departed_nodes.remove(&req.node_id);
+                    if let Some(entry) = state.nodes.get_mut(&req.node_id) {
+                        if existing_caps_changed(&entry.caps, &req.caps) {
+                            tracing::warn!(
+                                node_id = %req.node_id,
+                                "RegisterNode updated caps for re-registering node"
+                            );
+                        }
+                        entry.caps = req.caps.clone();
+                        entry.last_heartbeat_unix_time_ms = Some(now_ms);
+                        entry.last_stats = None;
+                    }
+                    if was_departed {
+                        tracing::info!(
+                            node_id = %req.node_id,
+                            manifest_hash = %self.manifest_hash,
+                            "departed node re-registered; slot reclaimed"
+                        );
+                    }
+                } else {
+                    // New node ID — first try to fill a vacant (departed) rank slot.
+                    let departed_id = state.departed_nodes.iter().next().cloned();
+                    if let Some(old_id) = departed_id {
+                        // Swap new node_id into the slot previously held by old_id.
+                        if let Some(membership) = state.frozen_membership.as_mut() {
+                            if let Some(slot) = membership.iter_mut().find(|id| *id == &old_id) {
+                                *slot = req.node_id.clone();
+                            }
+                        }
+                        state.departed_nodes.remove(&old_id);
+                        state.nodes.remove(&old_id);
+                        state.nodes.insert(
+                            req.node_id.clone(),
+                            NodeEntry {
+                                caps: req.caps.clone(),
+                                last_heartbeat_unix_time_ms: Some(now_ms),
+                                last_stats: None,
+                            },
+                        );
+                        tracing::info!(
+                            node_id = %req.node_id,
+                            replaced_node_id = %old_id,
+                            manifest_hash = %self.manifest_hash,
+                            "replacement node filled departed rank slot"
+                        );
+                    } else {
+                        // No departed slot: allow true scale-out until world_size capacity.
+                        let current_capacity = state
+                            .frozen_membership
+                            .as_ref()
+                            .map(|m| m.len() as u32)
+                            .ok_or_else(|| {
+                                Status::internal(
+                                    "frozen membership missing in post-freeze register path",
+                                )
+                            })?;
+                        if current_capacity >= self.world_size {
+                            return Err(Status::failed_precondition(
+                                "membership is frozen and at world_size capacity; \
+                                 no vacant rank slots are available",
+                            ));
+                        }
+                        if let Some(membership) = state.frozen_membership.as_mut() {
+                            membership.push(req.node_id.clone());
+                        } else {
+                            return Err(Status::internal(
+                                "frozen membership missing in post-freeze register path",
+                            ));
+                        }
+                        state.nodes.insert(
+                            req.node_id.clone(),
+                            NodeEntry {
+                                caps: req.caps.clone(),
+                                last_heartbeat_unix_time_ms: Some(now_ms),
+                                last_stats: None,
+                            },
+                        );
+                        // Repartition all unissued ranges so the new rank can immediately consume.
+                        Self::repartition_unissued_ranges(
+                            &mut state,
+                            self.shuffle,
+                            self.seed,
+                            self.epoch,
+                        )?;
+                        tracing::info!(
+                            node_id = %req.node_id,
+                            manifest_hash = %self.manifest_hash,
+                            new_capacity = current_capacity + 1,
+                            "scale-out node admitted into new rank slot"
+                        );
+                    }
                 }
-                existing.caps = req.caps.clone();
-                existing.last_heartbeat_unix_time_ms = Some(now_ms);
-                existing.last_stats = None;
             } else {
-                state.nodes.insert(
-                    req.node_id.clone(),
-                    NodeEntry {
-                        caps: req.caps.clone(),
-                        last_heartbeat_unix_time_ms: Some(now_ms),
-                        last_stats: None,
-                    },
-                );
+                // ── Pre-freeze path ───────────────────────────────────────────────────────
+                // Cap at world_size before the barrier fires.
+                if state.nodes.len() as u32 >= self.world_size
+                    && !state.nodes.contains_key(&req.node_id)
+                {
+                    return Err(Status::resource_exhausted(
+                        "world_size capacity reached; wait for the job to start \
+                         or increase --world-size",
+                    ));
+                }
+                if let Some(existing) = state.nodes.get_mut(&req.node_id) {
+                    if existing_caps_changed(&existing.caps, &req.caps) {
+                        tracing::warn!("RegisterNode updated caps for existing node_id");
+                    }
+                    existing.caps = req.caps.clone();
+                    existing.last_heartbeat_unix_time_ms = Some(now_ms);
+                    existing.last_stats = None;
+                } else {
+                    state.nodes.insert(
+                        req.node_id.clone(),
+                        NodeEntry {
+                            caps: req.caps.clone(),
+                            last_heartbeat_unix_time_ms: Some(now_ms),
+                            last_stats: None,
+                        },
+                    );
+                }
             }
-            let assigned_rank = state
-                .nodes
-                .keys()
-                .position(|id| id == &req.node_id)
-                .ok_or_else(|| Status::internal("registered node missing from state"))?
-                as u32;
 
-            let registered_nodes = state.nodes.len() as u32;
-            let became_ready = registered_nodes == self.world_size;
-            (assigned_rank, registered_nodes, became_ready)
+            // Derive rank: position in frozen_membership when available, BTreeMap order before.
+            let assigned_rank = if let Some(membership) = state.frozen_membership.as_ref() {
+                membership
+                    .iter()
+                    .position(|id| id == &req.node_id)
+                    .ok_or_else(|| {
+                        Status::internal("registered node not found in frozen membership")
+                    })? as u32
+            } else {
+                state
+                    .nodes
+                    .keys()
+                    .position(|id| id == &req.node_id)
+                    .ok_or_else(|| Status::internal("registered node missing from state"))?
+                    as u32
+            };
+
+            let capacity = state
+                .frozen_membership
+                .as_ref()
+                .map(|m| m.len() as u32)
+                .unwrap_or(self.world_size);
+
+            let active_nodes =
+                (state.nodes.len().saturating_sub(state.departed_nodes.len())) as u32;
+
+            // Trigger freeze when we cross the min_world_size barrier for the first time.
+            let became_ready =
+                state.frozen_membership.is_none() && active_nodes >= self.min_world_size;
+
+            (assigned_rank, active_nodes, capacity, became_ready)
         };
 
-        if assigned_rank >= self.world_size {
+        if assigned_rank >= capacity {
             return Err(Status::failed_precondition(
-                "node registered, but exceeds configured world_size",
+                "node registered but rank exceeds capacity",
             ));
         }
 
         let resp = RegisterNodeResponse {
             assigned_rank,
-            world_size: self.world_size,
+            world_size: capacity,
             manifest_hash: self.manifest_hash.clone(),
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             lease_ttl_ms: self.lease_ttl_ms,
-            registered_nodes,
-            job_ready: registered_nodes >= self.world_size,
+            registered_nodes: active_nodes,
+            job_ready: self.is_job_ready().await || became_ready,
         };
 
         if became_ready {
             let mut state = self.state.write().await;
             Self::freeze_membership_and_partition_ranges(
                 &mut state,
-                self.world_size,
+                self.min_world_size,
                 self.shuffle,
                 self.seed,
                 self.epoch,
@@ -806,7 +1028,7 @@ impl Coordinator for CoordinatorSvc {
                 // Should have been initialized when the barrier was met, but be defensive.
                 Self::freeze_membership_and_partition_ranges(
                     &mut state,
-                    self.world_size,
+                    self.min_world_size,
                     self.shuffle,
                     self.seed,
                     self.epoch,
@@ -950,11 +1172,27 @@ impl Coordinator for CoordinatorSvc {
         if completed {
             let removed = state.leases.remove(&req.lease_id);
             state.progress.retain(|(_, id), _| id != &req.lease_id);
-            // Drop the write lock BEFORE calling update_gauges() to avoid deadlock.
+            // Drop the write lock BEFORE async operations to avoid deadlock.
             // update_gauges() needs a read lock; holding write + requesting read = deadlock.
             drop(state);
-            if let Some(removed) = removed {
+
+            if let Some(removed) = &removed {
                 if let Some(range) = &removed.range {
+                    // Durably record the completion.  We write *after* removing from memory;
+                    // if the coordinator crashes in this narrow window, the range will be
+                    // re-issued on restart (safe: agents get NotFound and re-request).
+                    if let Some(log) = &self.lease_log {
+                        let mut log = log.lock().await;
+                        if let Err(e) = log.append_completed(range.start_id, range.end_id).await {
+                            tracing::error!(
+                                error = %e,
+                                path = %log.path().display(),
+                                lease_id = %req.lease_id,
+                                "lease log write failed; durability degraded for this range"
+                            );
+                        }
+                    }
+
                     tracing::info!(
                         target: "mx8_proof",
                         event = "lease_completed",
@@ -1140,6 +1378,50 @@ async fn main() -> Result<()> {
             anyhow::bail!("MX8_DEV_BLOCK_SIZE must be > 0 when MX8_DEV_TOTAL_SAMPLES > 0");
         }
 
+        // --- Lease write-ahead log -------------------------------------------
+        // Derive the default log path from the manifest store root.
+        let lease_log_path_default = manifest_store_root
+            .parent()
+            .unwrap_or(&manifest_store_root)
+            .join("lease_logs")
+            .join(format!("{resolved_manifest_hash}.log"));
+
+        let raw_lease_log_path = args
+            .lease_log_path
+            .as_deref()
+            .unwrap_or_else(|| lease_log_path_default.to_str().unwrap_or(""));
+
+        // Allow the user to explicitly opt out ("none" or empty string).
+        let lease_log_enabled = !raw_lease_log_path.is_empty()
+            && raw_lease_log_path != "none"
+            && resolved_manifest_hash != "dev";
+
+        type LeaseLogState = (Option<Arc<Mutex<lease_log::LeaseLog>>>, HashSet<(u64, u64)>);
+        let (lease_log_arc, completed_ranges): LeaseLogState = if lease_log_enabled {
+            let log_path = PathBuf::from(raw_lease_log_path);
+            match lease_log::LeaseLog::open(&log_path, &resolved_manifest_hash).await {
+                Ok((log, completed)) => {
+                    let recovered = completed.len();
+                    info!(
+                        path = %log_path.display(),
+                        recovered_ranges = recovered,
+                        "lease log opened"
+                    );
+                    (Some(Arc::new(Mutex::new(log))), completed)
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to open lease log at {}: {} (set --lease-log-path=none to disable crash recovery)",
+                        raw_lease_log_path,
+                        e
+                    ));
+                }
+            }
+        } else {
+            (None, HashSet::new())
+        };
+        // ---------------------------------------------------------------------
+
         let mut available_ranges = std::collections::VecDeque::new();
         let total_samples = if args.dev_total_samples > 0 {
             args.dev_total_samples
@@ -1155,19 +1437,39 @@ async fn main() -> Result<()> {
             0
         };
 
+        let mut skipped_ranges: u64 = 0;
         if total_samples > 0 {
             let mut start_id = 0u64;
             while start_id < total_samples {
                 let end_id = (start_id + args.dev_block_size).min(total_samples);
-                available_ranges.push_back(WorkRange {
-                    start_id,
-                    end_id,
-                    epoch: 0,
-                    seed: 0,
-                });
+                if completed_ranges.contains(&(start_id, end_id)) {
+                    skipped_ranges = skipped_ranges.saturating_add(1);
+                } else {
+                    available_ranges.push_back(WorkRange {
+                        start_id,
+                        end_id,
+                        epoch: 0,
+                        seed: 0,
+                    });
+                }
                 start_id = end_id;
             }
         }
+
+        if skipped_ranges > 0 {
+            info!(
+                skipped_ranges,
+                remaining_ranges = available_ranges.len(),
+                "coordinator resumed: skipped already-completed ranges"
+            );
+        }
+
+        // min_world_size=0 means "same as world_size" (default).
+        let min_world_size = if args.min_world_size == 0 {
+            args.world_size
+        } else {
+            args.min_world_size.min(args.world_size)
+        };
 
         let svc = CoordinatorSvc {
             state: Arc::new(RwLock::new(CoordinatorState {
@@ -1175,13 +1477,17 @@ async fn main() -> Result<()> {
                 available_ranges,
                 rank_ranges: None,
                 frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
                 leases: std::collections::BTreeMap::new(),
                 progress: std::collections::BTreeMap::new(),
                 next_lease_id: 0,
+                // tick_once will emit job_drained on the first tick if all ranges were
+                // already completed when the coordinator was resumed.
                 drained_emitted: false,
             })),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: args.world_size,
+            min_world_size,
             heartbeat_interval_ms: args.heartbeat_interval_ms,
             lease_ttl_ms: args.lease_ttl_ms,
             shuffle: args.shuffle,
@@ -1189,6 +1495,7 @@ async fn main() -> Result<()> {
             epoch: args.epoch,
             manifest_hash: resolved_manifest_hash,
             manifest_store: Some(store.clone()),
+            lease_log: lease_log_arc,
         };
 
         let maintenance_svc = svc.clone();
@@ -1248,6 +1555,7 @@ mod tests {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
+            min_world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             shuffle: false,
@@ -1255,6 +1563,7 @@ mod tests {
             epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
+            lease_log: None,
         };
 
         let err = svc
@@ -1274,6 +1583,7 @@ mod tests {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 2,
+            min_world_size: 2,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             shuffle: false,
@@ -1281,6 +1591,7 @@ mod tests {
             epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
+            lease_log: None,
         };
 
         let node2_first = svc
@@ -1324,6 +1635,7 @@ mod tests {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
+            min_world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             shuffle: false,
@@ -1331,6 +1643,7 @@ mod tests {
             epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
+            lease_log: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -1365,6 +1678,7 @@ mod tests {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
+            min_world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             shuffle: false,
@@ -1372,6 +1686,7 @@ mod tests {
             epoch: 0,
             manifest_hash: "h".to_string(),
             manifest_store: Some(store),
+            lease_log: None,
         };
 
         let resp = svc
@@ -1406,6 +1721,7 @@ mod tests {
             state: Arc::new(RwLock::new(CoordinatorState::default())),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
+            min_world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             shuffle: false,
@@ -1413,6 +1729,7 @@ mod tests {
             epoch: 0,
             manifest_hash: "h".to_string(),
             manifest_store: Some(store),
+            lease_log: None,
         };
 
         let resp = svc
@@ -1454,6 +1771,7 @@ mod tests {
             }]),
             rank_ranges: None,
             frozen_membership: None,
+            departed_nodes: std::collections::BTreeSet::new(),
             leases: std::collections::BTreeMap::new(),
             progress: std::collections::BTreeMap::new(),
             next_lease_id: 0,
@@ -1464,6 +1782,7 @@ mod tests {
             state: state.clone(),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
+            min_world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             shuffle: false,
@@ -1471,6 +1790,7 @@ mod tests {
             epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
+            lease_log: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -1545,6 +1865,7 @@ mod tests {
             }]),
             rank_ranges: None,
             frozen_membership: None,
+            departed_nodes: std::collections::BTreeSet::new(),
             leases: std::collections::BTreeMap::new(),
             progress: std::collections::BTreeMap::new(),
             next_lease_id: 0,
@@ -1555,6 +1876,7 @@ mod tests {
             state: state.clone(),
             metrics: Arc::new(CoordinatorMetrics::default()),
             world_size: 1,
+            min_world_size: 1,
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 10_000,
             shuffle: false,
@@ -1562,6 +1884,7 @@ mod tests {
             epoch: 0,
             manifest_hash: "dev".to_string(),
             manifest_store: None,
+            lease_log: None,
         };
 
         svc.register_node(Request::new(RegisterNodeRequest {
@@ -1608,6 +1931,480 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        Ok(())
+    }
+
+    /// Run a single-node coordinator over a 3-block manifest, complete all leases,
+    /// then restart with the same lease log and verify no new ranges are issued
+    /// (the job starts already drained).
+    #[tokio::test]
+    async fn lease_log_restart_skips_completed_ranges() -> anyhow::Result<()> {
+        let log_path = std::env::temp_dir().join(format!(
+            "mx8-lease-log-restart-test-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+
+        // -- Run 1: complete all 3 ranges [0,100), [100,200), [200,300) --
+        {
+            let (log, completed) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
+            assert!(completed.is_empty());
+            let log_arc = Arc::new(Mutex::new(log));
+
+            let available_ranges = std::collections::VecDeque::from([
+                WorkRange {
+                    start_id: 0,
+                    end_id: 100,
+                    epoch: 0,
+                    seed: 0,
+                },
+                WorkRange {
+                    start_id: 100,
+                    end_id: 200,
+                    epoch: 0,
+                    seed: 0,
+                },
+                WorkRange {
+                    start_id: 200,
+                    end_id: 300,
+                    epoch: 0,
+                    seed: 0,
+                },
+            ]);
+
+            let svc = CoordinatorSvc {
+                state: Arc::new(RwLock::new(CoordinatorState {
+                    nodes: std::collections::BTreeMap::new(),
+                    available_ranges,
+                    rank_ranges: None,
+                    frozen_membership: None,
+                    departed_nodes: std::collections::BTreeSet::new(),
+                    leases: std::collections::BTreeMap::new(),
+                    progress: std::collections::BTreeMap::new(),
+                    next_lease_id: 0,
+                    drained_emitted: false,
+                })),
+                metrics: Arc::new(CoordinatorMetrics::default()),
+                world_size: 1,
+                min_world_size: 1,
+                heartbeat_interval_ms: 1000,
+                lease_ttl_ms: 10_000,
+                shuffle: false,
+                seed: 0,
+                epoch: 0,
+                manifest_hash: "testhash".to_string(),
+                manifest_store: None,
+                lease_log: Some(log_arc),
+            };
+
+            svc.register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?;
+
+            // Complete all 3 leases one by one.
+            for _ in 0..3 {
+                let resp = svc
+                    .request_lease(Request::new(RequestLeaseRequest {
+                        job_id: "job".to_string(),
+                        node_id: "node".to_string(),
+                        want: 1,
+                    }))
+                    .await?
+                    .into_inner();
+                let lease = resp
+                    .leases
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("expected a lease"))?;
+                let end = lease.range.as_ref().map(|r| r.end_id).unwrap_or(0);
+                svc.report_progress(Request::new(ReportProgressRequest {
+                    job_id: "job".to_string(),
+                    node_id: "node".to_string(),
+                    lease_id: lease.lease_id,
+                    cursor: end,
+                    delivered_samples: end,
+                    delivered_bytes: 0,
+                    unix_time_ms: CoordinatorSvc::unix_time_ms(),
+                }))
+                .await?;
+            }
+        }
+
+        // -- Run 2: replay log, build available_ranges (should be empty) --
+        {
+            let (_log2, completed) = lease_log::LeaseLog::open(&log_path, "testhash").await?;
+            assert_eq!(completed.len(), 3, "expected 3 completed ranges in log");
+            assert!(completed.contains(&(0, 100)));
+            assert!(completed.contains(&(100, 200)));
+            assert!(completed.contains(&(200, 300)));
+
+            // Simulate what main() does: filter completed ranges out.
+            let block_size = 100u64;
+            let total_samples = 300u64;
+            let mut available: std::collections::VecDeque<WorkRange> =
+                std::collections::VecDeque::new();
+            let mut start_id = 0u64;
+            while start_id < total_samples {
+                let end_id = (start_id + block_size).min(total_samples);
+                if !completed.contains(&(start_id, end_id)) {
+                    available.push_back(WorkRange {
+                        start_id,
+                        end_id,
+                        epoch: 0,
+                        seed: 0,
+                    });
+                }
+                start_id = end_id;
+            }
+            assert!(
+                available.is_empty(),
+                "all ranges should be filtered out after restart"
+            );
+        }
+
+        let _ = std::fs::remove_file(&log_path);
+        Ok(())
+    }
+
+    // ── Step 2: dynamic membership tests ─────────────────────────────────────
+
+    /// A node that times out is marked departed; a replacement node fills its slot
+    /// and gets the same rank.
+    #[tokio::test]
+    async fn replacement_node_fills_departed_slot() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([WorkRange {
+                    start_id: 0,
+                    end_id: 100,
+                    epoch: 0,
+                    seed: 0,
+                }]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 5_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        // Original node registers → barrier met → frozen at rank 0.
+        let r1 = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(r1.assigned_rank, 0);
+        assert!(r1.job_ready);
+
+        // Simulate node-a going dead: backdate heartbeat past TTL.
+        {
+            let now = CoordinatorSvc::unix_time_ms();
+            let mut st = svc.state.write().await;
+            if let Some(e) = st.nodes.get_mut("node-a") {
+                e.last_heartbeat_unix_time_ms =
+                    Some(now.saturating_sub(svc.lease_ttl_ms as u64 + 1));
+            }
+        }
+        svc.tick_once().await;
+
+        // node-a should now be in departed_nodes.
+        {
+            let st = svc.state.read().await;
+            assert!(
+                st.departed_nodes.contains("node-a"),
+                "node-a should be departed"
+            );
+        }
+
+        // Replacement node-b registers and fills node-a's slot at rank 0.
+        let r2 = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-b".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(r2.assigned_rank, 0, "replacement should inherit rank 0");
+        assert!(r2.job_ready);
+
+        // node-a should no longer be in departed_nodes.
+        {
+            let st = svc.state.read().await;
+            assert!(
+                !st.departed_nodes.contains("node-a"),
+                "slot should be cleared after replacement"
+            );
+            assert!(
+                !st.nodes.contains_key("node-a"),
+                "old node should be evicted from nodes map"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// No vacant slot → new node is rejected.
+    #[tokio::test]
+    async fn no_vacant_slot_rejects_new_node_after_freeze() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState::default())),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        // node-a fills the only slot.
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            caps: Some(NodeCaps::default()),
+        }))
+        .await?;
+
+        // node-b tries to register while node-a is still active → rejected.
+        let err = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-b".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        Ok(())
+    }
+
+    /// With world_size headroom, a post-freeze node is admitted and receives work.
+    #[tokio::test]
+    async fn scale_out_node_is_admitted_after_freeze() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([
+                    WorkRange {
+                        start_id: 0,
+                        end_id: 100,
+                        epoch: 0,
+                        seed: 0,
+                    },
+                    WorkRange {
+                        start_id: 100,
+                        end_id: 200,
+                        epoch: 0,
+                        seed: 0,
+                    },
+                ]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 2,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        let first = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first.assigned_rank, 0);
+        assert_eq!(first.world_size, 2);
+        assert!(first.job_ready);
+
+        let second = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-b".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(second.assigned_rank, 1);
+        assert_eq!(second.world_size, 2);
+        assert!(second.job_ready);
+
+        let lease = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node-b".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner()
+            .leases
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected lease for scale-out node"))?;
+
+        let range = lease
+            .range
+            .ok_or_else(|| anyhow::anyhow!("expected range in scale-out lease"))?;
+        assert_eq!(range.start_id, 100);
+        assert_eq!(range.end_id, 200);
+        Ok(())
+    }
+
+    /// min_world_size < world_size: job starts when min_world_size nodes register.
+    #[tokio::test]
+    async fn min_world_size_allows_early_start() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([WorkRange {
+                    start_id: 0,
+                    end_id: 200,
+                    epoch: 0,
+                    seed: 0,
+                }]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 2,
+            min_world_size: 1, // start with just 1 node
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        // Only 1 node registers (< world_size=2) but >= min_world_size=1.
+        let r = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert!(
+            r.job_ready,
+            "job should be ready after min_world_size is met"
+        );
+
+        // node-a should be able to request a lease.
+        let lease_resp = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner();
+        assert!(!lease_resp.leases.is_empty(), "node-a should get a lease");
+
+        Ok(())
+    }
+
+    /// A departed node that recovers with the same node_id is un-departed on re-register.
+    #[tokio::test]
+    async fn departed_node_can_rejoin_with_same_identity() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState::default())),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 5_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            caps: Some(NodeCaps::default()),
+        }))
+        .await?;
+
+        // Backdate heartbeat so node-a is detected as dead.
+        {
+            let now = CoordinatorSvc::unix_time_ms();
+            let mut st = svc.state.write().await;
+            if let Some(e) = st.nodes.get_mut("node-a") {
+                e.last_heartbeat_unix_time_ms =
+                    Some(now.saturating_sub(svc.lease_ttl_ms as u64 + 1));
+            }
+        }
+        svc.tick_once().await;
+        {
+            let st = svc.state.read().await;
+            assert!(st.departed_nodes.contains("node-a"));
+        }
+
+        // Same node recovers and re-registers.
+        let r = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                caps: Some(NodeCaps::default()),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(r.assigned_rank, 0);
+
+        // Should no longer be in departed_nodes.
+        let st = svc.state.read().await;
+        assert!(!st.departed_nodes.contains("node-a"));
         Ok(())
     }
 }

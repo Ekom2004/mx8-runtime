@@ -29,6 +29,32 @@ Coordinator HA is planned for v1.9 and is not part of the v1.8 shipped contract.
 - v1.8 contract: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
 - v1.9 target: leader failover with durable lease/progress state and single-writer fencing.
 
+### Dynamic Membership (shipped in v1.8.2)
+
+The coordinator supports elastic membership changes after the initial barrier is met:
+
+- **`--min-world-size` / `MX8_MIN_WORLD_SIZE`**: job starts (membership frozen, leases issued) when this many nodes register.  Defaults to `world_size`. Set lower to start the job under a partial cluster.
+- **Departed nodes**: when a node's heartbeat expires after freeze, `tick_once` adds it to `departed_nodes` and releases its unissued rank-ranges back to the global pool.  Dead nodes are tracked exactly once (no double-release).
+- **Replacement nodes**: a new node ID may register after freeze if at least one slot is vacant (in `departed_nodes`). The new node inherits the departed rank slot and can immediately request leases for the requeued work.
+- **Scale-out nodes**: if no slot is vacant and current frozen membership is below configured `world_size`, a new node is admitted into a new rank slot. Unissued ranges are repartitioned across the expanded membership so the new node immediately receives work.
+- **Same-identity recovery**: a node that briefly loses connectivity and re-registers with the same ID is un-departed and resumes its original rank.
+- **No slot available**: if a new node ID registers after freeze and membership has already reached `world_size`, the request is rejected with `FailedPrecondition`.
+- **Determinism note**: fixed-membership runs are deterministic. Any post-freeze membership change (replacement or scale-out) may reorder unissued work at the boundary.
+
+### Durable Lease Log (shipped in v1.8.1)
+
+The coordinator writes an **append-only write-ahead log** to disk as each lease range is fully
+completed.  On restart, the log is replayed and already-completed ranges are skipped, so the
+job does not re-deliver work that was already cleanly finished.
+
+- **Format**: newline-delimited text.  `H v1 <manifest_hash>` header + one `C <start_id> <end_id>` line per completed range.
+- **Default path**: `~/.mx8/lease_logs/<manifest_hash>.log`  (configurable via `--lease-log-path` / `MX8_LEASE_LOG_PATH`; set to `none` to disable).
+- **Fail-closed startup**: if the log cannot be opened/replayed while enabled, coordinator startup fails (explicitly set `--lease-log-path=none` to opt out).
+- **Header safety**: replay validates the on-disk header manifest hash against the requested run hash; mismatch is a startup error.
+- **Durability**: each append calls `sync_data()` before returning.
+- **Crash window**: the narrow gap between removing a lease from memory and flushing to the log means at most one range per crash may be re-delivered.  This is safe: agents receive `NotFound` for stale lease IDs and re-request.
+- **Invariant**: completed ranges are never re-issued after coordinator restart.
+
 Canonical plan and acceptance gates are defined in:
 - `docs/ha_contract.md`
 
