@@ -31,6 +31,8 @@ Current inventory size: `237` variables.
 | `MX8_COORD_HA_LEADER_ID` | `<hostname>-<pid>` | coordinator | non-empty string | stable |
 | `MX8_COORD_HA_LEASE_TTL_MS` | `5000` | coordinator | integer >= 1 | stable |
 | `MX8_COORD_HA_RENEW_INTERVAL_MS` | `1000` | coordinator | integer >= 1 | stable |
+| `MX8_COORD_STATE_STORE_ENABLE` | `false` (auto-true with HA) | coordinator | boolish (`true/false/1/0`) | stable |
+| `MX8_COORD_STATE_STORE_PATH` | `<manifest_store_root>/../state/<manifest_hash>.json` | coordinator | filesystem path | stable |
 | `MX8_WORLD_SIZE` | `1` | coordinator | integer >= 1 | stable |
 | `MX8_HEARTBEAT_INTERVAL_MS` | `1000` | coordinator | integer >= 1 | stable |
 | `MX8_LEASE_TTL_MS` | `10000` | coordinator | integer >= 1 | stable |
@@ -145,6 +147,8 @@ MX8_COORD_HA_LEADER_ID
 MX8_COORD_HA_LEASE_PATH
 MX8_COORD_HA_LEASE_TTL_MS
 MX8_COORD_HA_RENEW_INTERVAL_MS
+MX8_COORD_STATE_STORE_ENABLE
+MX8_COORD_STATE_STORE_PATH
 MX8_COORD_URL
 MX8_DATASET_LINK
 MX8_DATASET_LINK_A

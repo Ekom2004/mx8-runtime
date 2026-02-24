@@ -40,6 +40,9 @@ echo "[mx8] prod_readiness: static checks"
 echo "[mx8] prod_readiness: leader fencing semantics"
 ./scripts/leader_fencing_gate.sh
 
+echo "[mx8] prod_readiness: durable state store roundtrip"
+./scripts/state_store_gate.sh
+
 echo "[mx8] prod_readiness: coordinator restart recovery"
 ./scripts/coordinator_restart_gate.sh
 

@@ -16,6 +16,10 @@ impl Counter {
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    pub fn set(&self, value: u64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Default)]

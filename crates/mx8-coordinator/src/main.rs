@@ -3,12 +3,14 @@
 
 mod leader_lease;
 mod lease_log;
+mod state_store;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +38,8 @@ const DEFAULT_HA_LEASE_TTL_MS: u64 = 5000;
 const DEFAULT_HA_RENEW_INTERVAL_MS: u64 = 1000;
 
 static HA_GATE: OnceLock<Arc<leader_lease::LeaderGate>> = OnceLock::new();
+static HA_APPLIED_TERM: AtomicU64 = AtomicU64::new(0);
+static STATE_STORE: OnceLock<Arc<state_store::FileCoordinatorStore>> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "mx8-coordinator")]
@@ -180,6 +184,23 @@ struct Args {
         default_value_t = DEFAULT_HA_RENEW_INTERVAL_MS
     )]
     ha_renew_interval_ms: u64,
+
+    /// Enable durable shared coordinator state snapshots.
+    ///
+    /// This is automatically enabled when `--ha-enable` is set.
+    #[arg(
+        long,
+        env = "MX8_COORD_STATE_STORE_ENABLE",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    state_store_enable: bool,
+
+    /// Durable shared coordinator state snapshot path.
+    ///
+    /// Defaults to `<manifest_store_root>/../state/<manifest_hash>.json`.
+    #[arg(long, env = "MX8_COORD_STATE_STORE_PATH")]
+    state_store_path: Option<String>,
 }
 
 fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> {
@@ -281,16 +302,6 @@ fn default_leader_id() -> String {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "unknown-host".to_string());
     format!("{host}-{}", std::process::id())
-}
-
-#[allow(clippy::result_large_err)]
-fn ensure_write_leader() -> Result<(), Status> {
-    if let Some(gate) = HA_GATE.get() {
-        if !gate.is_leader() {
-            return Err(Status::failed_precondition(gate.fence_message()));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +509,337 @@ impl CoordinatorSvc {
             )));
         }
         None
+    }
+
+    fn current_leader_term() -> u64 {
+        HA_GATE.get().map(|g| g.term()).unwrap_or(0)
+    }
+
+    fn node_caps_to_durable(caps: &NodeCaps) -> state_store::DurableNodeCaps {
+        state_store::DurableNodeCaps {
+            max_fetch_concurrency: caps.max_fetch_concurrency,
+            max_decode_concurrency: caps.max_decode_concurrency,
+            max_inflight_bytes: caps.max_inflight_bytes,
+            max_ram_bytes: caps.max_ram_bytes,
+        }
+    }
+
+    fn node_caps_from_durable(caps: &state_store::DurableNodeCaps) -> NodeCaps {
+        NodeCaps {
+            max_fetch_concurrency: caps.max_fetch_concurrency,
+            max_decode_concurrency: caps.max_decode_concurrency,
+            max_inflight_bytes: caps.max_inflight_bytes,
+            max_ram_bytes: caps.max_ram_bytes,
+        }
+    }
+
+    fn range_to_durable(range: &WorkRange) -> state_store::DurableWorkRange {
+        state_store::DurableWorkRange {
+            start_id: range.start_id,
+            end_id: range.end_id,
+            epoch: range.epoch,
+            seed: range.seed,
+        }
+    }
+
+    fn range_from_durable(range: &state_store::DurableWorkRange) -> WorkRange {
+        WorkRange {
+            start_id: range.start_id,
+            end_id: range.end_id,
+            epoch: range.epoch,
+            seed: range.seed,
+        }
+    }
+
+    async fn build_durable_snapshot(
+        &self,
+        write_term: u64,
+    ) -> state_store::DurableCoordinatorSnapshot {
+        let state = self.state.read().await;
+        let nodes = state
+            .nodes
+            .iter()
+            .map(|(node_id, entry)| state_store::DurableNodeEntry {
+                node_id: node_id.clone(),
+                caps: entry.caps.as_ref().map(Self::node_caps_to_durable),
+                last_heartbeat_unix_time_ms: entry.last_heartbeat_unix_time_ms,
+            })
+            .collect::<Vec<_>>();
+        let available_ranges = state
+            .available_ranges
+            .iter()
+            .map(Self::range_to_durable)
+            .collect::<Vec<_>>();
+        let rank_ranges = state.rank_ranges.as_ref().map(|queues| {
+            queues
+                .iter()
+                .map(|q| q.iter().map(Self::range_to_durable).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        });
+        let leases = state
+            .leases
+            .values()
+            .filter_map(|lease| {
+                lease.range.as_ref().map(|range| state_store::DurableLease {
+                    lease_id: lease.lease_id.clone(),
+                    node_id: lease.node_id.clone(),
+                    range: Self::range_to_durable(range),
+                    cursor: lease.cursor,
+                    expires_unix_time_ms: lease.expires_unix_time_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        let progress = state
+            .progress
+            .iter()
+            .map(
+                |((node_id, lease_id), cursor)| state_store::DurableProgress {
+                    node_id: node_id.clone(),
+                    lease_id: lease_id.clone(),
+                    cursor: *cursor,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut completed_ranges = state
+            .completed_ranges
+            .iter()
+            .map(|(start_id, end_id)| state_store::DurableRangeKey {
+                start_id: *start_id,
+                end_id: *end_id,
+            })
+            .collect::<Vec<_>>();
+        completed_ranges.sort_by_key(|r| (r.start_id, r.end_id));
+        state_store::DurableCoordinatorSnapshot {
+            schema_version: 1,
+            manifest_hash: self.manifest_hash.clone(),
+            epoch: self.epoch,
+            write_term,
+            updated_unix_time_ms: Self::unix_time_ms(),
+            nodes,
+            available_ranges,
+            rank_ranges,
+            frozen_membership: state.frozen_membership.clone(),
+            departed_nodes: state.departed_nodes.iter().cloned().collect::<Vec<_>>(),
+            leases,
+            progress,
+            completed_ranges,
+            resume_checkpoint_fingerprint: state.resume_checkpoint_fingerprint,
+            next_lease_id: state.next_lease_id,
+            drained_emitted: state.drained_emitted,
+            metrics: state_store::DurableCoordinatorMetrics {
+                register_total: self.metrics.register_total.get(),
+                heartbeat_total: self.metrics.heartbeat_total.get(),
+                request_lease_total: self.metrics.request_lease_total.get(),
+                leases_granted_total: self.metrics.leases_granted_total.get(),
+                leases_expired_total: self.metrics.leases_expired_total.get(),
+                ranges_requeued_total: self.metrics.ranges_requeued_total.get(),
+                progress_total: self.metrics.progress_total.get(),
+                resume_checkpoint_applied_total: self.metrics.resume_checkpoint_applied_total.get(),
+                resume_checkpoint_rejected_total: self
+                    .metrics
+                    .resume_checkpoint_rejected_total
+                    .get(),
+                resume_ranges_applied_total: self.metrics.resume_ranges_applied_total.get(),
+                active_leases: self.metrics.active_leases.get(),
+                registered_nodes: self.metrics.registered_nodes.get(),
+            },
+        }
+    }
+
+    async fn apply_durable_snapshot(
+        &self,
+        snapshot: &state_store::DurableCoordinatorSnapshot,
+        reason: &'static str,
+    ) -> Result<(), Status> {
+        if snapshot.manifest_hash != self.manifest_hash {
+            return Err(Status::failed_precondition(format!(
+                "state snapshot manifest_hash mismatch: snapshot={} current={}",
+                snapshot.manifest_hash, self.manifest_hash
+            )));
+        }
+        if snapshot.epoch != self.epoch {
+            return Err(Status::failed_precondition(format!(
+                "state snapshot epoch mismatch: snapshot={} current={}",
+                snapshot.epoch, self.epoch
+            )));
+        }
+
+        let mut restored_nodes = std::collections::BTreeMap::new();
+        for entry in &snapshot.nodes {
+            restored_nodes.insert(
+                entry.node_id.clone(),
+                NodeEntry {
+                    caps: entry.caps.as_ref().map(Self::node_caps_from_durable),
+                    last_heartbeat_unix_time_ms: entry.last_heartbeat_unix_time_ms,
+                    last_stats: None,
+                },
+            );
+        }
+        let restored_available = snapshot
+            .available_ranges
+            .iter()
+            .map(Self::range_from_durable)
+            .collect::<std::collections::VecDeque<_>>();
+        let restored_rank_ranges = snapshot.rank_ranges.as_ref().map(|queues| {
+            queues
+                .iter()
+                .map(|q| {
+                    q.iter()
+                        .map(Self::range_from_durable)
+                        .collect::<std::collections::VecDeque<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut restored_leases = std::collections::BTreeMap::new();
+        for lease in &snapshot.leases {
+            restored_leases.insert(
+                lease.lease_id.clone(),
+                Lease {
+                    lease_id: lease.lease_id.clone(),
+                    node_id: lease.node_id.clone(),
+                    range: Some(Self::range_from_durable(&lease.range)),
+                    cursor: lease.cursor,
+                    expires_unix_time_ms: lease.expires_unix_time_ms,
+                },
+            );
+        }
+        let mut restored_progress = std::collections::BTreeMap::new();
+        for p in &snapshot.progress {
+            restored_progress.insert((p.node_id.clone(), p.lease_id.clone()), p.cursor);
+        }
+        let restored_completed = snapshot
+            .completed_ranges
+            .iter()
+            .map(|r| (r.start_id, r.end_id))
+            .collect::<HashSet<_>>();
+
+        {
+            let mut state = self.state.write().await;
+            *state = CoordinatorState {
+                nodes: restored_nodes,
+                available_ranges: restored_available,
+                rank_ranges: restored_rank_ranges,
+                frozen_membership: snapshot.frozen_membership.clone(),
+                departed_nodes: snapshot.departed_nodes.iter().cloned().collect(),
+                leases: restored_leases,
+                progress: restored_progress,
+                completed_ranges: restored_completed,
+                resume_checkpoint_fingerprint: snapshot.resume_checkpoint_fingerprint,
+                next_lease_id: snapshot.next_lease_id,
+                drained_emitted: snapshot.drained_emitted,
+            };
+        }
+
+        self.metrics
+            .register_total
+            .set(snapshot.metrics.register_total);
+        self.metrics
+            .heartbeat_total
+            .set(snapshot.metrics.heartbeat_total);
+        self.metrics
+            .request_lease_total
+            .set(snapshot.metrics.request_lease_total);
+        self.metrics
+            .leases_granted_total
+            .set(snapshot.metrics.leases_granted_total);
+        self.metrics
+            .leases_expired_total
+            .set(snapshot.metrics.leases_expired_total);
+        self.metrics
+            .ranges_requeued_total
+            .set(snapshot.metrics.ranges_requeued_total);
+        self.metrics
+            .progress_total
+            .set(snapshot.metrics.progress_total);
+        self.metrics
+            .resume_checkpoint_applied_total
+            .set(snapshot.metrics.resume_checkpoint_applied_total);
+        self.metrics
+            .resume_checkpoint_rejected_total
+            .set(snapshot.metrics.resume_checkpoint_rejected_total);
+        self.metrics
+            .resume_ranges_applied_total
+            .set(snapshot.metrics.resume_ranges_applied_total);
+        self.metrics
+            .active_leases
+            .set(snapshot.metrics.active_leases);
+        self.metrics
+            .registered_nodes
+            .set(snapshot.metrics.registered_nodes);
+
+        tracing::info!(
+            reason = reason,
+            write_term = snapshot.write_term,
+            updated_unix_time_ms = snapshot.updated_unix_time_ms,
+            nodes = snapshot.nodes.len() as u64,
+            live_leases = snapshot.leases.len() as u64,
+            available_ranges = snapshot.available_ranges.len() as u64,
+            completed_ranges = snapshot.completed_ranges.len() as u64,
+            "applied durable coordinator snapshot"
+        );
+        Ok(())
+    }
+
+    async fn persist_state_store_snapshot(&self) -> Result<(), Status> {
+        let Some(store) = STATE_STORE.get() else {
+            return Ok(());
+        };
+        let snapshot = self
+            .build_durable_snapshot(Self::current_leader_term())
+            .await;
+        store.save(&snapshot).await.map_err(|e| {
+            Status::internal(format!(
+                "state store write failed at {}: {e}",
+                store.path().display()
+            ))
+        })
+    }
+
+    async fn bootstrap_from_state_store(&self) -> Result<(), Status> {
+        let Some(store) = STATE_STORE.get() else {
+            return Ok(());
+        };
+        let loaded = store.load().await.map_err(|e| {
+            Status::internal(format!(
+                "state store load failed at {}: {e}",
+                store.path().display()
+            ))
+        })?;
+        if let Some(snapshot) = loaded {
+            self.apply_durable_snapshot(&snapshot, "startup").await?;
+        } else {
+            self.persist_state_store_snapshot().await?;
+        }
+        HA_APPLIED_TERM.store(Self::current_leader_term(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn ensure_write_leader(&self) -> Result<(), Status> {
+        if let Some(gate) = HA_GATE.get() {
+            if !gate.is_leader() {
+                return Err(Status::failed_precondition(gate.fence_message()));
+            }
+            let current_term = gate.term();
+            let applied = HA_APPLIED_TERM.load(Ordering::Relaxed);
+            if current_term > applied {
+                let Some(store) = STATE_STORE.get() else {
+                    HA_APPLIED_TERM.store(current_term, Ordering::Relaxed);
+                    return Ok(());
+                };
+                let loaded = store.load().await.map_err(|e| {
+                    Status::internal(format!(
+                        "state store load failed at {}: {e}",
+                        store.path().display()
+                    ))
+                })?;
+                if let Some(snapshot) = loaded {
+                    self.apply_durable_snapshot(&snapshot, "leader_term_change")
+                        .await?;
+                }
+                HA_APPLIED_TERM.store(current_term, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_registered(&self, node_id: &str) -> Option<Status> {
@@ -878,6 +1220,14 @@ impl CoordinatorSvc {
     }
 
     async fn tick_once_at(&self, now_unix_time_ms: u64) {
+        if let Err(status) = self.ensure_write_leader().await {
+            tracing::trace!(
+                reason = %status.message(),
+                "tick skipped: coordinator is not current write leader"
+            );
+            return;
+        }
+
         let mut expired: Vec<(Lease, u64)> = Vec::new();
         let mut requeued: Vec<(String, String, WorkRange, u64)> = Vec::new();
         let mut released: Vec<(String, u32, u64)> = Vec::new();
@@ -1124,6 +1474,12 @@ impl CoordinatorSvc {
         }
 
         self.update_gauges().await;
+        if let Err(status) = self.persist_state_store_snapshot().await {
+            tracing::error!(
+                error = %status.message(),
+                "failed to persist durable state after maintenance tick"
+            );
+        }
     }
 
     async fn tick_once(&self) {
@@ -1141,7 +1497,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<RegisterNodeResponse>, Status> {
-        ensure_write_leader()?;
+        self.ensure_write_leader().await?;
         self.metrics.register_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1361,6 +1717,7 @@ impl Coordinator for CoordinatorSvc {
         );
 
         self.update_gauges().await;
+        self.persist_state_store_snapshot().await?;
         Ok(Response::new(resp))
     }
 
@@ -1368,7 +1725,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        ensure_write_leader()?;
+        self.ensure_write_leader().await?;
         self.metrics.heartbeat_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1387,6 +1744,7 @@ impl Coordinator for CoordinatorSvc {
                 entry.last_stats = req.stats.clone();
             }
         }
+        self.persist_state_store_snapshot().await?;
         Ok(Response::new(HeartbeatResponse {}))
     }
 
@@ -1394,7 +1752,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<RequestLeaseRequest>,
     ) -> Result<Response<RequestLeaseResponse>, Status> {
-        ensure_write_leader()?;
+        self.ensure_write_leader().await?;
         self.metrics.request_lease_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1485,6 +1843,8 @@ impl Coordinator for CoordinatorSvc {
             }
         }
 
+        self.persist_state_store_snapshot().await?;
+
         Ok(Response::new(RequestLeaseResponse {
             wait_ms: if leases.is_empty() { 500 } else { 0 },
             leases,
@@ -1495,7 +1855,7 @@ impl Coordinator for CoordinatorSvc {
         &self,
         request: Request<ReportProgressRequest>,
     ) -> Result<Response<ReportProgressResponse>, Status> {
-        ensure_write_leader()?;
+        self.ensure_write_leader().await?;
         self.metrics.progress_total.inc();
         let req = request.into_inner();
         if let Some(status) = Self::validate_id("job_id", &req.job_id) {
@@ -1625,6 +1985,7 @@ impl Coordinator for CoordinatorSvc {
                 }
             }
             self.update_gauges().await;
+            self.persist_state_store_snapshot().await?;
             return Ok(Response::new(ReportProgressResponse {}));
         }
 
@@ -1670,6 +2031,7 @@ impl Coordinator for CoordinatorSvc {
             unix_time_ms = req.unix_time_ms,
             "progress accepted"
         );
+        self.persist_state_store_snapshot().await?;
         Ok(Response::new(ReportProgressResponse {}))
     }
 
@@ -1825,6 +2187,31 @@ async fn main() -> Result<()> {
         if args.dev_total_samples > 0 && args.dev_block_size == 0 {
             anyhow::bail!("MX8_DEV_BLOCK_SIZE must be > 0 when MX8_DEV_TOTAL_SAMPLES > 0");
         }
+
+        // --- Durable shared state store (optional; enabled automatically with HA) ----------
+        let state_store_enabled = args.state_store_enable || args.ha_enable;
+        if state_store_enabled {
+            let state_store_path_default = manifest_store_root
+                .parent()
+                .unwrap_or(&manifest_store_root)
+                .join("state")
+                .join(format!("{resolved_manifest_hash}.json"));
+            let raw_state_store_path = args
+                .state_store_path
+                .clone()
+                .unwrap_or_else(|| state_store_path_default.to_string_lossy().to_string());
+            let store = Arc::new(state_store::FileCoordinatorStore::new(PathBuf::from(
+                raw_state_store_path.clone(),
+            )));
+            if STATE_STORE.set(store).is_err() {
+                tracing::warn!("state store already initialized; keeping existing global store");
+            }
+            info!(
+                path = %raw_state_store_path,
+                "durable coordinator state store enabled"
+            );
+        }
+        // ------------------------------------------------------------------------------------
 
         // --- Leader election + term fencing (optional) -----------------------
         if args.ha_enable {
@@ -2011,6 +2398,8 @@ async fn main() -> Result<()> {
             manifest_store: Some(store.clone()),
             lease_log: lease_log_arc,
         };
+
+        svc.bootstrap_from_state_store().await?;
 
         let maintenance_svc = svc.clone();
         tokio::spawn(async move {

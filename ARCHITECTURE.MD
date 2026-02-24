@@ -29,6 +29,7 @@ Coordinator HA is planned for v1.9 and is not part of the v1.8 shipped contract.
 - v1.8 contract: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
 - v1.9 target: leader failover with durable lease/progress state and single-writer fencing.
 - v1.8.4 foundation: optional lease-file leader election + term fencing for mutating RPCs (`MX8_COORD_HA_ENABLE=1`). This enforces single-writer behavior but does not yet provide shared-state failover continuity.
+- v1.8.5 foundation: optional durable coordinator state snapshots (`MX8_COORD_STATE_STORE_ENABLE=1`, auto-enabled with HA) persist membership/leases/progress/counters and are replayed on leader startup/term change.
 
 ### Dynamic Membership (shipped in v1.8.2)
 

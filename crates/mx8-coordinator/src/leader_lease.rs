@@ -79,6 +79,10 @@ impl LeaderGate {
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::Relaxed)
     }
+
+    pub fn term(&self) -> u64 {
+        self.term.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone)]

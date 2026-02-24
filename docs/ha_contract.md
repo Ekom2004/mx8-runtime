@@ -13,6 +13,8 @@ v1.8.3 foundation: coordinator restart recovery replays durable completion and d
 
 v1.8.4 foundation: optional lease-file leader election + term fencing (`MX8_COORD_HA_ENABLE=1`) fences mutating RPCs on stale coordinators. This enforces single-writer control-plane semantics but still does not provide shared-state continuity after leader switch.
 
+v1.8.5 foundation: optional durable coordinator state snapshots (`MX8_COORD_STATE_STORE_ENABLE=1`, auto-enabled with HA) persist membership, lease index, progress cursors, completed ranges, and counters to a shared file path. New leaders replay this snapshot on startup/term-change before accepting mutating work.
+
 For current incident procedure, see `docs/prod_runbook.md`.
 
 
@@ -75,6 +77,8 @@ Phase 0 locks this contract in docs and architecture (current state).
 Phase 0.5 ships durable restart replay (`C` + `P` lease log lines) and a deterministic restart gate (`./scripts/coordinator_restart_gate.sh`).
 
 Phase 0.6 ships lease-file leader election + term fencing and a deterministic gate (`./scripts/leader_fencing_gate.sh`).
+
+Phase 0.7 ships durable coordinator state snapshot/replay in the running coordinator (`MX8_COORD_STATE_STORE_*`) and persists state on mutating operations + maintenance ticks.
 
 Phase 1 enables HA behind a feature flag for selected internal jobs and runs the kill-leader gates in nightly CI.
 

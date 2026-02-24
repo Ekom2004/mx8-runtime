@@ -109,4 +109,6 @@ When lease logging is enabled (default for non-dev manifest hashes), restart rec
 
 If `MX8_COORD_HA_ENABLE=1` is enabled, mutating RPCs are fenced on followers/stale leaders with `FAILED_PRECONDITION` and a `not leader for mutating operation` message. In that case, direct agents to the active lease holder or wait for leader lease transition before retrying.
 
+If HA is enabled, keep `MX8_COORD_STATE_STORE_PATH` on a shared durable filesystem visible to all candidate coordinators. If this path is not shared, leader transition can fence stale writers but cannot continue from latest shared state.
+
 The v1.9 HA plan — single-writer leader with fencing, durable lease state, and automatic failover for inference and ETL jobs — is documented in `docs/ha_contract.md`. Training remains non-elastic even after coordinator HA ships.
