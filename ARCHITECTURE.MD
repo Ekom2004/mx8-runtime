@@ -18,19 +18,16 @@ Primary v1.8 workloads: offline inference / ETL / preprocessing / large corpus p
 ## Non-Goals (v1.8)
 - Multi-job QoS / fair-sharing across jobs.
 - Fleet scheduler / GPU placement.
-- Coordinator HA (if coordinator dies, the job stops/pauses).
+- Coordinator HA as a default-on zero-ops mode.
 - Mid-run “live pickup” of newly added data (refresh is job-start only in v1.8).
 - Exactly-once delivery guarantees (at-least-once at boundaries is acceptable for v1.8 inference/ETL).
 
-## Coordinator HA (v1.9 target)
+## Coordinator HA (design-partner opt-in in v1.8.6; default-on target v1.9)
 
-Coordinator HA is planned for v1.9 and is not part of the v1.8 shipped contract.
-
-- v1.8 contract: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
-- v1.9 target: leader failover with durable lease/progress state and single-writer fencing.
-- v1.8.4 foundation: optional lease-file leader election + term fencing for mutating RPCs (`MX8_COORD_HA_ENABLE=1`). This enforces single-writer behavior but does not yet provide shared-state failover continuity.
-- v1.8.5 foundation: optional durable coordinator state snapshots (`MX8_COORD_STATE_STORE_ENABLE=1`, auto-enabled with HA) persist membership/leases/progress/counters and are replayed on leader startup/term change.
-- v1.8.6 foundation: deterministic HA failover gates (`./scripts/ha_failover_gate.sh`) validate leader death -> follower promotion, cursor continuity, no-overlap lease issuance after failover, and duplicate-progress replay acceptance.
+- v1.8 default mode: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
+- v1.8.6 design-partner mode: opt-in HA (`MX8_COORD_HA_ENABLE=1`) with leader fencing + durable shared state replay + deterministic kill-leader failover gates for inference/ETL workloads.
+- v1.8.6 operator requirement: shared durable lease/state paths (`MX8_COORD_HA_LEASE_PATH`, `MX8_COORD_STATE_STORE_PATH`) across coordinator candidates.
+- v1.9 default-on target: HA becomes default deployment posture for new coordinator rollouts.
 
 ### Dynamic Membership (shipped in v1.8.2)
 

@@ -91,7 +91,7 @@ If rejections continue, relaunch without `resume_from` and treat it as a fresh e
 
 ## Coordinator failure
 
-In default v1.8 deployments, the coordinator is run as a single process per job. If it dies, the control plane pauses until restart. Optional HA foundations (`MX8_COORD_HA_ENABLE=1`) can promote a follower, but require shared lease/state paths and are still an operator-managed rollout.
+In default v1.8 deployments, the coordinator is run as a single process per job. If it dies, the control plane pauses until restart. Opt-in HA mode (`MX8_COORD_HA_ENABLE=1`) is available for design-partner rollouts and can promote a follower, but requires shared lease/state paths and explicit operator rollout.
 
 Restart the coordinator for the affected job. Restart affected agents if they do not reconnect on their own. Then verify recovery in the TUI:
 
@@ -111,4 +111,4 @@ If `MX8_COORD_HA_ENABLE=1` is enabled, mutating RPCs are fenced on followers/sta
 
 If HA is enabled, keep `MX8_COORD_STATE_STORE_PATH` on a shared durable filesystem visible to all candidate coordinators. If this path is not shared, leader transition can fence stale writers but cannot continue from latest shared state.
 
-The v1.9 HA plan — single-writer leader with fencing, durable lease state, and automatic failover for inference and ETL jobs — is documented in `docs/ha_contract.md`. Training remains non-elastic even after coordinator HA ships.
+The HA contract for design-partner opt-in mode and default-on v1.9 target is documented in `docs/ha_contract.md`. Training remains non-elastic.

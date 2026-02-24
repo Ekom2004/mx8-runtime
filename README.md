@@ -201,7 +201,7 @@ The **agent** (`mx8d-agent`) runs once per node. It enforces per-node memory bud
 | [CLI Reference](docs/cli_reference.md) | mx8-pack-s3, mx8-snapshot-resolve |
 | [gRPC Contract](docs/grpc_contract.md) | Coordinator/agent wire protocol |
 | [Env Reference](docs/env_reference.md) | All MX8_* environment variables |
-| [HA Contract](docs/ha_contract.md) | Coordinator HA plan (v1.9) |
+| [HA Contract](docs/ha_contract.md) | Coordinator HA contract (opt-in now, default target v1.9) |
 | [Compatibility Policy](docs/compatibility_policy.md) | Versioning and stability guarantees |
 
 ---
@@ -259,6 +259,6 @@ pip install dist/mx8-*.whl
 | Video loader (GPU/NVDEC) | Planned |
 | Multi-dataset mix | GA |
 | Distributed coordinator + agent | GA |
-| Coordinator HA (automatic failover) | v1.9 planned |
+| Coordinator HA (automatic failover) | Design partner (opt-in) |
 | Mid-epoch resume (`state_dict`) | v1.9 planned |
 | Prometheus/OTEL metrics export | Planned |
