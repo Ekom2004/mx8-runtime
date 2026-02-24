@@ -10,7 +10,6 @@ Point to your data. Set a RAM limit. Train. That's it.
 
 [![PyPI version](https://img.shields.io/pypi/v/mx8?color=blue)](https://pypi.org/project/mx8/)
 [![Python](https://img.shields.io/pypi/pyversions/mx8)](https://pypi.org/project/mx8/)
-[![License](https://img.shields.io/badge/license-proprietary-lightgrey)](LICENSE)
 [![Smoke](https://img.shields.io/badge/gates-passing-brightgreen)](#gates)
 
 </div>
@@ -42,7 +41,7 @@ No manifest required. No setup. MX8 scans the prefix, shuffles, caps memory, and
 
 Most data loading tools hand you the primitives and leave the hard problems to you. MX8 solves them.
 
-**Guaranteed no-OOM.** Every loader surface has a hard memory cap enforced by backpressure. Set `max_ram_gb=12` and the process will never use more, no matter the dataset size. MX8 fails fast with a clear error before the OS kills it.
+**Guaranteed bounded loader memory + fail-fast RSS.** Every loader surface has hard inflight backpressure caps plus a whole-process RSS fail-fast cap. Set `max_ram_gb=12` and MX8 aborts explicitly if RSS exceeds the cap, before a silent OS OOM kill.
 
 **Zero-manifest loading.** Point MX8 at any raw S3 prefix and it starts delivering bounded, shuffled batches immediately. No packing step, no index generation, no prep. When you are ready for production, pack once and MX8 switches to the fast path automatically.
 
@@ -170,7 +169,7 @@ MX8 has three components.
 
 The **runtime** (`mx8`) runs in-process inside your Python training or inference script. It owns the data path: Fetch → Decode/Parse → Pack → Deliver. All pipeline stages are bounded. Backpressure prevents runaway prefetch. The RSS watchdog prevents silent OOM kills.
 
-The **coordinator** (`mx8-coordinator`) runs once per job. It resolves the dataset to a pinned snapshot, freezes cluster membership, assigns leases to nodes, expires stale leases, and requeues unfinished ranges. It is the reason multi-node MX8 behaves like one coordinated consumer instead of many independent loaders.
+The **coordinator** (`mx8-coordinator`) runs once per job. It resolves the dataset to a pinned snapshot, freezes initial membership, supports bounded post-freeze replacement/scale-out up to configured capacity, assigns leases to nodes, expires stale leases, and requeues unfinished ranges. It is the reason multi-node MX8 behaves like one coordinated consumer instead of many independent loaders.
 
 The **agent** (`mx8d-agent`) runs once per node. It enforces per-node memory budgets, requests leases from the coordinator, and feeds work ranges to local runtime processes.
 

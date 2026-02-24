@@ -15,7 +15,7 @@ def main() -> None:
         raise SystemExit("MX8_DEV_MANIFEST_PATH is required for the dev snapshot resolver")
 
     link = os.environ.get("MX8_DATASET_LINK", "/tmp/dev@refresh")
-    loader = mx8.DataLoader(
+    loader = mx8.load(
         link,
         manifest_store=root,
         manifest_path=dev_manifest,
@@ -43,4 +43,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -20,7 +20,7 @@ def main() -> None:
     steps = int(os.environ.get("MX8_TORCH_STEPS", "8"))
     lr = float(os.environ.get("MX8_TORCH_LR", "0.01"))
 
-    loader = mx8.DataLoader(
+    loader = mx8.load(
         link,
         manifest_store=root,
         manifest_path=dev_manifest,
@@ -77,4 +77,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

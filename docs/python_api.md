@@ -147,13 +147,28 @@ for epoch in range(10):
 
 `loader.stats()` returns a plain Python dict. Poll it each step or every N steps to track pipeline health.
 
-Key fields: `delivered_batches_total`, `delivered_samples_total`, `inflight_bytes`, `process_rss_bytes`, `ram_high_water_bytes`.
+Key fields: `delivered_batches_total`, `delivered_samples_total`, `process_rss_bytes`, `max_process_rss_bytes`, `ram_high_water_bytes`, `elapsed_seconds`.
 
 Byte-batch jitter fields: `batch_payload_bytes_p50`, `batch_payload_bytes_p95`, `batch_payload_bytes_p95_over_p50`, `batch_payload_window_size`, `batch_jitter_slo_breaches_total`, `batch_jitter_band_adjustments_total`, `batch_jitter_band_lower_pct`, `batch_jitter_band_upper_pct`.
 
 MX8 applies a tighter internal byte band around the target batch size to reduce oscillation, emits a proof event when the jitter SLO is breached, and adaptively tightens or relaxes the band with bounded hysteresis.
 
-A top-level `mx8.stats()` API is planned but not yet shipped in v1.8. Use `loader.stats()` directly.
+`mx8.stats(loader)` is now available as a one-shot human-readable snapshot.
+
+`mx8.stats(loader, raw=True)` returns the raw dict from `loader.stats()` unchanged.
+
+`mx8.stats(loader)` contract:
+- Always show: `status`, `mode`, `epoch/step` (when present), `progress`, `throughput`, `memory`, `stability`.
+- Conditional sections: distributed details and autotune details are shown only when those fields exist for that loader type.
+- Snapshot only: this is not a live TUI stream; call repeatedly in your loop if you want a live terminal view.
+
+```python
+import mx8
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+print(mx8.stats(loader))           # human-readable snapshot
+raw = mx8.stats(loader, raw=True)  # same dict as loader.stats()
+```
 
 To wire loader stats into Prometheus:
 
