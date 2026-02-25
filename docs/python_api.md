@@ -485,8 +485,8 @@ mixed = mx8.mix(
 Resume contract for mix:
 
 - `seed`, `epoch`, and source count must match.
-- Source checkpoints must match exactly. Recreate source loaders from their checkpoint tokens first, then construct `mx8.mix(..., resume_from=token)`.
 - The mix token restores scheduler position and per-source delivery counters.
+- If source checkpoints differ, MX8 continues in best-effort mode and increments `mix_resume_source_checkpoint_mismatch_total` in `mixed.stats()`.
 
 For a fixed set of manifests, weights, seed, epoch, and frozen membership, the mixed stream order is deterministic and replayable. All sources share one inflight cap — backpressure is global. `mixed.stats()["mix_sources"]` exposes per-source diagnostics including manifest IDs, delivery counters, and configured knobs.
 

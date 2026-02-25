@@ -37,6 +37,8 @@ mixed = mx8.mix(
 
 For a fixed set of source manifests, weights, seed, epoch, world size, and frozen membership, the mixed stream order is deterministic and replayable. Reproduce any run by pinning the same inputs.
 
+On `resume_from`, mix restores scheduler/counter state from the token. If source checkpoints differ from token snapshots, mix continues in best-effort mode and reports this via `mix_resume_source_checkpoint_mismatch_total` in `mixed.stats()`.
+
 
 ## Memory contract
 

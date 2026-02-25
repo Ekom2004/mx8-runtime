@@ -1,6 +1,6 @@
 # Coordinator HA Contract
 
-Status: available in v1.8.6 as opt-in mode.
+Status: enabled by default in v1.8.6 (can be disabled with `MX8_COORD_HA_ENABLE=0`).
 
 This document defines what coordinator HA means for MX8, what it explicitly does not include, and what must be true before it is considered default production posture.
 
@@ -9,13 +9,13 @@ This document defines what coordinator HA means for MX8, what it explicitly does
 
 Default v1.8 mode is still a single coordinator process per job. If that process dies, the control plane pauses until restart.
 
-Opt-in HA mode is available now behind `MX8_COORD_HA_ENABLE=1` with shared lease/state paths across coordinator candidates.
+HA mode is enabled by default with shared lease/state paths across coordinator candidates.
 
 Shipped foundations:
 
 v1.8.3: coordinator restart recovery replays durable completion and durable cursor progress from the lease log.
 
-v1.8.4: lease-file leader election + term fencing (`MX8_COORD_HA_ENABLE=1`) fences mutating RPCs on stale coordinators.
+v1.8.4: lease-file leader election + term fencing fences mutating RPCs on stale coordinators.
 
 v1.8.5: durable coordinator state snapshots (`MX8_COORD_STATE_STORE_ENABLE=1`, auto-enabled with HA) persist membership, lease index, progress cursors, completed ranges, and counters; new leaders replay this state before accepting mutating work.
 
@@ -24,7 +24,7 @@ v1.8.6: deterministic kill-leader failover gates (`./scripts/ha_failover_gate.sh
 For incident procedure, see `docs/prod_runbook.md`.
 
 
-## Guarantees in opt-in HA mode
+## Guarantees in default HA mode
 
 HA covers per-job coordinator availability for inference, ETL, and preprocessing jobs. It does not cover training elasticity.
 

@@ -152,7 +152,7 @@ struct Args {
     #[arg(
         long,
         env = "MX8_COORD_HA_ENABLE",
-        default_value_t = false,
+        default_value_t = true,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     ha_enable: bool,
@@ -191,7 +191,7 @@ struct Args {
     #[arg(
         long,
         env = "MX8_COORD_STATE_STORE_ENABLE",
-        default_value_t = false,
+        default_value_t = true,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     state_store_enable: bool,

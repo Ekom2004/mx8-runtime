@@ -7,7 +7,7 @@ Primary implementations: `crates/mx8-coordinator/src/main.rs`, `crates/mx8d-agen
 
 ## What you need to know before deploying
 
-Default v1.8 deployment is a single coordinator process per job. If it dies, the control plane pauses until restart. Opt-in HA mode is available behind `MX8_COORD_HA_ENABLE=1` with shared lease/state files, but the baseline remains single-endpoint operations. Run coordinators on stable nodes, not spot instances.
+Default v1.8 deployment runs coordinator leader-fencing and durable state replay enabled. Keep shared lease/state files configured so leader transition can continue progress.
 
 Training is non-elastic in v1.8. If a DDP rank dies, the training job terminates. Lease reassignment handles inference and ETL recovery, not training node loss.
 
@@ -88,12 +88,12 @@ Every CLI argument has a corresponding environment variable. All timing values a
 | `--epoch` | `MX8_EPOCH` | `0` | epoch input for deterministic ordering |
 | `--grpc-max-message-bytes` | `MX8_GRPC_MAX_MESSAGE_BYTES` | `67108864` | gRPC message size cap (64MB) |
 | `--metrics-snapshot-interval-ms` | `MX8_METRICS_SNAPSHOT_INTERVAL_MS` | `0` | set to non-zero to enable periodic metrics logging |
-| `--ha-enable` | `MX8_COORD_HA_ENABLE` | `false` | enable lease-file leader fencing mode |
+| `--ha-enable` | `MX8_COORD_HA_ENABLE` | `true` | enable lease-file leader fencing mode |
 | `--ha-lease-path` | `MX8_COORD_HA_LEASE_PATH` | `<manifest_store_root>/../ha/<manifest_hash>.leader_lease` | shared leader lease file |
 | `--ha-leader-id` | `MX8_COORD_HA_LEADER_ID` | `<hostname>-<pid>` | coordinator identity for lease records |
 | `--ha-lease-ttl-ms` | `MX8_COORD_HA_LEASE_TTL_MS` | `5000` | leader lease TTL |
 | `--ha-renew-interval-ms` | `MX8_COORD_HA_RENEW_INTERVAL_MS` | `1000` | leader lease renew cadence |
-| `--state-store-enable` | `MX8_COORD_STATE_STORE_ENABLE` | `false` (auto-enabled with HA) | enable durable shared state snapshots |
+| `--state-store-enable` | `MX8_COORD_STATE_STORE_ENABLE` | `true` | enable durable shared state snapshots |
 | `--state-store-path` | `MX8_COORD_STATE_STORE_PATH` | `<manifest_store_root>/../state/<manifest_hash>.json` | shared state snapshot file |
 
 
@@ -126,7 +126,7 @@ When an agent dies or stops heartbeating, the coordinator waits for the lease TT
 
 To restart a failed agent, bring it back up with the same `MX8_JOB_ID` and `MX8_NODE_ID`. Verify in the TUI that heartbeats resume and the requeued range is picked up.
 
-If the coordinator dies in non-HA mode, the job control plane pauses. Restart it, then verify that agents reconnect and heartbeats resume. If the job does not resume cleanly after restart, relaunch from the pinned snapshot using `@sha256:<manifest_hash>`. In HA mode, verify that all candidates share `MX8_COORD_HA_LEASE_PATH` and `MX8_COORD_STATE_STORE_PATH`.
+If the active coordinator dies, leader transition should continue control-plane progress when HA paths are correctly shared. Verify that all candidates share `MX8_COORD_HA_LEASE_PATH` and `MX8_COORD_STATE_STORE_PATH`, then confirm agents reconnect and heartbeats continue.
 
 
 ## Production baseline

@@ -91,7 +91,7 @@ If rejections continue, relaunch without `resume_from` and treat it as a fresh e
 
 ## Coordinator failure
 
-In default v1.8 deployments, the coordinator is run as a single process per job. If it dies, the control plane pauses until restart. Opt-in HA mode (`MX8_COORD_HA_ENABLE=1`) can promote a follower, but requires shared lease/state paths.
+In default v1.8 deployments, coordinator leader-fencing + durable state replay are enabled. If the active leader dies, a follower should take over when shared lease/state paths are configured correctly.
 
 Restart the coordinator for the affected job. Restart affected agents if they do not reconnect on their own. Then verify recovery in the TUI:
 
@@ -107,7 +107,7 @@ You should see nodes re-register, heartbeats resume, and progress counters start
 
 When lease logging is enabled (default for non-dev manifest hashes), restart recovery replays durable completion and durable progress cursors. This means partially completed ranges should resume near their previous cursor instead of restarting from the full block.
 
-If `MX8_COORD_HA_ENABLE=1` is enabled, mutating RPCs are fenced on followers/stale leaders with `FAILED_PRECONDITION` and a `not leader for mutating operation` message. In that case, direct agents to the active lease holder or wait for leader lease transition before retrying.
+Mutating RPCs are fenced on followers/stale leaders with `FAILED_PRECONDITION` and a `not leader for mutating operation` message. In that case, direct agents to the active lease holder or wait for leader lease transition before retrying.
 
 If HA is enabled, keep `MX8_COORD_STATE_STORE_PATH` on a shared durable filesystem visible to all candidate coordinators. If this path is not shared, leader transition can fence stale writers but cannot continue from latest shared state.
 

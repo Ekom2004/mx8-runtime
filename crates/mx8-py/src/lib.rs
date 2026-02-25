@@ -688,6 +688,7 @@ struct MixedDataLoader {
     mix_runtime_autotune_last_tick: u64,
     mix_runtime_autotune_adjustments_total: u64,
     mix_runtime_autotune_pressure_milli: u64,
+    mix_resume_source_checkpoint_mismatch_total: u64,
     mix_max_process_rss_bytes: Option<u64>,
     started_at: Instant,
 }
@@ -2454,14 +2455,23 @@ impl MixedDataLoader {
             )));
         }
 
+        let mut mismatches = 0u64;
         for (idx, loader) in self.loaders.iter().enumerate() {
             let checkpoint = Self::source_checkpoint(loader, py)?;
             if checkpoint != token.source_checkpoints[idx] {
-                return Err(PyValueError::new_err(format!(
-                    "resume_from source checkpoint mismatch at source_idx={idx}; recreate source loaders from their checkpoint tokens first",
-                )));
+                mismatches = mismatches.saturating_add(1);
+                tracing::warn!(
+                    target: "mx8_proof",
+                    event = "mix_resume_source_checkpoint_mismatch",
+                    source_idx = idx as u64,
+                    mismatches = mismatches,
+                    "mix resume token source checkpoint differs from provided source loader; continuing in best-effort mode"
+                );
             }
         }
+        self.mix_resume_source_checkpoint_mismatch_total = self
+            .mix_resume_source_checkpoint_mismatch_total
+            .saturating_add(mismatches);
 
         self.active = token.active.clone();
         self.delivered_batches = token.delivered_batches.clone();
@@ -2764,6 +2774,10 @@ impl MixedDataLoader {
         out.set_item(
             "mix_runtime_autotune_pressure",
             self.mix_runtime_autotune_pressure_milli as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "mix_resume_source_checkpoint_mismatch_total",
+            self.mix_resume_source_checkpoint_mismatch_total,
         )?;
         out.set_item("process_rss_bytes", self.max_process_rss_bytes(py))?;
         out.set_item("max_process_rss_bytes", self.mix_max_process_rss_bytes)?;
@@ -6026,6 +6040,7 @@ fn mix(
         mix_runtime_autotune_last_tick: 0,
         mix_runtime_autotune_adjustments_total: 0,
         mix_runtime_autotune_pressure_milli: 0,
+        mix_resume_source_checkpoint_mismatch_total: 0,
         mix_max_process_rss_bytes,
         started_at: Instant::now(),
     };

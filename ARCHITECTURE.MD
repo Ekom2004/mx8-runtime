@@ -18,15 +18,14 @@ Primary v1.8 workloads: offline inference / ETL / preprocessing / large corpus p
 ## Non-Goals (v1.8)
 - Multi-job QoS / fair-sharing across jobs.
 - Fleet scheduler / GPU placement.
-- Coordinator HA as a default-on zero-ops mode.
 - Mid-run “live pickup” of newly added data (refresh is job-start only in v1.8).
 - Exactly-once delivery guarantees (at-least-once at boundaries is acceptable for v1.8 inference/ETL).
 
-## Coordinator HA (opt-in in v1.8.6)
+## Coordinator HA (default-on in v1.8.6)
 
-- Default mode: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
-- Opt-in HA mode: enable `MX8_COORD_HA_ENABLE=1` for leader fencing + durable shared state replay + deterministic kill-leader failover gates for inference/ETL workloads.
-- Operator requirement for HA mode: shared durable lease/state paths (`MX8_COORD_HA_LEASE_PATH`, `MX8_COORD_STATE_STORE_PATH`) across coordinator candidates.
+- Default mode: leader-fenced coordinator with durable shared state replay enabled.
+- HA can be explicitly disabled with `MX8_COORD_HA_ENABLE=0`.
+- Operator requirement: shared durable lease/state paths (`MX8_COORD_HA_LEASE_PATH`, `MX8_COORD_STATE_STORE_PATH`) across coordinator candidates.
 
 ### Dynamic Membership (shipped in v1.8.2)
 
