@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ::image::imageops::FilterType as ImageFilterType;
@@ -33,8 +33,10 @@ use mx8_proto::v0::HeartbeatRequest;
 use mx8_proto::v0::NodeCaps;
 use mx8_proto::v0::NodeStats;
 use mx8_proto::v0::RegisterNodeRequest;
+use mx8_proto::v0::RegisterNodeResponse;
 use mx8_proto::v0::ReportProgressRequest;
 use mx8_proto::v0::RequestLeaseRequest;
+use mx8_proto::v0::RequestLeaseResponse;
 use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps, RuntimeMetrics};
 use mx8_snapshot::labels::load_labels_for_base;
 use mx8_snapshot::pack_dir::{
@@ -71,6 +73,8 @@ const VIDEO_DTYPE: &str = "u8";
 const VIDEO_COLORSPACE: &str = "rgb24";
 const DATA_CHECKPOINT_MAGIC: &str = "mx8_checkpoint_v1";
 const DATA_CHECKPOINT_KIND: &str = "data_loader";
+const VIDEO_CHECKPOINT_KIND: &str = "video_loader";
+const MIX_CHECKPOINT_KIND: &str = "mix_loader";
 const DATA_CHECKPOINT_EPOCH: u32 = 0;
 
 #[derive(Debug, Clone, Copy)]
@@ -108,9 +112,14 @@ struct DecodeBatchResult {
     pack_ms: u64,
 }
 
+enum ImageLoaderInner {
+    Local(DataLoader),
+    Distributed(DistributedDataLoader),
+}
+
 #[pyclass]
 struct ImageLoader {
-    loader: DataLoader,
+    loader: ImageLoaderInner,
     resize_hw: Option<(u32, u32)>,
     to_float: bool,
     decode_backend: DecodeBackend,
@@ -152,6 +161,390 @@ struct DataLoaderCheckpointToken {
     epoch: u32,
     next_sample_id: u64,
     end_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct VideoLoaderCheckpointToken {
+    manifest_hash: String,
+    seed: u64,
+    epoch: u64,
+    clip_len: u32,
+    stride: u32,
+    fps: u32,
+    next_idx: u64,
+    clips_total: u64,
+    assigned_rank: u32,
+    world_size: u32,
+}
+
+impl VideoLoaderCheckpointToken {
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "{DATA_CHECKPOINT_MAGIC}\nkind={VIDEO_CHECKPOINT_KIND}\nmanifest_hash={}\nseed={}\nepoch={}\nclip_len={}\nstride={}\nfps={}\nnext_idx={}\nclips_total={}\nassigned_rank={}\nworld_size={}\n",
+            self.manifest_hash,
+            self.seed,
+            self.epoch,
+            self.clip_len,
+            self.stride,
+            self.fps,
+            self.next_idx,
+            self.clips_total,
+            self.assigned_rank,
+            self.world_size,
+        )
+        .into_bytes()
+    }
+
+    fn decode(raw: &[u8]) -> Result<Self> {
+        let text = std::str::from_utf8(raw)?;
+        let mut lines = text.lines();
+        let magic = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty checkpoint token"))?;
+        anyhow::ensure!(
+            magic == DATA_CHECKPOINT_MAGIC,
+            "unsupported checkpoint token format"
+        );
+
+        let mut kv = HashMap::<String, String>::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                anyhow::bail!("invalid checkpoint token line: {line}");
+            };
+            kv.insert(k.trim().to_string(), v.trim().to_string());
+        }
+        let kind = kv
+            .get("kind")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing kind"))?;
+        anyhow::ensure!(
+            kind == VIDEO_CHECKPOINT_KIND,
+            "unsupported checkpoint kind {kind}"
+        );
+
+        let token = Self {
+            manifest_hash: kv
+                .get("manifest_hash")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing manifest_hash"))?
+                .to_string(),
+            seed: kv
+                .get("seed")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing seed"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint seed"))?,
+            epoch: kv
+                .get("epoch")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing epoch"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint epoch"))?,
+            clip_len: kv
+                .get("clip_len")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing clip_len"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint clip_len"))?,
+            stride: kv
+                .get("stride")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing stride"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint stride"))?,
+            fps: kv
+                .get("fps")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing fps"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint fps"))?,
+            next_idx: kv
+                .get("next_idx")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing next_idx"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint next_idx"))?,
+            clips_total: kv
+                .get("clips_total")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing clips_total"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint clips_total"))?,
+            assigned_rank: kv
+                .get("assigned_rank")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing assigned_rank"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint assigned_rank"))?,
+            world_size: kv
+                .get("world_size")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing world_size"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint world_size"))?,
+        };
+        anyhow::ensure!(
+            token.next_idx <= token.clips_total,
+            "invalid checkpoint token range (next_idx > clips_total)"
+        );
+        anyhow::ensure!(token.world_size >= 1, "invalid checkpoint token world_size");
+        Ok(token)
+    }
+}
+
+fn parse_csv_u64(raw: &str) -> Result<Vec<u64>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|v| {
+            v.trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid u64 list value: {v}"))
+        })
+        .collect()
+}
+
+fn parse_csv_bool(raw: &str) -> Result<Vec<bool>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|v| match v.trim() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(anyhow::anyhow!("invalid bool list value: {v}")),
+        })
+        .collect()
+}
+
+fn parse_csv_i128(raw: &str) -> Result<Vec<i128>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|v| {
+            v.trim()
+                .parse::<i128>()
+                .map_err(|_| anyhow::anyhow!("invalid i128 list value: {v}"))
+        })
+        .collect()
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn hex_to_bytes(raw: &str) -> Result<Vec<u8>> {
+    let s = raw.trim();
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("invalid hex length");
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let pair = std::str::from_utf8(&bytes[i..i + 2])?;
+        let b = u8::from_str_radix(pair, 16).map_err(|_| anyhow::anyhow!("invalid hex byte"))?;
+        out.push(b);
+        i += 2;
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone)]
+struct MixLoaderCheckpointToken {
+    seed: u64,
+    epoch: u64,
+    source_count: usize,
+    schedule_ticks: u64,
+    snapshot_emitted_total: u64,
+    active: Vec<bool>,
+    delivered_batches: Vec<u64>,
+    delivered_samples: Vec<u64>,
+    delivered_bytes: Vec<u64>,
+    starvation_total: Vec<u64>,
+    source_exhausted_total: Vec<u64>,
+    steps_since_emit: Vec<u64>,
+    scheduler_current: Vec<i128>,
+    scheduler_tie_break_offset: usize,
+    source_checkpoints: Vec<Vec<u8>>,
+}
+
+impl MixLoaderCheckpointToken {
+    fn encode(&self) -> Vec<u8> {
+        let fmt_u64 = |v: &[u64]| {
+            v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let fmt_bool = |v: &[bool]| {
+            v.iter()
+                .map(|b| if *b { "1".to_string() } else { "0".to_string() })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let fmt_i128 = |v: &[i128]| {
+            v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let source_cp = self
+            .source_checkpoints
+            .iter()
+            .map(|bytes| bytes_to_hex(bytes))
+            .collect::<Vec<_>>()
+            .join(";");
+        format!(
+            "{DATA_CHECKPOINT_MAGIC}\nkind={MIX_CHECKPOINT_KIND}\nseed={}\nepoch={}\nsource_count={}\nschedule_ticks={}\nsnapshot_emitted_total={}\nactive={}\ndelivered_batches={}\ndelivered_samples={}\ndelivered_bytes={}\nstarvation_total={}\nsource_exhausted_total={}\nsteps_since_emit={}\nscheduler_current={}\nscheduler_tie_break_offset={}\nsource_checkpoints={}\n",
+            self.seed,
+            self.epoch,
+            self.source_count,
+            self.schedule_ticks,
+            self.snapshot_emitted_total,
+            fmt_bool(&self.active),
+            fmt_u64(&self.delivered_batches),
+            fmt_u64(&self.delivered_samples),
+            fmt_u64(&self.delivered_bytes),
+            fmt_u64(&self.starvation_total),
+            fmt_u64(&self.source_exhausted_total),
+            fmt_u64(&self.steps_since_emit),
+            fmt_i128(&self.scheduler_current),
+            self.scheduler_tie_break_offset,
+            source_cp,
+        )
+        .into_bytes()
+    }
+
+    fn decode(raw: &[u8]) -> Result<Self> {
+        let text = std::str::from_utf8(raw)?;
+        let mut lines = text.lines();
+        let magic = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty checkpoint token"))?;
+        anyhow::ensure!(
+            magic == DATA_CHECKPOINT_MAGIC,
+            "unsupported checkpoint token format"
+        );
+        let mut kv = HashMap::<String, String>::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                anyhow::bail!("invalid checkpoint token line: {line}");
+            };
+            kv.insert(k.trim().to_string(), v.trim().to_string());
+        }
+        let kind = kv
+            .get("kind")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing kind"))?;
+        anyhow::ensure!(
+            kind == MIX_CHECKPOINT_KIND,
+            "unsupported checkpoint kind {kind}"
+        );
+
+        let source_count = kv
+            .get("source_count")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing source_count"))?
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("invalid checkpoint source_count"))?;
+
+        let active = parse_csv_bool(
+            kv.get("active")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing active"))?,
+        )?;
+        let delivered_batches = parse_csv_u64(
+            kv.get("delivered_batches")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing delivered_batches"))?,
+        )?;
+        let delivered_samples = parse_csv_u64(
+            kv.get("delivered_samples")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing delivered_samples"))?,
+        )?;
+        let delivered_bytes = parse_csv_u64(
+            kv.get("delivered_bytes")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing delivered_bytes"))?,
+        )?;
+        let starvation_total = parse_csv_u64(
+            kv.get("starvation_total")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing starvation_total"))?,
+        )?;
+        let source_exhausted_total =
+            parse_csv_u64(kv.get("source_exhausted_total").ok_or_else(|| {
+                anyhow::anyhow!("checkpoint token missing source_exhausted_total")
+            })?)?;
+        let steps_since_emit = parse_csv_u64(
+            kv.get("steps_since_emit")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing steps_since_emit"))?,
+        )?;
+        let scheduler_current = parse_csv_i128(
+            kv.get("scheduler_current")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing scheduler_current"))?,
+        )?;
+        let source_checkpoints = kv
+            .get("source_checkpoints")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint token missing source_checkpoints"))?
+            .split(';')
+            .filter(|v| !v.trim().is_empty())
+            .map(hex_to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+
+        let token = Self {
+            seed: kv
+                .get("seed")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing seed"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint seed"))?,
+            epoch: kv
+                .get("epoch")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing epoch"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint epoch"))?,
+            source_count,
+            schedule_ticks: kv
+                .get("schedule_ticks")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing schedule_ticks"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint schedule_ticks"))?,
+            snapshot_emitted_total: kv
+                .get("snapshot_emitted_total")
+                .ok_or_else(|| anyhow::anyhow!("checkpoint token missing snapshot_emitted_total"))?
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint snapshot_emitted_total"))?,
+            active,
+            delivered_batches,
+            delivered_samples,
+            delivered_bytes,
+            starvation_total,
+            source_exhausted_total,
+            steps_since_emit,
+            scheduler_current,
+            scheduler_tie_break_offset: kv
+                .get("scheduler_tie_break_offset")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("checkpoint token missing scheduler_tie_break_offset")
+                })?
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("invalid checkpoint scheduler_tie_break_offset"))?,
+            source_checkpoints,
+        };
+
+        let lens_ok = [
+            token.active.len(),
+            token.delivered_batches.len(),
+            token.delivered_samples.len(),
+            token.delivered_bytes.len(),
+            token.starvation_total.len(),
+            token.source_exhausted_total.len(),
+            token.steps_since_emit.len(),
+            token.scheduler_current.len(),
+            token.source_checkpoints.len(),
+        ]
+        .iter()
+        .all(|v| *v == token.source_count);
+        anyhow::ensure!(lens_ok, "checkpoint token source vector length mismatch");
+        Ok(token)
+    }
 }
 
 impl DataLoaderCheckpointToken {
@@ -263,7 +656,7 @@ fn manifest_schema_version_and_sample_count(manifest_bytes: &[u8]) -> Result<(u3
 
 #[pyclass]
 struct MixedDataLoader {
-    loaders: Vec<Py<DataLoader>>,
+    loaders: Vec<MixLoader>,
     scheduler: WeightedRoundRobin,
     active: Vec<bool>,
     source_exhausted_total: Vec<u64>,
@@ -297,6 +690,11 @@ struct MixedDataLoader {
     mix_runtime_autotune_pressure_milli: u64,
     mix_max_process_rss_bytes: Option<u64>,
     started_at: Instant,
+}
+
+enum MixLoader {
+    Local(Py<DataLoader>),
+    Distributed(Py<DistributedDataLoader>),
 }
 
 #[pyclass]
@@ -359,6 +757,10 @@ struct VideoDataLoader {
     video_runtime_autotune_adjustments_total: u64,
     video_runtime_autotune_pressure_milli: u64,
     video_max_process_rss_bytes: Option<u64>,
+    assigned_rank: u32,
+    world_size: u32,
+    job_id: Option<String>,
+    cluster_url: Option<String>,
     started_at: Instant,
 }
 
@@ -907,6 +1309,19 @@ fn render_human_stats(stats: &Bound<'_, PyDict>) -> String {
     }
     if !autotune_parts.is_empty() {
         lines.push(format!("Autotune: {}", autotune_parts.join(" | ")));
+    }
+
+    if let Some(transitions_total) = dict_u64(stats, "elastic_transitions_total") {
+        let pending = dict_bool(stats, "elastic_transition_pending").unwrap_or(false);
+        let reason = dict_item(stats, "elastic_last_transition_reason")
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_else(|| "none".to_string());
+        let current = dict_u64(stats, "elastic_current_world_size").unwrap_or(0);
+        let target = dict_u64(stats, "elastic_target_world_size").unwrap_or(0);
+        let state = if pending { "pending" } else { "stable" };
+        lines.push(format!(
+            "Elastic: {state} | transitions={transitions_total} | reason={reason} | world={current}->{target}"
+        ));
     }
 
     if is_distributed {
@@ -1856,10 +2271,113 @@ impl DataLoader {
 }
 
 impl MixedDataLoader {
+    fn source_inflight_bytes(source: &MixLoader, py: Python<'_>) -> u64 {
+        match source {
+            MixLoader::Local(loader) => {
+                let guard = loader.borrow(py);
+                guard.metrics.inflight_bytes.get()
+            }
+            MixLoader::Distributed(loader) => {
+                let guard = loader.borrow(py);
+                guard.metrics.inflight_bytes.get()
+            }
+        }
+    }
+
+    fn source_rss_bytes(source: &MixLoader, py: Python<'_>) -> u64 {
+        match source {
+            MixLoader::Local(loader) => {
+                let guard = loader.borrow(py);
+                guard.metrics.process_rss_bytes.get()
+            }
+            MixLoader::Distributed(loader) => {
+                let guard = loader.borrow(py);
+                guard.metrics.process_rss_bytes.get()
+            }
+        }
+    }
+
+    fn source_config(
+        source: &MixLoader,
+        py: Python<'_>,
+    ) -> (Option<String>, Option<String>, usize, u64, usize, usize) {
+        match source {
+            MixLoader::Local(loader) => {
+                let guard = loader.borrow(py);
+                (
+                    Some(guard.dataset_base.clone()),
+                    Some(guard.manifest_hash.clone()),
+                    guard.batch_size_samples,
+                    guard.max_inflight_bytes,
+                    guard.max_queue_batches,
+                    guard.prefetch_batches,
+                )
+            }
+            MixLoader::Distributed(loader) => {
+                let guard = loader.borrow(py);
+                (
+                    None,
+                    Some(guard.manifest_hash.clone()),
+                    0,
+                    0,
+                    guard.pipeline.effective_max_queue_batches(),
+                    guard.pipeline.effective_prefetch_batches(),
+                )
+            }
+        }
+    }
+
+    fn source_apply_runtime_overrides(
+        source: &MixLoader,
+        py: Python<'_>,
+        prefetch_batches: Option<usize>,
+        max_queue_batches: Option<usize>,
+    ) {
+        match source {
+            MixLoader::Local(loader) => {
+                let mut guard = loader.borrow_mut(py);
+                guard.apply_runtime_overrides(prefetch_batches, max_queue_batches);
+            }
+            MixLoader::Distributed(loader) => {
+                let guard = loader.borrow_mut(py);
+                if let Some(prefetch) = prefetch_batches {
+                    guard.pipeline.set_prefetch_batches(prefetch.max(1));
+                }
+                if let Some(max_queue) = max_queue_batches {
+                    guard.pipeline.set_max_queue_batches(max_queue.max(1));
+                }
+            }
+        }
+    }
+
+    fn source_next<'py>(source: &MixLoader, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match source {
+            MixLoader::Local(loader) => {
+                let mut guard = loader.borrow_mut(py);
+                guard.__next__(py)
+            }
+            MixLoader::Distributed(loader) => {
+                let mut guard = loader.borrow_mut(py);
+                let batch = guard.__next__()?;
+                let out = Py::new(py, batch)?;
+                Ok(out.into_bound(py).into_any())
+            }
+        }
+    }
+
+    fn source_checkpoint(source: &MixLoader, py: Python<'_>) -> PyResult<Vec<u8>> {
+        match source {
+            MixLoader::Local(loader) => Ok(loader.borrow(py).checkpoint(py)?.as_bytes().to_vec()),
+            MixLoader::Distributed(loader) => {
+                Ok(loader.borrow(py).checkpoint(py)?.as_bytes().to_vec())
+            }
+        }
+    }
+
     fn total_inflight_bytes(&self, py: Python<'_>) -> u64 {
         self.loaders
             .iter()
-            .map(|ldr| ldr.borrow(py).metrics.inflight_bytes.get())
+            .map(|ldr| Self::source_inflight_bytes(ldr, py))
             .fold(0u64, |acc, v| acc.saturating_add(v))
     }
 
@@ -1906,9 +2424,57 @@ impl MixedDataLoader {
     fn max_process_rss_bytes(&self, py: Python<'_>) -> u64 {
         self.loaders
             .iter()
-            .map(|ldr| ldr.borrow(py).metrics.process_rss_bytes.get())
+            .map(|ldr| Self::source_rss_bytes(ldr, py))
             .max()
             .unwrap_or(0)
+    }
+
+    fn apply_resume_token(
+        &mut self,
+        py: Python<'_>,
+        token: &MixLoaderCheckpointToken,
+    ) -> PyResult<()> {
+        if token.seed != self.seed {
+            return Err(PyValueError::new_err(format!(
+                "resume_from seed mismatch: token={} current={}",
+                token.seed, self.seed
+            )));
+        }
+        if token.epoch != self.epoch {
+            return Err(PyValueError::new_err(format!(
+                "resume_from epoch mismatch: token={} current={}",
+                token.epoch, self.epoch
+            )));
+        }
+        if token.source_count != self.loaders.len() {
+            return Err(PyValueError::new_err(format!(
+                "resume_from source_count mismatch: token={} current={}",
+                token.source_count,
+                self.loaders.len()
+            )));
+        }
+
+        for (idx, loader) in self.loaders.iter().enumerate() {
+            let checkpoint = Self::source_checkpoint(loader, py)?;
+            if checkpoint != token.source_checkpoints[idx] {
+                return Err(PyValueError::new_err(format!(
+                    "resume_from source checkpoint mismatch at source_idx={idx}; recreate source loaders from their checkpoint tokens first",
+                )));
+            }
+        }
+
+        self.active = token.active.clone();
+        self.delivered_batches = token.delivered_batches.clone();
+        self.delivered_samples = token.delivered_samples.clone();
+        self.delivered_bytes = token.delivered_bytes.clone();
+        self.starvation_total = token.starvation_total.clone();
+        self.source_exhausted_total = token.source_exhausted_total.clone();
+        self.steps_since_emit = token.steps_since_emit.clone();
+        self.schedule_ticks = token.schedule_ticks;
+        self.snapshot_emitted_total = token.snapshot_emitted_total;
+        self.scheduler.current = token.scheduler_current.clone();
+        self.scheduler.tie_break_offset = token.scheduler_tie_break_offset;
+        Ok(())
     }
 
     fn maybe_run_runtime_autotune(&mut self, py: Python<'_>) {
@@ -1969,8 +2535,9 @@ impl MixedDataLoader {
         self.mix_effective_prefetch_batches = tick.next.prefetch_batches;
         self.mix_effective_max_queue_batches = tick.next.max_queue_batches;
         for loader in &self.loaders {
-            let mut guard = loader.borrow_mut(py);
-            guard.apply_runtime_overrides(
+            Self::source_apply_runtime_overrides(
+                loader,
+                py,
                 Some(tick.next.prefetch_batches),
                 Some(tick.next.max_queue_batches),
             );
@@ -2062,10 +2629,7 @@ impl MixedDataLoader {
                 }
             }
 
-            let next_item = {
-                let mut loader = self.loaders[source_idx].borrow_mut(py);
-                loader.__next__(py)
-            };
+            let next_item = Self::source_next(&self.loaders[source_idx], py);
 
             match next_item {
                 Ok(item) => {
@@ -2212,7 +2776,14 @@ impl MixedDataLoader {
         let source_stats = PyList::empty_bound(py);
         let realized = self.realized_ratio();
         for (source_idx, loader) in self.loaders.iter().enumerate() {
-            let guard = loader.borrow(py);
+            let (
+                dataset_base,
+                manifest_hash,
+                batch_size_samples,
+                max_inflight_bytes,
+                max_queue_batches,
+                prefetch_batches,
+            ) = Self::source_config(loader, py);
             let source = PyDict::new_bound(py);
             source.set_item("source_idx", source_idx)?;
             source.set_item("active", self.active[source_idx])?;
@@ -2238,17 +2809,54 @@ impl MixedDataLoader {
                 "source_exhausted_total",
                 self.source_exhausted_total[source_idx],
             )?;
-            source.set_item("dataset_base", guard.dataset_base.as_str())?;
-            source.set_item("manifest_hash", guard.manifest_hash.as_str())?;
-            source.set_item("batch_size_samples", guard.batch_size_samples)?;
-            source.set_item("max_inflight_bytes", guard.max_inflight_bytes)?;
-            source.set_item("max_queue_batches", guard.max_queue_batches)?;
-            source.set_item("prefetch_batches", guard.prefetch_batches)?;
-            source.set_item("metrics", metrics_to_dict(py, guard.metrics.as_ref())?)?;
+            source.set_item("dataset_base", dataset_base.as_deref())?;
+            source.set_item("manifest_hash", manifest_hash.as_deref())?;
+            source.set_item("batch_size_samples", batch_size_samples)?;
+            source.set_item("max_inflight_bytes", max_inflight_bytes)?;
+            source.set_item("max_queue_batches", max_queue_batches)?;
+            source.set_item("prefetch_batches", prefetch_batches)?;
+            let metrics = match loader {
+                MixLoader::Local(local) => {
+                    let guard = local.borrow(py);
+                    metrics_to_dict(py, guard.metrics.as_ref())?
+                }
+                MixLoader::Distributed(distributed) => {
+                    let guard = distributed.borrow(py);
+                    metrics_to_dict(py, guard.metrics.as_ref())?
+                }
+            };
+            source.set_item("metrics", metrics)?;
             source_stats.append(source)?;
         }
         out.set_item("mix_sources", source_stats)?;
         Ok(out.into_any())
+    }
+
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let source_checkpoints = self
+            .loaders
+            .iter()
+            .map(|loader| Self::source_checkpoint(loader, py))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let token = MixLoaderCheckpointToken {
+            seed: self.seed,
+            epoch: self.epoch,
+            source_count: self.loaders.len(),
+            schedule_ticks: self.schedule_ticks,
+            snapshot_emitted_total: self.snapshot_emitted_total,
+            active: self.active.clone(),
+            delivered_batches: self.delivered_batches.clone(),
+            delivered_samples: self.delivered_samples.clone(),
+            delivered_bytes: self.delivered_bytes.clone(),
+            starvation_total: self.starvation_total.clone(),
+            source_exhausted_total: self.source_exhausted_total.clone(),
+            steps_since_emit: self.steps_since_emit.clone(),
+            scheduler_current: self.scheduler.current.clone(),
+            scheduler_tie_break_offset: self.scheduler.tie_break_offset,
+            source_checkpoints,
+        };
+        Ok(PyBytes::new_bound(py, &token.encode()))
     }
 }
 
@@ -3208,6 +3816,10 @@ impl VideoDataLoader {
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let out = PyDict::new_bound(py);
         out.set_item("manifest_hash", &self.manifest_hash)?;
+        out.set_item("assigned_rank", self.assigned_rank)?;
+        out.set_item("world_size", self.world_size)?;
+        out.set_item("job_id", self.job_id.as_deref())?;
+        out.set_item("cluster_url", self.cluster_url.as_deref())?;
         out.set_item("seed", self.seed)?;
         out.set_item("epoch", self.epoch)?;
         out.set_item("clip_len", self.clip_len)?;
@@ -3324,6 +3936,22 @@ impl VideoDataLoader {
             self.s3_full_object_range_fallback_total,
         )?;
         Ok(out.into_any())
+    }
+
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let token = VideoLoaderCheckpointToken {
+            manifest_hash: self.manifest_hash.clone(),
+            seed: self.seed,
+            epoch: self.epoch,
+            clip_len: self.clip_len,
+            stride: self.stride,
+            fps: self.decode_fps,
+            next_idx: self.next_idx as u64,
+            clips_total: self.clips.len() as u64,
+            assigned_rank: self.assigned_rank,
+            world_size: self.world_size,
+        };
+        Ok(PyBytes::new_bound(py, &token.encode()))
     }
 }
 
@@ -3593,7 +4221,7 @@ impl ImageLoader {
             "vision decode backend selected"
         );
         Ok(Self {
-            loader,
+            loader: ImageLoaderInner::Local(loader),
             resize_hw,
             to_float,
             decode_backend,
@@ -3614,15 +4242,30 @@ impl ImageLoader {
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.loader.stats(py)
+        match &self.loader {
+            ImageLoaderInner::Local(loader) => loader.stats(py),
+            ImageLoaderInner::Distributed(loader) => loader.stats(py),
+        }
     }
 
     fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        self.loader.checkpoint(py)
+        match &self.loader {
+            ImageLoaderInner::Local(loader) => loader.checkpoint(py),
+            ImageLoaderInner::Distributed(loader) => loader.checkpoint(py),
+        }
     }
 
     fn print_stats(&self, py: Python<'_>) -> PyResult<()> {
-        self.loader.print_stats(py)
+        match &self.loader {
+            ImageLoaderInner::Local(loader) => loader.print_stats(py),
+            ImageLoaderInner::Distributed(loader) => {
+                let stats = loader.stats(py)?;
+                let stats = stats.downcast::<PyDict>()?;
+                let text = render_human_stats(stats).replace('\n', " | ");
+                eprintln!("[mx8] {text}");
+                Ok(())
+            }
+        }
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -3630,31 +4273,63 @@ impl ImageLoader {
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let lease = py.allow_threads(|| {
-            self.loader
-                .rt
-                .block_on(async { self.loader.rx.recv().await })
-        });
-
-        let Some(lease) = lease else {
-            let Some(task) = self.loader.task.take() else {
-                return Err(PyStopIteration::new_err(()));
-            };
-            let out = py.allow_threads(|| self.loader.rt.block_on(task));
-            return match out {
-                Ok(Ok(())) => Err(PyStopIteration::new_err(())),
-                Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
-                Err(err) => Err(PyRuntimeError::new_err(format!(
-                    "producer task failed: {err}"
-                ))),
-            };
+        let lease = match &mut self.loader {
+            ImageLoaderInner::Local(loader) => {
+                let lease =
+                    py.allow_threads(|| loader.rt.block_on(async { loader.rx.recv().await }));
+                let Some(lease) = lease else {
+                    let Some(task) = loader.task.take() else {
+                        return Err(PyStopIteration::new_err(()));
+                    };
+                    let out = py.allow_threads(|| loader.rt.block_on(task));
+                    return match out {
+                        Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                        Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                        Err(err) => Err(PyRuntimeError::new_err(format!(
+                            "producer task failed: {err}"
+                        ))),
+                    };
+                };
+                loader.on_batch_delivered(&lease);
+                lease
+            }
+            ImageLoaderInner::Distributed(loader) => {
+                let wait_started = Instant::now();
+                let lease =
+                    py.allow_threads(|| loader.rt.block_on(async { loader.rx.recv().await }));
+                let Some(lease) = lease else {
+                    let Some(task) = loader.task.take() else {
+                        return Err(PyStopIteration::new_err(()));
+                    };
+                    let out = py.allow_threads(|| loader.rt.block_on(task));
+                    return match out {
+                        Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                        Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                        Err(err) => Err(PyRuntimeError::new_err(format!(
+                            "producer task failed: {err}"
+                        ))),
+                    };
+                };
+                loader.autotune.on_wait(wait_started.elapsed());
+                lease
+            }
         };
 
-        self.loader.on_batch_delivered(&lease);
         match self.decode_backend {
             DecodeBackend::Rust => self.next_rust_decode(py, lease),
             DecodeBackend::Python => self.next_python_decode(py, lease),
         }
+    }
+
+    fn close(&mut self) {
+        match &mut self.loader {
+            ImageLoaderInner::Local(loader) => loader.close(),
+            ImageLoaderInner::Distributed(loader) => loader.close(),
+        }
+    }
+
+    fn __del__(&mut self) {
+        self.close();
     }
 }
 
@@ -4145,6 +4820,8 @@ fn maybe_autopack(py: Python<'_>, s3_url: &str, shard_mb: u64) -> PyResult<()> {
     start_id=None,
     end_id=None,
     resume_from=None,
+    job_id=None,
+    cluster_url=None,
     node_id=None,
     max_ram_gb=None,
     profile=None,
@@ -4155,8 +4832,8 @@ fn maybe_autopack(py: Python<'_>, s3_url: &str, shard_mb: u64) -> PyResult<()> {
     autopack_shard_mb=512,
 ))]
 #[allow(clippy::too_many_arguments)]
-fn load(
-    py: Python<'_>,
+fn load<'py>(
+    py: Python<'py>,
     dataset_link: String,
     manifest_store: Option<PathBuf>,
     manifest_path: Option<PathBuf>,
@@ -4170,6 +4847,8 @@ fn load(
     start_id: Option<u64>,
     end_id: Option<u64>,
     resume_from: Option<Vec<u8>>,
+    job_id: Option<String>,
+    cluster_url: Option<String>,
     node_id: Option<String>,
     max_ram_gb: Option<f64>,
     profile: Option<String>,
@@ -4178,7 +4857,7 @@ fn load(
     runtime: Option<Py<RuntimeConfig>>,
     autopack: bool,
     autopack_shard_mb: u64,
-) -> PyResult<Py<DataLoader>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
     let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
@@ -4281,6 +4960,57 @@ fn load(
         }
     }
 
+    if distributed_requested(cluster_url.as_deref()) {
+        if start_id.is_some() || end_id.is_some() {
+            return Err(PyValueError::new_err(
+                "start_id/end_id are unsupported in distributed mode",
+            ));
+        }
+        if autopack {
+            return Err(PyValueError::new_err(
+                "autopack is unsupported in distributed mode",
+            ));
+        }
+        if manifest_store.is_some() || manifest_path.is_some() {
+            return Err(PyValueError::new_err(
+                "manifest_store/manifest_path are unsupported in distributed mode; coordinator owns snapshot resolution",
+            ));
+        }
+        let coord_url = effective_cluster_url(cluster_url).ok_or_else(|| {
+            PyValueError::new_err(
+                "distributed mode requires cluster_url (or MX8_CLUSTER_URL / MX8_COORD_URL)",
+            )
+        })?;
+        let job_id = job_id.or_else(|| env_string("MX8_JOB_ID")).ok_or_else(|| {
+            PyValueError::new_err("distributed mode requires job_id (or MX8_JOB_ID)")
+        })?;
+        let rank = rank_from_env();
+        let node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
+        let out = DistributedDataLoader::new(
+            py,
+            coord_url,
+            job_id,
+            node_id,
+            batch_size_samples,
+            effective_max_inflight_bytes,
+            effective_max_queue_batches,
+            effective_prefetch_batches,
+            target_batch_bytes,
+            max_batch_bytes,
+            1,
+            max_ram_gb,
+            profile,
+            autotune,
+            constraints,
+            runtime,
+            500,
+            DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+            resume_from,
+        )?;
+        let out = Py::new(py, out)?;
+        return Ok(out.into_bound(py).into_any());
+    }
+
     if autopack && dataset_link.starts_with("s3://") && !dataset_link.contains('@') {
         maybe_autopack(py, &dataset_link, autopack_shard_mb)?;
     }
@@ -4304,7 +5034,130 @@ fn load(
         profile.clone(),
         autotune,
     )?;
-    Py::new(py, loader)
+    let out = Py::new(py, loader)?;
+    Ok(out.into_bound(py).into_any())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    dataset,
+    *,
+    batch_size=512,
+    memory_gb=8.0,
+    profile="balanced".to_string(),
+    job_id=None,
+    resume_from=None,
+    coordinator=None,
+    node_id=None,
+    recursive=true,
+    manifest_store=None,
+    manifest_path=None,
+    autotune=None,
+    constraints=None,
+    runtime=None,
+))]
+#[allow(clippy::too_many_arguments)]
+/// `mx8.run(...)` is the default job entry point.
+///
+/// - Single-node (`WORLD_SIZE` unset/1): delegates to `mx8.load(...)`.
+/// - Distributed (`WORLD_SIZE > 1`): delegates to `mx8.DistributedDataLoader(...)`
+///   and requires `job_id` + coordinator URL (`coordinator=` or `MX8_COORD_URL`).
+fn run<'py>(
+    py: Python<'py>,
+    dataset: String,
+    batch_size: usize,
+    memory_gb: f64,
+    profile: String,
+    job_id: Option<String>,
+    resume_from: Option<Vec<u8>>,
+    coordinator: Option<String>,
+    node_id: Option<String>,
+    recursive: bool,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    autotune: Option<bool>,
+    constraints: Option<Py<Constraints>>,
+    runtime: Option<Py<RuntimeConfig>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let world_size = std::env::var("WORLD_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1);
+
+    if world_size > 1 {
+        let coord_url = coordinator
+            .or_else(|| std::env::var("MX8_COORD_URL").ok())
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "mx8.run distributed mode requires coordinator URL (pass coordinator=... or set MX8_COORD_URL)",
+                )
+            })?;
+        let effective_job_id = job_id
+            .or_else(|| std::env::var("MX8_JOB_ID").ok())
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "mx8.run distributed mode requires job_id (pass job_id=... or set MX8_JOB_ID)",
+                )
+            })?;
+        let rank = std::env::var("RANK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let effective_node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
+        let _ = (dataset, recursive, manifest_store, manifest_path);
+
+        let loader = DistributedDataLoader::new(
+            py,
+            coord_url,
+            effective_job_id,
+            effective_node_id,
+            batch_size,
+            128 * 1024 * 1024,
+            64,
+            1,
+            None,
+            None,
+            1,
+            Some(memory_gb),
+            Some(profile),
+            autotune,
+            constraints,
+            runtime,
+            500,
+            DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+            resume_from,
+        )?;
+        let out = Py::new(py, loader)?;
+        return Ok(out.into_bound(py).into_any());
+    }
+
+    let loader = load(
+        py,
+        dataset,
+        manifest_store,
+        manifest_path,
+        recursive,
+        batch_size,
+        128 * 1024 * 1024,
+        64,
+        1,
+        None,
+        None,
+        None,
+        None,
+        resume_from,
+        job_id,
+        coordinator,
+        node_id,
+        Some(memory_gb),
+        Some(profile),
+        autotune,
+        constraints,
+        runtime,
+        false,
+        512,
+    )?;
+    Ok(loader)
 }
 
 #[pyfunction]
@@ -4324,6 +5177,8 @@ fn load(
     start_id=None,
     end_id=None,
     resume_from=None,
+    job_id=None,
+    cluster_url=None,
     node_id=None,
     max_ram_gb=None,
     profile=None,
@@ -4351,6 +5206,8 @@ fn py_image(
     start_id: Option<u64>,
     end_id: Option<u64>,
     resume_from: Option<Vec<u8>>,
+    job_id: Option<String>,
+    cluster_url: Option<String>,
     node_id: Option<String>,
     max_ram_gb: Option<f64>,
     profile: Option<String>,
@@ -4437,6 +5294,85 @@ fn py_image(
         }
     }
 
+    if distributed_requested(cluster_url.as_deref()) {
+        if start_id.is_some() || end_id.is_some() {
+            return Err(PyValueError::new_err(
+                "start_id/end_id are unsupported in distributed mode",
+            ));
+        }
+        if autopack {
+            return Err(PyValueError::new_err(
+                "autopack is unsupported in distributed mode",
+            ));
+        }
+        if manifest_store.is_some() || manifest_path.is_some() {
+            return Err(PyValueError::new_err(
+                "manifest_store/manifest_path are unsupported in distributed mode; coordinator owns snapshot resolution",
+            ));
+        }
+        let coord_url = effective_cluster_url(cluster_url).ok_or_else(|| {
+            PyValueError::new_err(
+                "distributed mode requires cluster_url (or MX8_CLUSTER_URL / MX8_COORD_URL)",
+            )
+        })?;
+        let job_id = job_id.or_else(|| env_string("MX8_JOB_ID")).ok_or_else(|| {
+            PyValueError::new_err("distributed mode requires job_id (or MX8_JOB_ID)")
+        })?;
+        let rank = rank_from_env();
+        let node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
+        let distributed_loader = DistributedDataLoader::new(
+            py,
+            coord_url,
+            job_id,
+            node_id,
+            batch_size_samples,
+            effective_max_inflight_bytes,
+            effective_max_queue_batches,
+            effective_prefetch_batches,
+            target_batch_bytes,
+            max_batch_bytes,
+            1,
+            max_ram_gb,
+            profile.clone(),
+            autotune,
+            constraints,
+            runtime,
+            500,
+            DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+            resume_from,
+        )?;
+        let decode_backend = decode_backend_from_env()?;
+        let rust_jpeg_codec = rust_jpeg_codec_from_env()?;
+        let rust_resize_backend = rust_resize_backend_from_env()?;
+        let decode_threads = decode_threads_from_env()?;
+        let decode_pool = if matches!(decode_backend, DecodeBackend::Rust) && decode_threads > 1 {
+            Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(decode_threads)
+                    .build()
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "failed to build rust decode thread pool: {e}"
+                        ))
+                    })?,
+            ))
+        } else {
+            None
+        };
+        let out = ImageLoader {
+            loader: ImageLoaderInner::Distributed(distributed_loader),
+            resize_hw,
+            to_float,
+            decode_backend,
+            rust_jpeg_codec,
+            rust_resize_backend,
+            decode_threads,
+            decode_pool,
+            classes: None,
+        };
+        return Py::new(py, out);
+    }
+
     let loader = ImageLoader::new(
         dataset_link,
         manifest_store,
@@ -4474,6 +5410,9 @@ fn py_image(
     batch_size_samples=32,
     seed=0,
     epoch=0,
+    resume_from=None,
+    job_id=None,
+    cluster_url=None,
     max_ram_gb=None,
     profile=None,
     autotune=None,
@@ -4494,6 +5433,9 @@ fn video(
     batch_size_samples: usize,
     seed: u64,
     epoch: u64,
+    resume_from: Option<Vec<u8>>,
+    job_id: Option<String>,
+    cluster_url: Option<String>,
     max_ram_gb: Option<f64>,
     profile: Option<String>,
     autotune: Option<bool>,
@@ -4526,6 +5468,11 @@ fn video(
             },
         )
         .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+    let resume_token = resume_from
+        .as_deref()
+        .map(VideoLoaderCheckpointToken::decode)
+        .transpose()
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
     let fps_policy = format!("fixed_fps:{fps}");
     let cfg = VideoStage1Config {
@@ -4544,6 +5491,27 @@ fn video(
     .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
     let stage2d_sidecars = build_stage2d_sidecar_map(&snapshot.manifest_bytes)
         .map_err(|e| PyRuntimeError::new_err(format!("build stage2d sidecar map failed: {e}")))?;
+    let mut clips = index.clips;
+    let mut assigned_rank = 0u32;
+    let mut world_size = 1u32;
+    if distributed_requested(cluster_url.as_deref()) {
+        world_size = world_size_from_env().max(1);
+        assigned_rank = rank_from_env().min(world_size.saturating_sub(1));
+        if world_size > 1 {
+            clips = clips
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, clip)| {
+                    let idx = idx as u32;
+                    if idx % world_size == assigned_rank {
+                        Some(clip)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+        }
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -4628,6 +5596,51 @@ fn video(
         .unwrap_or(16)
         .max(1);
 
+    let clips_total = clips.len() as u64;
+    let mut next_idx = 0usize;
+    if let Some(token) = &resume_token {
+        if token.manifest_hash != snapshot.manifest_hash.0 {
+            return Err(PyValueError::new_err(format!(
+                "resume_from manifest_hash mismatch: token={} current={}",
+                token.manifest_hash, snapshot.manifest_hash.0
+            )));
+        }
+        if token.seed != seed {
+            return Err(PyValueError::new_err(format!(
+                "resume_from seed mismatch: token={} current={}",
+                token.seed, seed
+            )));
+        }
+        if token.epoch != epoch {
+            return Err(PyValueError::new_err(format!(
+                "resume_from epoch mismatch: token={} current={}",
+                token.epoch, epoch
+            )));
+        }
+        if token.clip_len != clip_len || token.stride != stride || token.fps != fps {
+            return Err(PyValueError::new_err(
+                "resume_from video clip configuration mismatch",
+            ));
+        }
+        if token.assigned_rank != assigned_rank || token.world_size != world_size {
+            return Err(PyValueError::new_err(format!(
+                "resume_from distributed shape mismatch: token rank/world={}/{} current={}/{}",
+                token.assigned_rank, token.world_size, assigned_rank, world_size
+            )));
+        }
+        if token.clips_total != clips_total {
+            return Err(PyValueError::new_err(format!(
+                "resume_from clips_total mismatch: token={} current={}",
+                token.clips_total, clips_total
+            )));
+        }
+        next_idx = usize::try_from(token.next_idx)
+            .map_err(|_| PyValueError::new_err("resume_from next_idx overflow"))?;
+        if next_idx > clips.len() {
+            return Err(PyValueError::new_err("resume_from next_idx out of range"));
+        }
+    }
+
     tracing::info!(
         target: "mx8_proof",
         event = "video_loader_initialized",
@@ -4636,7 +5649,7 @@ fn video(
         stride = stride as u64,
         fps = fps as u64,
         batch_size_samples = batch_size_samples as u64,
-        clips_total = index.summary.clip_count,
+        clips_total = clips_total,
         stage2d_sidecars = stage2d_sidecars.len() as u64,
         decode_backend = video_decode_backend_name(decode_backend),
         max_inflight_bytes = max_inflight_bytes,
@@ -4650,6 +5663,8 @@ fn video(
         bytes_per_clip = bytes_per_clip as u64,
         seed = seed,
         epoch = epoch,
+        assigned_rank = assigned_rank,
+        world_size = world_size,
         "initialized stage2b video loader"
     );
 
@@ -4657,11 +5672,11 @@ fn video(
         py,
         VideoDataLoader {
             manifest_hash: snapshot.manifest_hash.0,
-            clips: index.clips,
+            clips,
             stage2d_sidecars,
             rt,
             decode_backend,
-            next_idx: 0,
+            next_idx,
             batch_size_samples,
             max_inflight_bytes,
             bytes_per_clip,
@@ -4696,6 +5711,10 @@ fn video(
             video_runtime_autotune_adjustments_total: 0,
             video_runtime_autotune_pressure_milli: 0,
             video_max_process_rss_bytes: effective_max_process_rss_bytes,
+            assigned_rank,
+            world_size,
+            job_id,
+            cluster_url,
             started_at: Instant::now(),
         },
     )
@@ -4710,6 +5729,9 @@ fn video(
     epoch=0,
     starvation_window=10_000,
     source_exhausted="error",
+    resume_from=None,
+    job_id=None,
+    cluster_url=None,
     max_ram_gb=None,
     profile=None,
     autotune=None,
@@ -4719,18 +5741,22 @@ fn video(
 #[allow(clippy::too_many_arguments)]
 fn mix(
     py: Python<'_>,
-    loaders: Vec<Py<DataLoader>>,
+    loaders: Vec<Py<PyAny>>,
     weights: Vec<f64>,
     seed: u64,
     epoch: u64,
     starvation_window: u64,
     source_exhausted: &str,
+    resume_from: Option<Vec<u8>>,
+    job_id: Option<String>,
+    cluster_url: Option<String>,
     max_ram_gb: Option<f64>,
     profile: Option<String>,
     autotune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
 ) -> PyResult<Py<MixedDataLoader>> {
+    let _ = (job_id, cluster_url);
     if loaders.is_empty() {
         return Err(PyValueError::new_err(
             "mix requires at least one loader instance",
@@ -4745,20 +5771,48 @@ fn mix(
     }
     let normalized =
         normalize_mix_weights(&weights).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let resume_token = resume_from
+        .as_deref()
+        .map(MixLoaderCheckpointToken::decode)
+        .transpose()
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
     let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
     let max_ram_bytes_from_gb = max_ram_gb_to_bytes(max_ram_gb)?;
-
-    let mut inflight_caps = Vec::with_capacity(loaders.len());
-    let mut batch_sizes = Vec::with_capacity(loaders.len());
-    for loader in &loaders {
-        let guard = loader.borrow(py);
-        inflight_caps.push(guard.max_inflight_bytes);
-        batch_sizes.push(guard.batch_size_samples);
+    let mut parsed_loaders = Vec::<MixLoader>::with_capacity(loaders.len());
+    for loader in loaders {
+        let bound = loader.bind(py);
+        if let Ok(local) = bound.extract::<Py<DataLoader>>() {
+            parsed_loaders.push(MixLoader::Local(local));
+            continue;
+        }
+        if let Ok(distributed) = bound.extract::<Py<DistributedDataLoader>>() {
+            parsed_loaders.push(MixLoader::Distributed(distributed));
+            continue;
+        }
+        return Err(PyValueError::new_err(
+            "mix requires loaders created by mx8.load(...) (local or distributed)",
+        ));
     }
-    let loader_shared_max_inflight_bytes = compute_shared_mix_cap(&inflight_caps)
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+
+    let mut inflight_caps = Vec::with_capacity(parsed_loaders.len());
+    let mut batch_sizes = Vec::with_capacity(parsed_loaders.len());
+    for loader in &parsed_loaders {
+        let (_, _, batch_size_samples, max_inflight_bytes, _, _) =
+            MixedDataLoader::source_config(loader, py);
+        if max_inflight_bytes > 0 {
+            inflight_caps.push(max_inflight_bytes);
+        }
+        if batch_size_samples > 0 {
+            batch_sizes.push(batch_size_samples);
+        }
+    }
+    let loader_shared_max_inflight_bytes = if inflight_caps.is_empty() {
+        128 * 1024 * 1024
+    } else {
+        compute_shared_mix_cap(&inflight_caps).map_err(|e| PyValueError::new_err(format!("{e}")))?
+    };
 
     if let Some(&first_batch_size) = batch_sizes.first() {
         if batch_sizes.iter().any(|v| *v != first_batch_size) {
@@ -4850,17 +5904,26 @@ fn mix(
         }
     }
 
-    for loader in &loaders {
-        let mut guard = loader.borrow_mut(py);
-        guard.apply_runtime_overrides(runtime_prefetch_override, runtime_max_queue_override);
+    for loader in &parsed_loaders {
+        MixedDataLoader::source_apply_runtime_overrides(
+            loader,
+            py,
+            runtime_prefetch_override,
+            runtime_max_queue_override,
+        );
     }
 
-    let mut queue_caps = Vec::with_capacity(loaders.len());
-    let mut prefetch_caps = Vec::with_capacity(loaders.len());
-    for loader in &loaders {
-        let guard = loader.borrow(py);
-        queue_caps.push(guard.max_queue_batches);
-        prefetch_caps.push(guard.prefetch_batches);
+    let mut queue_caps = Vec::with_capacity(parsed_loaders.len());
+    let mut prefetch_caps = Vec::with_capacity(parsed_loaders.len());
+    for loader in &parsed_loaders {
+        let (_, _, _, _, max_queue_batches, prefetch_batches) =
+            MixedDataLoader::source_config(loader, py);
+        if max_queue_batches > 0 {
+            queue_caps.push(max_queue_batches);
+        }
+        if prefetch_batches > 0 {
+            prefetch_caps.push(prefetch_batches);
+        }
     }
 
     let mut shared_max_inflight_bytes = shared_max_inflight_override
@@ -4900,7 +5963,7 @@ fn mix(
     let scheduler = WeightedRoundRobin::new(normalized.clone(), seed, epoch);
     let source_exhaustion_policy = SourceExhaustionPolicy::parse(source_exhausted)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-    let n = loaders.len();
+    let n = parsed_loaders.len();
     let snapshot_enabled = env_bool("MX8_MIX_SNAPSHOT", false);
     let snapshot_period_ticks = env_u64("MX8_MIX_SNAPSHOT_PERIOD_TICKS")
         .unwrap_or(64)
@@ -4926,8 +5989,8 @@ fn mix(
         prefetch_batches = ?prefetch_caps,
         "initialized mixed loader"
     );
-    let out = MixedDataLoader {
-        loaders,
+    let mut out = MixedDataLoader {
+        loaders: parsed_loaders,
         scheduler,
         active: vec![true; n],
         source_exhausted_total: vec![0; n],
@@ -4966,6 +6029,9 @@ fn mix(
         mix_max_process_rss_bytes,
         started_at: Instant::now(),
     };
+    if let Some(token) = resume_token {
+        out.apply_resume_token(py, &token)?;
+    }
     Py::new(py, out)
 }
 
@@ -5271,6 +6337,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBatch>()?;
     m.add_function(wrap_pyfunction!(pack, m)?)?;
     m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(py_image, m)?)?;
     m.add_function(wrap_pyfunction!(video, m)?)?;
@@ -5393,6 +6460,17 @@ fn default_manifest_store() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/.mx8/manifests"))
 }
 
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse::<u64>().ok()
 }
@@ -5412,6 +6490,28 @@ fn env_bool(name: &str, default: bool) -> bool {
         ),
         Err(_) => default,
     }
+}
+
+fn world_size_from_env() -> u32 {
+    env_string("WORLD_SIZE")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+}
+
+fn rank_from_env() -> u32 {
+    env_string("RANK")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn distributed_requested(cluster_url: Option<&str>) -> bool {
+    cluster_url.is_some() || world_size_from_env() > 1
+}
+
+fn effective_cluster_url(cluster_url: Option<String>) -> Option<String> {
+    cluster_url
+        .or_else(|| env_string("MX8_CLUSTER_URL"))
+        .or_else(|| env_string("MX8_COORD_URL"))
 }
 
 fn should_use_zero_manifest_scan(parsed: &mx8_core::dataset_link::DatasetLink, base: &str) -> bool {
@@ -6114,6 +7214,22 @@ async fn fetch_manifest_bytes(
     }
 }
 
+async fn fetch_resume_checkpoint_bytes(
+    channel: Channel,
+    grpc_max_message_bytes: usize,
+    job_id: &str,
+) -> Result<Vec<u8>> {
+    let mut client = CoordinatorClient::new(channel)
+        .max_decoding_message_size(grpc_max_message_bytes)
+        .max_encoding_message_size(grpc_max_message_bytes);
+    let resp = client
+        .get_resume_checkpoint(GetResumeCheckpointRequest {
+            job_id: job_id.to_string(),
+        })
+        .await?;
+    Ok(resp.into_inner().checkpoint)
+}
+
 async fn heartbeat_loop(
     channel: Channel,
     grpc_max_message_bytes: usize,
@@ -6274,6 +7390,7 @@ struct DistributedDataLoader {
     manifest_hash: String,
     assigned_rank: u32,
     world_size: u32,
+    elastic_state: Arc<ElasticRuntimeState>,
     max_process_rss_bytes: Option<u64>,
     metrics: Arc<RuntimeMetrics>,
     pipeline: Arc<Pipeline>,
@@ -6284,6 +7401,92 @@ struct DistributedDataLoader {
     autotune_task: Option<tokio::task::JoinHandle<()>>,
     rt: tokio::runtime::Runtime,
     started_at: Instant,
+}
+
+#[derive(Debug)]
+struct ElasticRuntimeState {
+    pending: AtomicU32,
+    transitions_total: AtomicU64,
+    current_world_size: AtomicU32,
+    target_world_size: AtomicU32,
+    last_transition_unix_time_ms: AtomicU64,
+    last_reason: Mutex<String>,
+}
+
+impl Default for ElasticRuntimeState {
+    fn default() -> Self {
+        Self {
+            pending: AtomicU32::new(0),
+            transitions_total: AtomicU64::new(0),
+            current_world_size: AtomicU32::new(0),
+            target_world_size: AtomicU32::new(0),
+            last_transition_unix_time_ms: AtomicU64::new(0),
+            last_reason: Mutex::new("none".to_string()),
+        }
+    }
+}
+
+impl ElasticRuntimeState {
+    fn apply(
+        &self,
+        pending: bool,
+        transitions_total: u64,
+        last_reason: &str,
+        current_world_size: u32,
+        target_world_size: u32,
+        last_transition_unix_time_ms: u64,
+    ) {
+        self.pending.store(u32::from(pending), Ordering::Relaxed);
+        self.transitions_total
+            .store(transitions_total, Ordering::Relaxed);
+        self.current_world_size
+            .store(current_world_size, Ordering::Relaxed);
+        self.target_world_size
+            .store(target_world_size, Ordering::Relaxed);
+        self.last_transition_unix_time_ms
+            .store(last_transition_unix_time_ms, Ordering::Relaxed);
+        let mut guard = match self.last_reason.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let reason = if last_reason.trim().is_empty() {
+            "none"
+        } else {
+            last_reason
+        };
+        guard.clear();
+        guard.push_str(reason);
+    }
+
+    fn apply_from_register(&self, resp: &RegisterNodeResponse) {
+        self.apply(
+            resp.elastic_transition_pending,
+            resp.elastic_transitions_total,
+            resp.elastic_last_transition_reason.as_str(),
+            resp.elastic_current_world_size,
+            resp.elastic_target_world_size,
+            resp.elastic_last_transition_unix_time_ms,
+        );
+    }
+
+    fn apply_from_request_lease(&self, resp: &RequestLeaseResponse) {
+        self.apply(
+            resp.elastic_transition_pending,
+            resp.elastic_transitions_total,
+            resp.elastic_last_transition_reason.as_str(),
+            resp.elastic_current_world_size,
+            resp.elastic_target_world_size,
+            resp.elastic_last_transition_unix_time_ms,
+        );
+    }
+
+    fn last_reason(&self) -> String {
+        let guard = match self.last_reason.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    }
 }
 
 #[pymethods]
@@ -6402,10 +7605,18 @@ impl DistributedDataLoader {
             .enable_all()
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}")))?;
+        let elastic_state = Arc::new(ElasticRuntimeState::default());
+        let elastic_state_for_register = elastic_state.clone();
+        let coord_url_for_register = coord_url.clone();
+        let job_id_for_register = job_id.clone();
+        let node_id_for_register = node_id.clone();
+        let resume_from_for_register = resume_from.clone();
 
         let (manifest_hash, assigned_rank, world_size, heartbeat_interval_ms, channel) = rt
-            .block_on(async {
-                let channel = Channel::from_shared(coord_url.clone())?.connect().await?;
+            .block_on(async move {
+                let channel = Channel::from_shared(coord_url_for_register.clone())?
+                    .connect()
+                    .await?;
                 let mut client = CoordinatorClient::new(channel.clone())
                     .max_decoding_message_size(grpc_max_message_bytes)
                     .max_encoding_message_size(grpc_max_message_bytes);
@@ -6420,25 +7631,27 @@ impl DistributedDataLoader {
 
                 let mut resp = client
                     .register_node(RegisterNodeRequest {
-                        job_id: job_id.clone(),
-                        node_id: node_id.clone(),
+                        job_id: job_id_for_register.clone(),
+                        node_id: node_id_for_register.clone(),
                         caps: caps.clone(),
-                        resume_from: resume_from.clone().unwrap_or_default(),
+                        resume_from: resume_from_for_register.clone().unwrap_or_default(),
                     })
                     .await?
                     .into_inner();
+                elastic_state_for_register.apply_from_register(&resp);
 
                 while !resp.job_ready {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     resp = client
                         .register_node(RegisterNodeRequest {
-                            job_id: job_id.clone(),
-                            node_id: node_id.clone(),
+                            job_id: job_id_for_register.clone(),
+                            node_id: node_id_for_register.clone(),
                             caps: caps.clone(),
-                            resume_from: resume_from.clone().unwrap_or_default(),
+                            resume_from: resume_from_for_register.clone().unwrap_or_default(),
                         })
                         .await?
                         .into_inner();
+                    elastic_state_for_register.apply_from_register(&resp);
                 }
 
                 Ok::<_, anyhow::Error>((
@@ -6551,20 +7764,27 @@ impl DistributedDataLoader {
         let manifest_bytes = Arc::new(manifest_bytes);
         let autotune_for_requests = autotune.clone();
         let pipeline_for_requests = pipeline.clone();
+        let elastic_for_requests = elastic_state.clone();
         let job_id_for_task = job_id.clone();
         let node_id_for_task = node_id.clone();
         let task = rt.spawn(async move {
             let mut next_request_at = tokio::time::Instant::now();
+            let mut last_checkpointed_transition_total = 0u64;
             loop {
                 let now = tokio::time::Instant::now();
                 if now < next_request_at {
                     tokio::time::sleep_until(next_request_at).await;
                 }
-                let want = if autotune_for_requests.enabled {
+                let mut want = if autotune_for_requests.enabled {
                     autotune_for_requests.want.load(Ordering::Relaxed).max(1)
                 } else {
                     std::cmp::max(1, effective_want)
                 };
+                if elastic_for_requests.pending.load(Ordering::Relaxed) != 0 {
+                    // During elastic transitions, narrow request width to reduce
+                    // boundary churn while membership converges.
+                    want = 1;
+                }
 
                 let mut client = CoordinatorClient::new(channel.clone())
                     .max_decoding_message_size(grpc_max_message_bytes)
@@ -6585,8 +7805,54 @@ impl DistributedDataLoader {
                         continue;
                     }
                 };
+                elastic_for_requests.apply_from_request_lease(&resp);
+                if resp.elastic_transition_pending
+                    && resp.elastic_transitions_total > last_checkpointed_transition_total
+                {
+                    match fetch_resume_checkpoint_bytes(
+                        channel.clone(),
+                        grpc_max_message_bytes,
+                        &job_id_for_task,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => {
+                            tracing::info!(
+                                target: "mx8_proof",
+                                event = "elastic_transition_checkpoint_captured",
+                                transitions_total = resp.elastic_transitions_total,
+                                reason = %resp.elastic_last_transition_reason,
+                                current_world_size = resp.elastic_current_world_size,
+                                target_world_size = resp.elastic_target_world_size,
+                                checkpoint_bytes = bytes.len() as u64,
+                                "captured distributed resume checkpoint at elastic boundary"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "mx8_proof",
+                                event = "elastic_transition_checkpoint_capture_failed",
+                                transitions_total = resp.elastic_transitions_total,
+                                reason = %resp.elastic_last_transition_reason,
+                                error = %err,
+                                "failed to capture distributed resume checkpoint at elastic boundary"
+                            );
+                        }
+                    }
+                    last_checkpointed_transition_total = resp.elastic_transitions_total;
+                }
 
                 if resp.leases.is_empty() {
+                    if resp.job_drained {
+                        tracing::info!(
+                            target: "mx8_proof",
+                            event = "distributed_loader_job_drained",
+                            job_id = %job_id_for_task,
+                            node_id = %node_id_for_task,
+                            "coordinator reported drained; stopping distributed loader request loop"
+                        );
+                        break;
+                    }
                     let wait_ms = std::cmp::max(1, resp.wait_ms);
                     next_request_at =
                         tokio::time::Instant::now() + Duration::from_millis(wait_ms as u64);
@@ -6609,6 +7875,7 @@ impl DistributedDataLoader {
                     .await?;
                 }
             }
+            Ok::<(), anyhow::Error>(())
         });
 
         Ok(Self {
@@ -6618,6 +7885,7 @@ impl DistributedDataLoader {
             manifest_hash,
             assigned_rank,
             world_size,
+            elastic_state,
             max_process_rss_bytes: max_process_rss_bytes_cap,
             metrics,
             pipeline,
@@ -6659,6 +7927,34 @@ impl DistributedDataLoader {
         out.set_item("effective_want", self.autotune.want.load(Ordering::Relaxed))?;
         out.set_item("assigned_rank", self.assigned_rank)?;
         out.set_item("world_size", self.world_size)?;
+        out.set_item(
+            "elastic_transition_pending",
+            self.elastic_state.pending.load(Ordering::Relaxed) != 0,
+        )?;
+        out.set_item(
+            "elastic_transitions_total",
+            self.elastic_state.transitions_total.load(Ordering::Relaxed),
+        )?;
+        out.set_item(
+            "elastic_last_transition_reason",
+            self.elastic_state.last_reason(),
+        )?;
+        out.set_item(
+            "elastic_current_world_size",
+            self.elastic_state
+                .current_world_size
+                .load(Ordering::Relaxed),
+        )?;
+        out.set_item(
+            "elastic_target_world_size",
+            self.elastic_state.target_world_size.load(Ordering::Relaxed),
+        )?;
+        out.set_item(
+            "elastic_last_transition_unix_time_ms",
+            self.elastic_state
+                .last_transition_unix_time_ms
+                .load(Ordering::Relaxed),
+        )?;
         out.set_item("max_process_rss_bytes", self.max_process_rss_bytes)?;
         out.set_item("elapsed_seconds", self.started_at.elapsed().as_secs_f64())?;
         out.set_item("autotune_enabled", self.autotune.enabled)?;

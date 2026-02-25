@@ -19,6 +19,7 @@ The simple path lets MX8 do the work:
 ```python
 loader = mx8.load(
     "s3://bucket/train@refresh",
+    max_ram_gb=24,
     profile="balanced",
     autotune=True,
 )
@@ -29,6 +30,7 @@ The constrained path keeps autotune active but pins specific caps:
 ```python
 loader = mx8.load(
     "s3://bucket/train@refresh",
+    max_ram_gb=24,
     profile="throughput",
     autotune=True,
     constraints=mx8.Constraints(
@@ -43,6 +45,7 @@ The manual path disables adaptation entirely:
 ```python
 loader = mx8.load(
     "s3://bucket/train@refresh",
+    max_ram_gb=24,
     autotune=False,
     runtime=mx8.RuntimeConfig(
         prefetch_batches=8,
@@ -60,7 +63,7 @@ loader = mx8.load(
 
 ## Startup flow
 
-When `mx8.load` is called with autotune enabled, MX8 reads the node RAM limit by taking the minimum of physical RAM and any cgroup limit. It determines local rank count from the runtime context, selects default reservation ratios from the profile, warms up briefly to estimate the process baseline RSS, then derives `max_ram_bytes` and `max_inflight_bytes`. It emits a compact startup summary with the computed values.
+When `mx8.load` (or `mx8.run`) is called with autotune enabled, MX8 reads the node RAM limit by taking the minimum of physical RAM and any cgroup limit. It determines local rank count from the runtime context, selects default reservation ratios from the profile, warms up briefly to estimate the process baseline RSS, then derives `max_ram_bytes` and `max_inflight_bytes`. It emits a compact startup summary with the computed values.
 
 Cap derivation uses this chain:
 

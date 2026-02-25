@@ -13,7 +13,7 @@ Generation command:
 rg -o --no-filename "MX8_[A-Z0-9_]+" crates scripts | sort -u
 ```
 
-Current inventory size: `250` variables.
+Current inventory size: `255` variables.
 
 ## Stability Classes
 
@@ -48,6 +48,7 @@ Current inventory size: `250` variables.
 | `MX8_SEED` | `0` | coordinator | `u64` | stable |
 | `MX8_EPOCH` | `0` | coordinator | `u32` | stable |
 | `MX8_COORD_URL` | `http://127.0.0.1:50051` | agent/tui/distributed python loader | URL | stable |
+| `MX8_CLUSTER_URL` | unset (falls back to `MX8_COORD_URL`) | python loader attach | URL | stable |
 | `MX8_JOB_ID` | `local-job` (agent), `local-job` (tui) | control plane | non-empty string | stable |
 | `MX8_NODE_ID` | `local-node` (agent), `resolver` (resolver CLI) | control plane | non-empty string | stable |
 | `MX8_BATCH_SIZE_SAMPLES` | `512` | agent/runtime/python | integer >= 1 | stable |
@@ -146,6 +147,7 @@ MX8_BURNIN_RETRIES
 MX8_BURNIN_RUNS
 MX8_BYTES_PER_SAMPLE
 MX8_CHECK_OFFLINE
+MX8_CLUSTER_URL
 MX8_COORD_BIND_ADDR
 MX8_COORD_HA_ENABLE
 MX8_COORD_HA_LEADER_ID
