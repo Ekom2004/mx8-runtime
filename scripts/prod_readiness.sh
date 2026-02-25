@@ -71,6 +71,9 @@ echo "[mx8] prod_readiness: deterministic autotune pressure simulation"
 echo "[mx8] prod_readiness: distributed checkpoint/resume gate"
 ./scripts/distributed_resume_gate.sh
 
+echo "[mx8] prod_readiness: epoch-boundary training membership gate"
+./scripts/training_epoch_boundary_gate.sh
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "[mx8] prod_readiness failed: docker is required for MinIO soak gate" >&2
   exit 1

@@ -432,6 +432,29 @@ struct NodeEntry {
     last_stats: Option<NodeStats>,
 }
 
+#[derive(Debug, Clone)]
+struct ElasticTransitionView {
+    pending: bool,
+    transitions_total: u64,
+    last_reason: String,
+    current_world_size: u32,
+    target_world_size: u32,
+    last_transition_unix_time_ms: u64,
+}
+
+impl Default for ElasticTransitionView {
+    fn default() -> Self {
+        Self {
+            pending: false,
+            transitions_total: 0,
+            last_reason: "none".to_string(),
+            current_world_size: 0,
+            target_world_size: 0,
+            last_transition_unix_time_ms: 0,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct CoordinatorState {
     nodes: std::collections::BTreeMap<String, NodeEntry>,
@@ -456,6 +479,7 @@ struct CoordinatorState {
     completed_ranges: HashSet<(u64, u64)>,
     /// Fingerprint of an applied distributed resume token, if any.
     resume_checkpoint_fingerprint: Option<u64>,
+    elastic: ElasticTransitionView,
     next_lease_id: u64,
     drained_emitted: bool,
 }
@@ -513,6 +537,60 @@ impl CoordinatorSvc {
 
     fn current_leader_term() -> u64 {
         HA_GATE.get().map(|g| g.term()).unwrap_or(0)
+    }
+
+    fn active_node_count_locked(state: &CoordinatorState) -> u32 {
+        (state.nodes.len().saturating_sub(state.departed_nodes.len())) as u32
+    }
+
+    fn elastic_view_locked(state: &CoordinatorState) -> ElasticTransitionView {
+        state.elastic.clone()
+    }
+
+    fn note_elastic_transition_locked(
+        state: &mut CoordinatorState,
+        reason: &str,
+        from_world_size: u32,
+        to_world_size: u32,
+        now_unix_time_ms: u64,
+    ) {
+        state.elastic.pending = true;
+        state.elastic.transitions_total = state.elastic.transitions_total.saturating_add(1);
+        state.elastic.last_reason = reason.to_string();
+        state.elastic.current_world_size = from_world_size;
+        state.elastic.target_world_size = to_world_size;
+        state.elastic.last_transition_unix_time_ms = now_unix_time_ms;
+    }
+
+    fn elastic_settle_ms(&self) -> u64 {
+        // Hold pending for a short deterministic window so clients can observe
+        // the boundary before we return to steady-state.
+        (self.heartbeat_interval_ms as u64)
+            .max(1)
+            .saturating_mul(2)
+            .max(1_000)
+    }
+
+    fn maybe_finalize_elastic_transition_locked(
+        &self,
+        state: &mut CoordinatorState,
+        now_unix_time_ms: u64,
+    ) {
+        if !state.elastic.pending {
+            return;
+        }
+        let elapsed_ms =
+            now_unix_time_ms.saturating_sub(state.elastic.last_transition_unix_time_ms);
+        if elapsed_ms < self.elastic_settle_ms() {
+            return;
+        }
+        let active = Self::active_node_count_locked(state);
+        if active != state.elastic.target_world_size {
+            return;
+        }
+        state.elastic.pending = false;
+        state.elastic.current_world_size = active;
+        state.elastic.target_world_size = active;
     }
 
     fn node_caps_to_durable(caps: &NodeCaps) -> state_store::DurableNodeCaps {
@@ -725,6 +803,7 @@ impl CoordinatorSvc {
                 progress: restored_progress,
                 completed_ranges: restored_completed,
                 resume_checkpoint_fingerprint: snapshot.resume_checkpoint_fingerprint,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: snapshot.next_lease_id,
                 drained_emitted: snapshot.drained_emitted,
             };
@@ -1282,6 +1361,7 @@ impl CoordinatorSvc {
             // scheduled ranges so the job can drain or be picked up by a replacement.
             // Skipping already-departed nodes avoids double-releasing and log spam.
             let dead_after_ms = self.lease_ttl_ms as u64;
+            let active_before_depart = Self::active_node_count_locked(&state);
             let newly_dead: Vec<(usize, String)> = match state.frozen_membership.as_ref() {
                 None => Vec::new(),
                 Some(members) => members
@@ -1317,6 +1397,17 @@ impl CoordinatorSvc {
                 }
                 state.rank_ranges = Some(rank_ranges);
             }
+            if !newly_dead.is_empty() {
+                let active_after_depart = Self::active_node_count_locked(&state);
+                Self::note_elastic_transition_locked(
+                    &mut state,
+                    "node_departed",
+                    active_before_depart,
+                    active_after_depart,
+                    now_unix_time_ms,
+                );
+            }
+            self.maybe_finalize_elastic_transition_locked(&mut state, now_unix_time_ms);
 
             let mut intervals: Vec<(u64, u64, String, String)> = Vec::new();
             for lease in state.leases.values() {
@@ -1511,12 +1602,14 @@ impl Coordinator for CoordinatorSvc {
             return Err(Status::invalid_argument("caps is required"));
         }
 
-        let (assigned_rank, active_nodes, capacity, became_ready) = {
+        let (assigned_rank, active_nodes, capacity, became_ready, elastic) = {
             let mut state = self.state.write().await;
             let now_ms = Self::unix_time_ms();
             if !req.resume_from.is_empty() {
                 self.apply_resume_token_locked(&mut state, &req.resume_from)?;
             }
+            let active_before = Self::active_node_count_locked(&state);
+            let mut transition_reason: Option<&'static str> = None;
 
             if state.frozen_membership.is_some() {
                 // ── Post-freeze path ──────────────────────────────────────────────────────
@@ -1536,6 +1629,7 @@ impl Coordinator for CoordinatorSvc {
                         entry.last_stats = None;
                     }
                     if was_departed {
+                        transition_reason = Some("node_rejoin");
                         tracing::info!(
                             node_id = %req.node_id,
                             manifest_hash = %self.manifest_hash,
@@ -1562,6 +1656,7 @@ impl Coordinator for CoordinatorSvc {
                                 last_stats: None,
                             },
                         );
+                        transition_reason = Some("node_replaced");
                         tracing::info!(
                             node_id = %req.node_id,
                             replaced_node_id = %old_id,
@@ -1600,6 +1695,7 @@ impl Coordinator for CoordinatorSvc {
                                 last_stats: None,
                             },
                         );
+                        transition_reason = Some("node_added");
                         // Repartition all unissued ranges so the new rank can immediately consume.
                         Self::repartition_unissued_ranges(
                             &mut state,
@@ -1671,11 +1767,29 @@ impl Coordinator for CoordinatorSvc {
             let active_nodes =
                 (state.nodes.len().saturating_sub(state.departed_nodes.len())) as u32;
 
+            if let Some(reason) = transition_reason {
+                Self::note_elastic_transition_locked(
+                    &mut state,
+                    reason,
+                    active_before,
+                    active_nodes,
+                    now_ms,
+                );
+            }
+            if state.elastic.transitions_total == 0
+                && state.elastic.current_world_size == 0
+                && state.elastic.target_world_size == 0
+            {
+                state.elastic.current_world_size = active_nodes;
+                state.elastic.target_world_size = active_nodes;
+            }
+
             // Trigger freeze when we cross the min_world_size barrier for the first time.
             let became_ready =
                 state.frozen_membership.is_none() && active_nodes >= self.min_world_size;
 
-            (assigned_rank, active_nodes, capacity, became_ready)
+            let elastic = Self::elastic_view_locked(&state);
+            (assigned_rank, active_nodes, capacity, became_ready, elastic)
         };
 
         if assigned_rank >= capacity {
@@ -1692,6 +1806,12 @@ impl Coordinator for CoordinatorSvc {
             lease_ttl_ms: self.lease_ttl_ms,
             registered_nodes: active_nodes,
             job_ready: self.is_job_ready().await || became_ready,
+            elastic_transition_pending: elastic.pending,
+            elastic_transitions_total: elastic.transitions_total,
+            elastic_last_transition_reason: elastic.last_reason,
+            elastic_current_world_size: elastic.current_world_size,
+            elastic_target_world_size: elastic.target_world_size,
+            elastic_last_transition_unix_time_ms: elastic.last_transition_unix_time_ms,
         };
 
         if became_ready {
@@ -1784,6 +1904,8 @@ impl Coordinator for CoordinatorSvc {
         }
 
         let mut leases = Vec::new();
+        let elastic: ElasticTransitionView;
+        let job_drained: bool;
         {
             let mut state = self.state.write().await;
             if state.frozen_membership.is_none() {
@@ -1818,6 +1940,21 @@ impl Coordinator for CoordinatorSvc {
                 state.leases.insert(lease_id, lease.clone());
                 leases.push(lease);
             }
+            if state.elastic.transitions_total == 0
+                && state.elastic.current_world_size == 0
+                && state.elastic.target_world_size == 0
+            {
+                let active_nodes = Self::active_node_count_locked(&state);
+                state.elastic.current_world_size = active_nodes;
+                state.elastic.target_world_size = active_nodes;
+            }
+            elastic = Self::elastic_view_locked(&state);
+            let rank_ranges_empty = match &state.rank_ranges {
+                None => true,
+                Some(qs) => qs.iter().all(|q| q.is_empty()),
+            };
+            job_drained =
+                state.leases.is_empty() && state.available_ranges.is_empty() && rank_ranges_empty;
         }
 
         self.metrics
@@ -1848,6 +1985,13 @@ impl Coordinator for CoordinatorSvc {
         Ok(Response::new(RequestLeaseResponse {
             wait_ms: if leases.is_empty() { 500 } else { 0 },
             leases,
+            elastic_transition_pending: elastic.pending,
+            elastic_transitions_total: elastic.transitions_total,
+            elastic_last_transition_reason: elastic.last_reason,
+            elastic_current_world_size: elastic.current_world_size,
+            elastic_target_world_size: elastic.target_world_size,
+            elastic_last_transition_unix_time_ms: elastic.last_transition_unix_time_ms,
+            job_drained,
         }))
     }
 
@@ -2381,6 +2525,7 @@ async fn main() -> Result<()> {
                 progress: std::collections::BTreeMap::new(),
                 completed_ranges,
                 resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: 0,
                 // tick_once will emit job_drained on the first tick if all ranges were
                 // already completed when the coordinator was resumed.
@@ -2684,6 +2829,7 @@ mod tests {
             progress: std::collections::BTreeMap::new(),
             completed_ranges: HashSet::new(),
             resume_checkpoint_fingerprint: None,
+            elastic: ElasticTransitionView::default(),
             next_lease_id: 0,
             drained_emitted: false,
         }));
@@ -2781,6 +2927,7 @@ mod tests {
             progress: std::collections::BTreeMap::new(),
             completed_ranges: HashSet::new(),
             resume_checkpoint_fingerprint: None,
+            elastic: ElasticTransitionView::default(),
             next_lease_id: 0,
             drained_emitted: false,
         }));
@@ -2848,6 +2995,89 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn request_lease_reports_job_drained_when_complete() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([WorkRange {
+                    start_id: 0,
+                    end_id: 64,
+                    epoch: 0,
+                    seed: 0,
+                }]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 1,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1000,
+            lease_ttl_ms: 10_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
+        }))
+        .await?;
+
+        let lease = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner()
+            .leases
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected lease"))?;
+        let range = lease
+            .range
+            .ok_or_else(|| anyhow::anyhow!("expected lease range"))?;
+
+        svc.report_progress(Request::new(ReportProgressRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            lease_id: lease.lease_id,
+            cursor: range.end_id,
+            delivered_samples: range.end_id.saturating_sub(range.start_id),
+            delivered_bytes: 0,
+            unix_time_ms: CoordinatorSvc::unix_time_ms(),
+        }))
+        .await?;
+
+        let drained = svc
+            .request_lease(Request::new(RequestLeaseRequest {
+                job_id: "job".to_string(),
+                node_id: "node-a".to_string(),
+                want: 1,
+            }))
+            .await?
+            .into_inner();
+        assert!(drained.leases.is_empty());
+        assert!(drained.job_drained);
+        Ok(())
+    }
+
     /// Run a single-node coordinator over a 3-block manifest, complete all leases,
     /// then restart with the same lease log and verify no new ranges are issued
     /// (the job starts already drained).
@@ -2898,6 +3128,7 @@ mod tests {
                     progress: std::collections::BTreeMap::new(),
                     completed_ranges: HashSet::new(),
                     resume_checkpoint_fingerprint: None,
+                    elastic: ElasticTransitionView::default(),
                     next_lease_id: 0,
                     drained_emitted: false,
                 })),
@@ -3013,6 +3244,7 @@ mod tests {
                     progress: std::collections::BTreeMap::new(),
                     completed_ranges: HashSet::new(),
                     resume_checkpoint_fingerprint: None,
+                    elastic: ElasticTransitionView::default(),
                     next_lease_id: 0,
                     drained_emitted: false,
                 })),
@@ -3123,6 +3355,7 @@ mod tests {
                 progress: std::collections::BTreeMap::new(),
                 completed_ranges: HashSet::new(),
                 resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -3195,6 +3428,7 @@ mod tests {
                 progress: std::collections::BTreeMap::new(),
                 completed_ranges: HashSet::new(),
                 resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -3246,6 +3480,7 @@ mod tests {
                 progress: std::collections::BTreeMap::new(),
                 completed_ranges: HashSet::new(),
                 resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -3333,6 +3568,7 @@ mod tests {
                 progress: std::collections::BTreeMap::new(),
                 completed_ranges: HashSet::new(),
                 resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -3361,6 +3597,11 @@ mod tests {
             .into_inner();
         assert_eq!(r1.assigned_rank, 0);
         assert!(r1.job_ready);
+        assert!(!r1.elastic_transition_pending);
+        assert_eq!(r1.elastic_transitions_total, 0);
+        assert_eq!(r1.elastic_last_transition_reason, "none");
+        assert_eq!(r1.elastic_current_world_size, 1);
+        assert_eq!(r1.elastic_target_world_size, 1);
 
         // Simulate node-a going dead: backdate heartbeat past TTL.
         {
@@ -3394,6 +3635,14 @@ mod tests {
             .into_inner();
         assert_eq!(r2.assigned_rank, 0, "replacement should inherit rank 0");
         assert!(r2.job_ready);
+        assert!(r2.elastic_transition_pending);
+        assert_eq!(r2.elastic_last_transition_reason, "node_replaced");
+        assert_eq!(r2.elastic_current_world_size, 0);
+        assert_eq!(r2.elastic_target_world_size, 1);
+        assert!(
+            r2.elastic_transitions_total >= 2,
+            "expected departed+replacement transition events"
+        );
 
         // node-a should no longer be in departed_nodes.
         {
@@ -3479,6 +3728,7 @@ mod tests {
                 progress: std::collections::BTreeMap::new(),
                 completed_ranges: HashSet::new(),
                 resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: 0,
                 drained_emitted: false,
             })),
@@ -3507,6 +3757,10 @@ mod tests {
         assert_eq!(first.assigned_rank, 0);
         assert_eq!(first.world_size, 2);
         assert!(first.job_ready);
+        assert!(!first.elastic_transition_pending);
+        assert_eq!(first.elastic_last_transition_reason, "none");
+        assert_eq!(first.elastic_current_world_size, 1);
+        assert_eq!(first.elastic_target_world_size, 1);
 
         let second = svc
             .register_node(Request::new(RegisterNodeRequest {
@@ -3520,15 +3774,26 @@ mod tests {
         assert_eq!(second.assigned_rank, 1);
         assert_eq!(second.world_size, 2);
         assert!(second.job_ready);
+        assert!(second.elastic_transition_pending);
+        assert_eq!(second.elastic_transitions_total, 1);
+        assert_eq!(second.elastic_last_transition_reason, "node_added");
+        assert_eq!(second.elastic_current_world_size, 1);
+        assert_eq!(second.elastic_target_world_size, 2);
 
-        let lease = svc
+        let lease_resp = svc
             .request_lease(Request::new(RequestLeaseRequest {
                 job_id: "job".to_string(),
                 node_id: "node-b".to_string(),
                 want: 1,
             }))
             .await?
-            .into_inner()
+            .into_inner();
+        assert!(lease_resp.elastic_transition_pending);
+        assert_eq!(lease_resp.elastic_transitions_total, 1);
+        assert_eq!(lease_resp.elastic_last_transition_reason, "node_added");
+        assert_eq!(lease_resp.elastic_current_world_size, 1);
+        assert_eq!(lease_resp.elastic_target_world_size, 2);
+        let lease = lease_resp
             .leases
             .into_iter()
             .next()
@@ -3539,6 +3804,95 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("expected range in scale-out lease"))?;
         assert_eq!(range.start_id, 100);
         assert_eq!(range.end_id, 200);
+        Ok(())
+    }
+
+    /// Elastic transition pending flips back to stable after the settle window.
+    #[tokio::test]
+    async fn elastic_transition_settles_to_stable_after_window() -> anyhow::Result<()> {
+        let svc = CoordinatorSvc {
+            state: Arc::new(RwLock::new(CoordinatorState {
+                nodes: std::collections::BTreeMap::new(),
+                available_ranges: std::collections::VecDeque::from([
+                    WorkRange {
+                        start_id: 0,
+                        end_id: 100,
+                        epoch: 0,
+                        seed: 0,
+                    },
+                    WorkRange {
+                        start_id: 100,
+                        end_id: 200,
+                        epoch: 0,
+                        seed: 0,
+                    },
+                ]),
+                rank_ranges: None,
+                frozen_membership: None,
+                departed_nodes: std::collections::BTreeSet::new(),
+                leases: std::collections::BTreeMap::new(),
+                progress: std::collections::BTreeMap::new(),
+                completed_ranges: HashSet::new(),
+                resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
+                next_lease_id: 0,
+                drained_emitted: false,
+            })),
+            metrics: Arc::new(CoordinatorMetrics::default()),
+            world_size: 2,
+            min_world_size: 1,
+            heartbeat_interval_ms: 1_000,
+            lease_ttl_ms: 60_000,
+            shuffle: false,
+            seed: 0,
+            epoch: 0,
+            manifest_hash: "dev".to_string(),
+            manifest_store: None,
+            lease_log: None,
+        };
+
+        svc.register_node(Request::new(RegisterNodeRequest {
+            job_id: "job".to_string(),
+            node_id: "node-a".to_string(),
+            caps: Some(NodeCaps::default()),
+            resume_from: Vec::new(),
+        }))
+        .await?;
+        let second = svc
+            .register_node(Request::new(RegisterNodeRequest {
+                job_id: "job".to_string(),
+                node_id: "node-b".to_string(),
+                caps: Some(NodeCaps::default()),
+                resume_from: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert!(second.elastic_transition_pending);
+        assert_eq!(second.elastic_last_transition_reason, "node_added");
+
+        let transition_ts = {
+            let st = svc.state.read().await;
+            st.elastic.last_transition_unix_time_ms
+        };
+
+        svc.tick_once_at(transition_ts + 1_999).await;
+        {
+            let st = svc.state.read().await;
+            assert!(st.elastic.pending, "should still be pending before settle");
+        }
+
+        svc.tick_once_at(transition_ts + 2_000).await;
+        {
+            let st = svc.state.read().await;
+            assert!(
+                !st.elastic.pending,
+                "should settle to stable after settle window"
+            );
+            assert_eq!(st.elastic.current_world_size, 2);
+            assert_eq!(st.elastic.target_world_size, 2);
+            assert_eq!(st.elastic.last_reason, "node_added");
+        }
+
         Ok(())
     }
 
@@ -3561,6 +3915,7 @@ mod tests {
                 progress: std::collections::BTreeMap::new(),
                 completed_ranges: HashSet::new(),
                 resume_checkpoint_fingerprint: None,
+                elastic: ElasticTransitionView::default(),
                 next_lease_id: 0,
                 drained_emitted: false,
             })),

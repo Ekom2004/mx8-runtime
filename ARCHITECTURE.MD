@@ -22,12 +22,11 @@ Primary v1.8 workloads: offline inference / ETL / preprocessing / large corpus p
 - Mid-run “live pickup” of newly added data (refresh is job-start only in v1.8).
 - Exactly-once delivery guarantees (at-least-once at boundaries is acceptable for v1.8 inference/ETL).
 
-## Coordinator HA (design-partner opt-in in v1.8.6; default-on target v1.9)
+## Coordinator HA (opt-in in v1.8.6)
 
-- v1.8 default mode: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
-- v1.8.6 design-partner mode: opt-in HA (`MX8_COORD_HA_ENABLE=1`) with leader fencing + durable shared state replay + deterministic kill-leader failover gates for inference/ETL workloads.
-- v1.8.6 operator requirement: shared durable lease/state paths (`MX8_COORD_HA_LEASE_PATH`, `MX8_COORD_STATE_STORE_PATH`) across coordinator candidates.
-- v1.9 default-on target: HA becomes default deployment posture for new coordinator rollouts.
+- Default mode: single coordinator per job; coordinator failure pauses/stops job control-plane progress.
+- Opt-in HA mode: enable `MX8_COORD_HA_ENABLE=1` for leader fencing + durable shared state replay + deterministic kill-leader failover gates for inference/ETL workloads.
+- Operator requirement for HA mode: shared durable lease/state paths (`MX8_COORD_HA_LEASE_PATH`, `MX8_COORD_STATE_STORE_PATH`) across coordinator candidates.
 
 ### Dynamic Membership (shipped in v1.8.2)
 
@@ -255,7 +254,9 @@ Date: 2026-02-12
 
 ### Workload scope
 - v1.8 primary: offline inference / ETL / preprocessing / corpus processing.
-- Training supported as a consumer, but v1.8 is **non-elastic** (DDP node death kills the job).
+- Training supports **epoch-boundary elasticity only**:
+  - mid-epoch rank loss is still non-elastic (DDP process group fails; restart required),
+  - membership changes (add/remove nodes) are supported between epochs via restart.
 
 ### Runtime + authority split
 - Hot path stays in-process in Rust (`mx8` runtime).

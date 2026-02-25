@@ -52,6 +52,8 @@ Membership freezes once `registered_nodes >= world_size`. After that, new unknow
 
 Lease ranges are half-open intervals `[start_id, end_id)`. When `RequestLeaseResponse.wait_ms` is zero, the client should retry immediately. A non-zero value is a backoff hint for when no leases are available.
 
+When `RequestLeaseResponse.job_drained=true` and `leases` is empty, the coordinator is signaling that the entire job has drained and clients can terminate their lease-request loop cleanly.
+
 The cursor advances only after delivery to the consumer — not after fetch or decode. Lease completion is triggered when `cursor >= end_id`. The coordinator removes the lease and marks that range done.
 
 The manifest stream emits ordered chunks with a `schema_version` field. The client concatenates them to reconstruct the canonical manifest bytes. Schema mismatches or truncated streams are fail-closed.

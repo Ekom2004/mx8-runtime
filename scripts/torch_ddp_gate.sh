@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Multi-process (DDP-like) gate: prove mx8 can feed PyTorch distributed training
-# (static world size, restartable; v0 non-elastic).
+# for a fixed epoch membership (static world size per run).
 #
 # This runs everything locally with `torchrun --standalone` but uses the real
 # mx8-coordinator gRPC API and `mx8.DistributedDataLoader` client.

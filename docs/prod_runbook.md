@@ -91,7 +91,7 @@ If rejections continue, relaunch without `resume_from` and treat it as a fresh e
 
 ## Coordinator failure
 
-In default v1.8 deployments, the coordinator is run as a single process per job. If it dies, the control plane pauses until restart. Opt-in HA mode (`MX8_COORD_HA_ENABLE=1`) is available for design-partner rollouts and can promote a follower, but requires shared lease/state paths and explicit operator rollout.
+In default v1.8 deployments, the coordinator is run as a single process per job. If it dies, the control plane pauses until restart. Opt-in HA mode (`MX8_COORD_HA_ENABLE=1`) can promote a follower, but requires shared lease/state paths.
 
 Restart the coordinator for the affected job. Restart affected agents if they do not reconnect on their own. Then verify recovery in the TUI:
 
@@ -111,4 +111,17 @@ If `MX8_COORD_HA_ENABLE=1` is enabled, mutating RPCs are fenced on followers/sta
 
 If HA is enabled, keep `MX8_COORD_STATE_STORE_PATH` on a shared durable filesystem visible to all candidate coordinators. If this path is not shared, leader transition can fence stale writers but cannot continue from latest shared state.
 
-The HA contract for design-partner opt-in mode and default-on v1.9 target is documented in `docs/ha_contract.md`. Training remains non-elastic.
+The HA contract is documented in `docs/ha_contract.md`. Mid-epoch training remains non-elastic.
+
+
+## Training v1 boundary model
+
+Training support is epoch-boundary elastic only.
+
+If a rank dies mid-epoch, treat it as a restart event. Save or recover the distributed loader checkpoint token (`loader.checkpoint()`), relaunch all ranks, and pass the same `resume_from` token before any rank requests leases.
+
+To add or remove nodes, do it only at epoch boundaries by launching the next epoch with the new world size. Validate this behavior with:
+
+```bash
+./scripts/training_epoch_boundary_gate.sh
+```

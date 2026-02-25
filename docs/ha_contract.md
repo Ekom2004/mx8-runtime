@@ -1,6 +1,6 @@
 # Coordinator HA Contract
 
-Status: available for design partners in v1.8.6 as opt-in mode; default-on target is v1.9.
+Status: available in v1.8.6 as opt-in mode.
 
 This document defines what coordinator HA means for MX8, what it explicitly does not include, and what must be true before it is considered default production posture.
 
@@ -70,17 +70,6 @@ Verify the demoted stale leader fails mutating operations after leadership loss.
 Replay duplicate progress/report requests across failover boundary. Verify monotonic cursors and consistent completion.
 
 Run repeated leader churn over soak duration and verify no invariant violations accumulate.
-
-
-## Rollout status
-
-Completed: phases 0.5 through 0.9 (restart replay, fencing, durable state, failover gates).
-
-Current: phase 1 design-partner rollout in opt-in mode (`MX8_COORD_HA_ENABLE=1`).
-
-Next: phase 2 broadens availability across more inference/ETL workloads.
-
-Target: phase 3 makes HA the default posture for new coordinator deployments in v1.9.
 
 
 ## Training note

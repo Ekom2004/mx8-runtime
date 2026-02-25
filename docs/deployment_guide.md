@@ -7,7 +7,7 @@ Primary implementations: `crates/mx8-coordinator/src/main.rs`, `crates/mx8d-agen
 
 ## What you need to know before deploying
 
-Default v1.8 deployment is a single coordinator process per job. If it dies, the control plane pauses until restart. Opt-in HA mode is available behind `MX8_COORD_HA_ENABLE=1` with shared lease/state files for design-partner rollouts, but the baseline remains single-endpoint operations. Run coordinators on stable nodes, not spot instances.
+Default v1.8 deployment is a single coordinator process per job. If it dies, the control plane pauses until restart. Opt-in HA mode is available behind `MX8_COORD_HA_ENABLE=1` with shared lease/state files, but the baseline remains single-endpoint operations. Run coordinators on stable nodes, not spot instances.
 
 Training is non-elastic in v1.8. If a DDP rank dies, the training job terminates. Lease reassignment handles inference and ETL recovery, not training node loss.
 

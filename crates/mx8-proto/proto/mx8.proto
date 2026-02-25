@@ -49,6 +49,13 @@ message RegisterNodeResponse {
   uint32 lease_ttl_ms = 5;
   uint32 registered_nodes = 6;
   bool job_ready = 7;
+  // Elastic transition signal for training clients.
+  bool elastic_transition_pending = 8;
+  uint64 elastic_transitions_total = 9;
+  string elastic_last_transition_reason = 10;
+  uint32 elastic_current_world_size = 11;
+  uint32 elastic_target_world_size = 12;
+  uint64 elastic_last_transition_unix_time_ms = 13;
 }
 
 message NodeStats {
@@ -104,6 +111,15 @@ message RequestLeaseResponse {
   // When `leases` is empty and the job is ready, the coordinator may ask the agent to back off.
   // Semantics: retry after approximately this many milliseconds. 0 means "retry immediately".
   uint32 wait_ms = 2;
+  // Elastic transition signal for training clients.
+  bool elastic_transition_pending = 3;
+  uint64 elastic_transitions_total = 4;
+  string elastic_last_transition_reason = 5;
+  uint32 elastic_current_world_size = 6;
+  uint32 elastic_target_world_size = 7;
+  uint64 elastic_last_transition_unix_time_ms = 8;
+  // True when the coordinator has fully drained all work for the job.
+  bool job_drained = 9;
 }
 
 message ReportProgressRequest {
