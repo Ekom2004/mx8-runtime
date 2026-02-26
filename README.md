@@ -92,6 +92,7 @@ pip install mx8 pillow numpy torch
 
 | Doc | Description |
 | --- | --- |
+| [User Guide](docs/user_guide.md) | Day-to-day training and inference workflows |
 | [Python API](docs/python_api.md) | Full API reference |
 | [Deployment Guide](docs/deployment_guide.md) | Coordinator/agent deployment |
 | [Zero-Manifest Loading](docs/zero_manifest.md) | Raw S3 loading path |
