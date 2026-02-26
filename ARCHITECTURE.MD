@@ -21,7 +21,7 @@ Primary v1.8 workloads: offline inference / ETL / preprocessing / large corpus p
 - Mid-run “live pickup” of newly added data (refresh is job-start only in v1.8).
 - Exactly-once delivery guarantees (at-least-once at boundaries is acceptable for v1.8 inference/ETL).
 
-## Coordinator HA (default-on in v1.8.6)
+## Coordinator HA (default-on in v1.8.7)
 
 - Default mode: leader-fenced coordinator with durable shared state replay enabled.
 - HA can be explicitly disabled with `MX8_COORD_HA_ENABLE=0`.

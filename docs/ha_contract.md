@@ -1,15 +1,13 @@
 # Coordinator HA Contract
 
-Status: enabled by default in v1.8.6 (can be disabled with `MX8_COORD_HA_ENABLE=0`).
+Status: enabled by default in v1.8.7 (can be disabled with `MX8_COORD_HA_ENABLE=0`).
 
 This document defines what coordinator HA means for MX8, what it explicitly does not include, and what must be true before it is considered default production posture.
 
 
-## Current behavior in v1.8.6
+## Current behavior in v1.8.7
 
-Default v1.8 mode is still a single coordinator process per job. If that process dies, the control plane pauses until restart.
-
-HA mode is enabled by default with shared lease/state paths across coordinator candidates.
+Default mode uses HA coordinator leadership with shared lease/state paths across coordinator candidates. If the active leader dies, a follower can promote and continue with replayed state.
 
 Shipped foundations:
 
@@ -20,6 +18,8 @@ v1.8.4: lease-file leader election + term fencing fences mutating RPCs on stale 
 v1.8.5: durable coordinator state snapshots (`MX8_COORD_STATE_STORE_ENABLE=1`, auto-enabled with HA) persist membership, lease index, progress cursors, completed ranges, and counters; new leaders replay this state before accepting mutating work.
 
 v1.8.6: deterministic kill-leader failover gates (`./scripts/ha_failover_gate.sh`) validate follower promotion continuity, no-overlap for newly issued leases after promotion, and duplicate progress replay acceptance across failover.
+
+v1.8.7: HA default posture is the standard deployment mode. Single-coordinator behavior is now opt-out via `MX8_COORD_HA_ENABLE=0`.
 
 For incident procedure, see `docs/prod_runbook.md`.
 
@@ -59,7 +59,7 @@ When shared HA paths are unavailable, the control plane must fail safe: no split
 
 ## Acceptance gates
 
-Before HA is treated as default production posture, all of the following gates must pass repeatedly:
+To keep HA as default production posture, all of the following gates must pass repeatedly:
 
 Kill the active leader during a multi-node run with active leases. Verify failover completes within target and job drains correctly.
 
