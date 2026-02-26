@@ -1944,19 +1944,30 @@ impl DataLoader {
                 ));
             }
             let reservoir_size = env_usize("MX8_ZERO_MANIFEST_RESERVOIR", 100_000).max(1);
-            match rt.block_on(async {
-                pipeline
-                    .spawn_s3_scan(&dataset_base, recursive, reservoir_size, start_id, end_id)
-                    .await
-            }) {
+            let scan_result = if dataset_base.starts_with("gs://") {
+                rt.block_on(async {
+                    pipeline
+                        .spawn_gcs_scan(&dataset_base, recursive, reservoir_size, start_id, end_id)
+                        .await
+                })
+            } else {
+                rt.block_on(async {
+                    pipeline
+                        .spawn_s3_scan(&dataset_base, recursive, reservoir_size, start_id, end_id)
+                        .await
+                })
+            };
+            match scan_result {
                 Ok((rx, task)) => {
+                    let backend = if dataset_base.starts_with("gs://") { "gcs" } else { "s3" };
                     tracing::info!(
                         target: "mx8_proof",
                         event = "zero_manifest_scan_enabled",
                         dataset_base = %dataset_base,
                         recursive = recursive,
                         reservoir_size = reservoir_size as u64,
-                        "using zero-manifest s3 scan path"
+                        backend = backend,
+                        "using zero-manifest scan path"
                     );
 
                     let manifest_hash = format!(
@@ -3684,6 +3695,9 @@ impl VideoDataLoader {
         if clip.media_uri.starts_with("s3://") {
             return self.clip_payload_bytes_s3(clip);
         }
+        if clip.media_uri.starts_with("gs://") {
+            return self.clip_payload_bytes_gcs(clip);
+        }
         let path = std::path::PathBuf::from(&clip.media_uri);
         if !path.exists() {
             return Err(Self::decode_error(
@@ -3694,6 +3708,272 @@ impl VideoDataLoader {
         }
         let seek_seconds = (clip.clip_start as f64) / f64::from(self.decode_fps.max(1));
         self.decode_clip_from_path(&path, seek_seconds)
+    }
+
+    fn gcs_fetch_ranges_bytes(
+        &mut self,
+        clip: &VideoClipRecord,
+        bucket: &str,
+        key: &str,
+        ranges: &[ByteRange],
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        let client = self
+            .rt
+            .block_on(mx8_runtime::gcs::client_from_env())
+            .map_err(|e| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!("init gcs client failed: {e}"),
+                )
+            })?;
+
+        use google_cloud_storage::http::objects::download::Range as GcsRange;
+        use google_cloud_storage::http::objects::get::GetObjectRequest as GcsGetReq;
+
+        let mut payload = Vec::<u8>::new();
+        for range in ranges {
+            let end_inclusive = range.end_byte.checked_sub(1).ok_or_else(|| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "decode_failed",
+                    "invalid empty stage2d byte range",
+                )
+            })?;
+            let bytes = self
+                .rt
+                .block_on(async {
+                    client
+                        .download_object(
+                            &GcsGetReq {
+                                bucket: bucket.to_string(),
+                                object: key.to_string(),
+                                ..Default::default()
+                            },
+                            &GcsRange(Some(range.start_byte), Some(end_inclusive)),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .map_err(|e| {
+                    Self::decode_error(
+                        std::path::Path::new(&clip.media_uri),
+                        "io_read_failed",
+                        &format!("gcs range download failed: {e}"),
+                    )
+                })?;
+            let expected = usize::try_from(range.end_byte.saturating_sub(range.start_byte))
+                .map_err(|_| {
+                    Self::decode_error(
+                        std::path::Path::new(&clip.media_uri),
+                        "decode_failed",
+                        "stage2d range size conversion overflow",
+                    )
+                })?;
+            if bytes.len() != expected {
+                return Err(Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!(
+                        "gcs range returned {} bytes, expected {}",
+                        bytes.len(),
+                        expected
+                    ),
+                ));
+            }
+            payload.extend_from_slice(&bytes);
+            self.s3_range_requests_total = self.s3_range_requests_total.saturating_add(1);
+            self.s3_range_bytes_fetched_total = self
+                .s3_range_bytes_fetched_total
+                .saturating_add(bytes.len() as u64);
+        }
+        tracing::info!(
+            target: "mx8_proof",
+            event = "video_range_fetch",
+            media_uri = %clip.media_uri,
+            clip_id = %clip.clip_id,
+            request_count = ranges.len() as u64,
+            fetched_bytes = payload.len() as u64,
+            "fetched gcs ranges for video clip"
+        );
+        Ok(payload)
+    }
+
+    fn clip_payload_bytes_gcs(
+        &mut self,
+        clip: &VideoClipRecord,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        let (bucket, key) = parse_gcs_bucket_key_local(&clip.media_uri).map_err(|e| {
+            Self::decode_error(
+                std::path::Path::new(&clip.media_uri),
+                "decode_failed",
+                &format!("invalid gs uri: {e}"),
+            )
+        })?;
+        let sidecar_key = Self::stage2d_sidecar_key(&clip.media_uri, clip.stream_id);
+        let clip_start_ms = clip
+            .clip_start
+            .saturating_mul(1000)
+            .saturating_div(u64::from(self.decode_fps.max(1)));
+        let clip_len_ms = u64::from(clip.clip_len.max(1))
+            .saturating_mul(1000)
+            .saturating_div(u64::from(self.decode_fps.max(1)));
+
+        let planner_cfg = RangePlannerConfig {
+            max_ranges: env_usize("MX8_VIDEO_STAGE2D_MAX_RANGES", 8).max(1),
+            merge_gap_bytes: env_u64("MX8_VIDEO_STAGE2D_MERGE_GAP_BYTES").unwrap_or(0),
+        };
+
+        if let Some(sidecar) = self.stage2d_sidecars.get(&sidecar_key) {
+            match plan_video_ranges(sidecar, clip_start_ms, clip_len_ms.max(1), planner_cfg) {
+                Ok(plan) => {
+                    self.s3_stage2d_plan_used_total =
+                        self.s3_stage2d_plan_used_total.saturating_add(1);
+                    tracing::info!(
+                        target: "mx8_proof",
+                        event = "video_range_plan",
+                        media_uri = %clip.media_uri,
+                        clip_id = %clip.clip_id,
+                        range_count = plan.ranges.len() as u64,
+                        planned_bytes = plan.planned_bytes,
+                        anchor_ms = plan.anchor_ms,
+                        clip_start_ms = clip_start_ms,
+                        clip_len_ms = clip_len_ms,
+                        "planned stage2d gcs ranges for video clip"
+                    );
+                    if let Ok(bytes) =
+                        self.gcs_fetch_ranges_bytes(clip, &bucket, &key, &plan.ranges)
+                    {
+                        let tmp_path = std::env::temp_dir().join(format!(
+                            "mx8-video-stage2d-{}-{}-{}.mp4",
+                            std::process::id(),
+                            unix_time_ms(),
+                            clip.sample_id
+                        ));
+                        std::fs::write(&tmp_path, &bytes).map_err(|e| {
+                            Self::decode_error(
+                                std::path::Path::new(&clip.media_uri),
+                                "io_read_failed",
+                                &format!("write stage2d temp file failed: {e}"),
+                            )
+                        })?;
+                        let seek_seconds =
+                            clip_start_ms.saturating_sub(plan.anchor_ms) as f64 / 1000.0;
+                        let decoded = self.decode_clip_from_path(&tmp_path, seek_seconds);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        if decoded.is_ok() {
+                            return decoded;
+                        }
+                        self.s3_stage2d_plan_fallback_total =
+                            self.s3_stage2d_plan_fallback_total.saturating_add(1);
+                        tracing::warn!(
+                            target: "mx8_proof",
+                            event = "video_range_fallback",
+                            reason = "stage2d_decode_failed",
+                            media_uri = %clip.media_uri,
+                            clip_id = %clip.clip_id,
+                            "stage2d range decode failed; falling back to full-object range"
+                        );
+                    } else {
+                        self.s3_stage2d_plan_fallback_total =
+                            self.s3_stage2d_plan_fallback_total.saturating_add(1);
+                        tracing::warn!(
+                            target: "mx8_proof",
+                            event = "video_range_fallback",
+                            reason = "stage2d_fetch_failed",
+                            media_uri = %clip.media_uri,
+                            clip_id = %clip.clip_id,
+                            "stage2d range fetch failed; falling back to full-object range"
+                        );
+                    }
+                }
+                Err(err) => {
+                    self.s3_stage2d_plan_fallback_total =
+                        self.s3_stage2d_plan_fallback_total.saturating_add(1);
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "video_range_fallback",
+                        reason = "stage2d_plan_failed",
+                        media_uri = %clip.media_uri,
+                        clip_id = %clip.clip_id,
+                        detail = %err,
+                        "stage2d range planning failed; falling back to full-object range"
+                    );
+                }
+            }
+        }
+
+        self.s3_full_object_range_fallback_total =
+            self.s3_full_object_range_fallback_total.saturating_add(1);
+        let client = self
+            .rt
+            .block_on(mx8_runtime::gcs::client_from_env())
+            .map_err(|e| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!("init gcs client failed: {e}"),
+                )
+            })?;
+        use google_cloud_storage::http::objects::get::GetObjectRequest as GcsGetReq;
+        let meta = self
+            .rt
+            .block_on(async {
+                client
+                    .get_object(&GcsGetReq {
+                        bucket: bucket.clone(),
+                        object: key.clone(),
+                        ..Default::default()
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Self::decode_error(
+                    std::path::Path::new(&clip.media_uri),
+                    "io_read_failed",
+                    &format!("gcs get_object failed: {e:?}"),
+                )
+            })?;
+        let object_len = meta.size;
+        if object_len <= 0 {
+            return Err(Self::decode_error(
+                std::path::Path::new(&clip.media_uri),
+                "io_read_failed",
+                "gcs object has unknown/zero size",
+            ));
+        }
+        let full_range = vec![ByteRange {
+            start_byte: 0,
+            end_byte: object_len as u64,
+        }];
+        tracing::info!(
+            target: "mx8_proof",
+            event = "video_range_plan",
+            media_uri = %clip.media_uri,
+            clip_id = %clip.clip_id,
+            range_count = 1u64,
+            planned_bytes = object_len as u64,
+            reason = "full_object_range_fallback",
+            "using full-object gcs range fallback for video clip"
+        );
+        let bytes = self.gcs_fetch_ranges_bytes(clip, &bucket, &key, &full_range)?;
+        let tmp_path = std::env::temp_dir().join(format!(
+            "mx8-video-gcs-full-{}-{}-{}.mp4",
+            std::process::id(),
+            unix_time_ms(),
+            clip.sample_id
+        ));
+        std::fs::write(&tmp_path, &bytes).map_err(|e| {
+            Self::decode_error(
+                std::path::Path::new(&clip.media_uri),
+                "io_read_failed",
+                &format!("write gcs temp file failed: {e}"),
+            )
+        })?;
+        let seek_seconds = (clip.clip_start as f64) / f64::from(self.decode_fps.max(1));
+        let decoded = self.decode_clip_from_path(&tmp_path, seek_seconds);
+        let _ = std::fs::remove_file(&tmp_path);
+        decoded
     }
 }
 
@@ -6543,7 +6823,7 @@ fn should_use_zero_manifest_scan(parsed: &mx8_core::dataset_link::DatasetLink, b
     }
 
     let trimmed = base.trim();
-    if !trimmed.starts_with("s3://") {
+    if !trimmed.starts_with("s3://") && !trimmed.starts_with("gs://") {
         return false;
     }
     let lowered = trimmed.to_ascii_lowercase();
@@ -6569,6 +6849,24 @@ fn parse_s3_bucket_key_local(location: &str) -> Result<(String, String)> {
         "invalid s3 uri (empty bucket): {location}"
     );
     anyhow::ensure!(!key.is_empty(), "invalid s3 uri (empty key): {location}");
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+fn parse_gcs_bucket_key_local(location: &str) -> Result<(String, String)> {
+    let Some(rest) = location.trim().strip_prefix("gs://") else {
+        anyhow::bail!("not a gs uri: {location}");
+    };
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((bucket, key)) = rest.split_once('/') else {
+        anyhow::bail!("invalid gs uri (missing key): {location}");
+    };
+    let bucket = bucket.trim();
+    let key = key.trim();
+    anyhow::ensure!(
+        !bucket.is_empty(),
+        "invalid gs uri (empty bucket): {location}"
+    );
+    anyhow::ensure!(!key.is_empty(), "invalid gs uri (empty key): {location}");
     Ok((bucket.to_string(), key.to_string()))
 }
 

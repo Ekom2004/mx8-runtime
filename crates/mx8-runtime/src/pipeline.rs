@@ -25,6 +25,12 @@ type S3SdkError<E> = aws_sdk_s3::error::SdkError<E>;
 #[cfg(not(feature = "s3"))]
 type S3Client = ();
 
+#[cfg(feature = "gcs")]
+type GcsClient = google_cloud_storage::client::Client;
+
+#[cfg(not(feature = "gcs"))]
+type GcsClient = ();
+
 type HttpClient = reqwest::Client;
 
 const PERMIT_UNIT_BYTES: u64 = 1024;
@@ -292,6 +298,7 @@ impl Pipeline {
     )> {
         let records = parse_canonical_manifest_tsv(&manifest_bytes)?;
         let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_gcs = records.iter().any(|r| r.location.starts_with("gs://"));
         let has_http = records
             .iter()
             .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
@@ -304,6 +311,21 @@ impl Pipeline {
             {
                 anyhow::bail!(
                     "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let gcs_client: Option<GcsClient> = if has_gcs {
+            #[cfg(feature = "gcs")]
+            {
+                Some(crate::gcs::client_from_env().await?)
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                anyhow::bail!(
+                    "manifest contains gs:// locations but mx8-runtime was built without feature 'gcs'"
                 );
             }
         } else {
@@ -325,7 +347,7 @@ impl Pipeline {
         let pipeline = self.clone();
         let task = tokio::spawn(async move {
             pipeline
-                .produce_manifest_batches(tx, records, s3_client, http_client)
+                .produce_manifest_batches(tx, records, s3_client, gcs_client, http_client)
                 .await
         });
         Ok((rx, task))
@@ -344,6 +366,7 @@ impl Pipeline {
         let records = select_record_range(records, start_id, end_id)?;
 
         let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_gcs = records.iter().any(|r| r.location.starts_with("gs://"));
         let has_http = records
             .iter()
             .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
@@ -356,6 +379,21 @@ impl Pipeline {
             {
                 anyhow::bail!(
                     "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let gcs_client: Option<GcsClient> = if has_gcs {
+            #[cfg(feature = "gcs")]
+            {
+                Some(crate::gcs::client_from_env().await?)
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                anyhow::bail!(
+                    "manifest contains gs:// locations but mx8-runtime was built without feature 'gcs'"
                 );
             }
         } else {
@@ -386,7 +424,7 @@ impl Pipeline {
         let pipeline = self.clone();
         let task = tokio::spawn(async move {
             pipeline
-                .produce_manifest_batches(tx, records, s3_client, http_client)
+                .produce_manifest_batches(tx, records, s3_client, gcs_client, http_client)
                 .await
         });
         Ok((rx, task))
@@ -472,7 +510,63 @@ impl Pipeline {
             });
 
             let producer_res = pipeline
-                .produce_manifest_record_batches(tx, record_rx, Some(s3_client), None)
+                .produce_manifest_record_batches(tx, record_rx, Some(s3_client), None, None)
+                .await;
+            let scan_res = scanner.await.map_err(anyhow::Error::from)?;
+            producer_res?;
+            scan_res?;
+            Ok(())
+        });
+        Ok((rx, task))
+    }
+
+    #[cfg(feature = "gcs")]
+    pub async fn spawn_gcs_scan(
+        &self,
+        gcs_prefix: &str,
+        recursive: bool,
+        reservoir_size: usize,
+        start_id: Option<u64>,
+        end_id: Option<u64>,
+    ) -> Result<(
+        mpsc::Receiver<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        if start_id.is_some() ^ end_id.is_some() {
+            anyhow::bail!("start_id and end_id must be set together");
+        }
+        if let (Some(s), Some(e)) = (start_id, end_id) {
+            anyhow::ensure!(s <= e, "invalid range (start_id > end_id)");
+        }
+
+        let (bucket, list_prefix) = parse_gcs_bucket_prefix(gcs_prefix)?;
+        let gcs_client = crate::gcs::client_from_env().await?;
+
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
+        let pipeline = self.clone();
+        let task = tokio::spawn(async move {
+            let record_channel_capacity = pipeline
+                .effective_prefetch_batches()
+                .saturating_mul(std::cmp::max(1, pipeline.caps.batch_size_samples))
+                .max(1024);
+            let (record_tx, record_rx) =
+                mpsc::channel::<mx8_core::types::ManifestRecord>(record_channel_capacity);
+
+            let scanner_client = gcs_client.clone();
+            let scan_cfg = GcsScanConfig {
+                bucket,
+                list_prefix,
+                recursive,
+                reservoir_size: std::cmp::max(1, reservoir_size),
+                start_id,
+                end_id,
+            };
+            let scanner = tokio::spawn(async move {
+                scan_gcs_prefix_records_to_channel(scan_cfg, scanner_client, record_tx).await
+            });
+
+            let producer_res = pipeline
+                .produce_manifest_record_batches(tx, record_rx, None, Some(gcs_client), None)
                 .await;
             let scan_res = scanner.await.map_err(anyhow::Error::from)?;
             producer_res?;
@@ -576,6 +670,7 @@ impl Pipeline {
         records: Vec<mx8_core::types::ManifestRecord>,
     ) -> Result<()> {
         let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_gcs = records.iter().any(|r| r.location.starts_with("gs://"));
         let has_http = records
             .iter()
             .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
@@ -594,6 +689,21 @@ impl Pipeline {
             None
         };
 
+        let gcs_client: Option<GcsClient> = if has_gcs {
+            #[cfg(feature = "gcs")]
+            {
+                Some(crate::gcs::client_from_env().await?)
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                anyhow::bail!(
+                    "manifest contains gs:// locations but mx8-runtime was built without feature 'gcs'"
+                );
+            }
+        } else {
+            None
+        };
+
         let http_client: Option<HttpClient> = if has_http {
             Some(
                 reqwest::Client::builder()
@@ -606,7 +716,7 @@ impl Pipeline {
         };
 
         let (tx, sink_task) = self.spawn_sink(sink)?;
-        self.produce_manifest_batches(tx.clone(), records, s3_client, http_client)
+        self.produce_manifest_batches(tx.clone(), records, s3_client, gcs_client, http_client)
             .await?;
         drop(tx);
         sink_task.await??;
@@ -726,6 +836,7 @@ impl Pipeline {
         tx: mpsc::Sender<BatchLease>,
         records: Vec<mx8_core::types::ManifestRecord>,
         s3_client: Option<S3Client>,
+        gcs_client: Option<GcsClient>,
         http_client: Option<HttpClient>,
     ) -> Result<()> {
         let (band_lower_pct, band_upper_pct) = self.current_batch_band_pcts();
@@ -742,6 +853,7 @@ impl Pipeline {
                     self.rss_check_counter.clone(),
                     &records[range.start..range.end],
                     s3_client.as_ref(),
+                    gcs_client.as_ref(),
                     http_client.as_ref(),
                 )
                 .await?;
@@ -772,6 +884,7 @@ impl Pipeline {
                 let records = records.clone();
                 let ranges = ranges.clone();
                 let s3_client = s3_client.clone();
+                let gcs_client = gcs_client.clone();
                 let http_client = http_client.clone();
 
                 joinset.spawn(async move {
@@ -783,6 +896,7 @@ impl Pipeline {
                         rss_check_counter,
                         &records[range.start..range.end],
                         s3_client.as_ref(),
+                        gcs_client.as_ref(),
                         http_client.as_ref(),
                     )
                     .await;
@@ -809,12 +923,13 @@ impl Pipeline {
         Ok(())
     }
 
-    #[cfg(feature = "s3")]
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     async fn produce_manifest_record_batches(
         &self,
         tx: mpsc::Sender<BatchLease>,
         mut records_rx: mpsc::Receiver<mx8_core::types::ManifestRecord>,
         s3_client: Option<S3Client>,
+        gcs_client: Option<GcsClient>,
         http_client: Option<HttpClient>,
     ) -> Result<()> {
         let sample_cap = std::cmp::max(1, self.caps.batch_size_samples);
@@ -897,6 +1012,7 @@ impl Pipeline {
                     &mut sender,
                     &mut batch_records,
                     s3_client.as_ref(),
+                    gcs_client.as_ref(),
                     http_client.as_ref(),
                 )
                 .await?;
@@ -916,6 +1032,7 @@ impl Pipeline {
                 &mut sender,
                 &mut batch_records,
                 s3_client.as_ref(),
+                gcs_client.as_ref(),
                 http_client.as_ref(),
             )
             .await?;
@@ -924,12 +1041,13 @@ impl Pipeline {
         Ok(())
     }
 
-    #[cfg(feature = "s3")]
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     async fn flush_manifest_record_batch(
         &self,
         sender: &mut mpsc::Sender<BatchLease>,
         records: &mut Vec<mx8_core::types::ManifestRecord>,
         s3_client: Option<&S3Client>,
+        gcs_client: Option<&GcsClient>,
         http_client: Option<&HttpClient>,
     ) -> Result<()> {
         if records.is_empty() {
@@ -943,6 +1061,7 @@ impl Pipeline {
             self.rss_check_counter.clone(),
             owned.as_slice(),
             s3_client,
+            gcs_client,
             http_client,
         )
         .await?;
@@ -1364,6 +1483,11 @@ enum SpecLocation {
         bucket: String,
         key: String,
     },
+    #[cfg(feature = "gcs")]
+    Gcs {
+        bucket: String,
+        key: String,
+    },
     Http {
         url: String,
     },
@@ -1418,10 +1542,13 @@ fn parse_imagefolder_label_id(decode_hint: Option<&str>, sample_id: u64) -> Resu
 async fn build_batch_plan(
     records: &[mx8_core::types::ManifestRecord],
     s3_client: Option<&S3Client>,
+    gcs_client: Option<&GcsClient>,
     http_client: Option<&HttpClient>,
 ) -> Result<BatchPlan> {
     #[cfg(not(feature = "s3"))]
     let _ = s3_client;
+    #[cfg(not(feature = "gcs"))]
+    let _ = gcs_client;
 
     let mut sample_ids = Vec::with_capacity(records.len());
     let mut label_ids: Vec<Option<u64>> = Vec::with_capacity(records.len());
@@ -1461,6 +1588,28 @@ async fn build_batch_plan(
                     anyhow::ensure!(
                         size > 0,
                         "s3 object has unknown/zero size: s3://{bucket}/{key}"
+                    );
+                    (0u64, size, false)
+                }
+                #[cfg(feature = "gcs")]
+                SpecLocation::Gcs { bucket, key } => {
+                    let client = gcs_client.ok_or_else(|| {
+                        anyhow::anyhow!("gcs client not configured but gs:// location present")
+                    })?;
+                    use google_cloud_storage::http::objects::get::GetObjectRequest as GcsGetReq;
+                    let meta = client
+                        .get_object(&GcsGetReq {
+                            bucket: bucket.clone(),
+                            object: key.clone(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("gcs head_object failed gs://{bucket}/{key}: {e:?}"))?;
+                    let size = u64::try_from(meta.size)
+                        .map_err(|_| anyhow::anyhow!("gcs object size out of range: gs://{bucket}/{key}"))?;
+                    anyhow::ensure!(
+                        size > 0,
+                        "gcs object has unknown/zero size: gs://{bucket}/{key}"
                     );
                     (0u64, size, false)
                 }
@@ -1521,10 +1670,13 @@ async fn build_batch_plan(
 async fn fetch_specs_payload(
     specs: &[ReadSpec],
     s3_client: Option<&S3Client>,
+    gcs_client: Option<&GcsClient>,
     http_client: Option<&HttpClient>,
 ) -> Result<Vec<u8>> {
     #[cfg(not(feature = "s3"))]
     let _ = s3_client;
+    #[cfg(not(feature = "gcs"))]
+    let _ = gcs_client;
 
     let mut total: u64 = 0;
     for s in specs {
@@ -1602,6 +1754,40 @@ async fn fetch_specs_payload(
                 anyhow::ensure!(
                     b.len() == len,
                     "s3 returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
+                );
+                payload.extend_from_slice(&b);
+            }
+            #[cfg(feature = "gcs")]
+            SpecLocation::Gcs { bucket, key } => {
+                let client = gcs_client.ok_or_else(|| {
+                    anyhow::anyhow!("gcs client not configured but gs:// location present")
+                })?;
+                let start = s.offset;
+                let end = start
+                    .checked_add(s.len)
+                    .and_then(|v| v.checked_sub(1))
+                    .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+
+                use google_cloud_storage::http::objects::download::Range as GcsRange;
+                use google_cloud_storage::http::objects::get::GetObjectRequest as GcsGetReq;
+
+                let b = client
+                    .download_object(
+                        &GcsGetReq {
+                            bucket: bucket.clone(),
+                            object: key.clone(),
+                            ..Default::default()
+                        },
+                        &GcsRange(Some(start), Some(end)),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("gcs range download failed gs://{bucket}/{key}: {e:?}"))?;
+                anyhow::ensure!(
+                    b.len() == len,
+                    "gcs returned {} bytes, expected {} (sample_id={})",
                     b.len(),
                     len,
                     s.sample_id
@@ -1699,6 +1885,18 @@ fn parse_location(location: &str) -> Result<SpecLocation> {
             return Ok(SpecLocation::S3 { bucket, key });
         }
     }
+    if let Some(rest) = location.strip_prefix("gs://") {
+        #[cfg(not(feature = "gcs"))]
+        {
+            let _ = rest;
+            anyhow::bail!("gcs support not enabled (rebuild mx8-runtime with --features gcs)");
+        }
+        #[cfg(feature = "gcs")]
+        {
+            let (bucket, key) = parse_gcs_bucket_key(rest)?;
+            return Ok(SpecLocation::Gcs { bucket, key });
+        }
+    }
     if location.starts_with("http://") || location.starts_with("https://") {
         return Ok(SpecLocation::Http {
             url: location.to_string(),
@@ -1733,6 +1931,32 @@ fn parse_s3_bucket_prefix(url: &str) -> Result<(String, Option<String>)> {
     Ok((bucket.to_string(), list_prefix))
 }
 
+#[cfg(feature = "gcs")]
+fn parse_gcs_bucket_prefix(url: &str) -> Result<(String, Option<String>)> {
+    let mut rest = url.trim();
+    if let Some(stripped) = rest.strip_prefix("gs://") {
+        rest = stripped;
+    }
+    rest = rest.trim_start_matches('/');
+    anyhow::ensure!(!rest.is_empty(), "invalid gs prefix (empty url)");
+
+    let (bucket, prefix) = match rest.split_once('/') {
+        Some((bucket, prefix)) => (bucket.trim(), Some(prefix.trim())),
+        None => (rest.trim(), None),
+    };
+    anyhow::ensure!(!bucket.is_empty(), "invalid gs prefix (empty bucket)");
+
+    let list_prefix = prefix.and_then(|p| {
+        let trimmed = p.trim_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!("{trimmed}/"))
+        }
+    });
+    Ok((bucket.to_string(), list_prefix))
+}
+
 #[cfg(feature = "s3")]
 fn s3_precomputed_manifest_key(list_prefix: Option<&str>) -> String {
     match list_prefix {
@@ -1741,7 +1965,7 @@ fn s3_precomputed_manifest_key(list_prefix: Option<&str>) -> String {
     }
 }
 
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "gcs"))]
 #[derive(Debug, Clone)]
 struct ShuffleReservoir {
     cap: usize,
@@ -1749,7 +1973,7 @@ struct ShuffleReservoir {
     data: Vec<mx8_core::types::ManifestRecord>,
 }
 
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "gcs"))]
 impl ShuffleReservoir {
     fn new(cap: usize, seed: u64) -> Self {
         Self {
@@ -1780,13 +2004,13 @@ impl ShuffleReservoir {
     }
 }
 
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "gcs"))]
 #[derive(Debug, Clone, Copy)]
 struct TinyRng {
     state: u64,
 }
 
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "gcs"))]
 impl TinyRng {
     fn new(seed: u64) -> Self {
         let init = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
@@ -1927,7 +2151,7 @@ async fn scan_s3_prefix_records_to_channel(
     Ok(())
 }
 
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "gcs"))]
 fn imagefolder_decode_hint_for_key(
     list_prefix: Option<&str>,
     key: &str,
@@ -1963,7 +2187,130 @@ fn imagefolder_decode_hint_for_key(
     ))
 }
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "gcs")]
+struct GcsScanConfig {
+    bucket: String,
+    list_prefix: Option<String>,
+    recursive: bool,
+    reservoir_size: usize,
+    start_id: Option<u64>,
+    end_id: Option<u64>,
+}
+
+#[cfg(feature = "gcs")]
+async fn scan_gcs_prefix_records_to_channel(
+    cfg: GcsScanConfig,
+    client: GcsClient,
+    tx: mpsc::Sender<mx8_core::types::ManifestRecord>,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use google_cloud_storage::http::objects::list::ListObjectsRequest;
+
+    let mut sender = tx;
+    let seed = std::env::var("MX8_GCS_SCAN_SHUFFLE_SEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(mx8_observe::time::unix_time_ms);
+    let mut reservoir = ShuffleReservoir::new(cfg.reservoir_size, seed);
+    let mut token: Option<String> = None;
+    let mut objects_seen: u64 = 0;
+    let mut emitted: u64 = 0;
+    let mut sent: u64 = 0;
+    let mut label_to_id: HashMap<String, u64> = HashMap::new();
+    let mut next_label_id: u64 = 0;
+
+    loop {
+        let resp = client
+            .list_objects(&ListObjectsRequest {
+                bucket: cfg.bucket.clone(),
+                prefix: cfg.list_prefix.clone(),
+                max_results: Some(1000),
+                page_token: token.clone(),
+                delimiter: if cfg.recursive {
+                    None
+                } else {
+                    Some("/".to_string())
+                },
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("gcs list_objects failed: {e:?}"))?;
+
+        if let Some(items) = resp.items {
+            for object in items {
+                let key = object.name;
+                if key.ends_with('/') {
+                    continue;
+                }
+                let size = object.size;
+                if size <= 0 {
+                    continue;
+                }
+                let size = size as u64;
+                objects_seen = objects_seen.saturating_add(1);
+                let decode_hint = imagefolder_decode_hint_for_key(
+                    cfg.list_prefix.as_deref(),
+                    key.as_str(),
+                    &mut label_to_id,
+                    &mut next_label_id,
+                );
+                let record = mx8_core::types::ManifestRecord {
+                    sample_id: 0,
+                    location: format!("gs://{}/{key}", cfg.bucket),
+                    byte_offset: Some(0),
+                    byte_length: Some(size),
+                    decode_hint,
+                };
+                if let Some(out) = reservoir.push_and_maybe_pop(record) {
+                    scan_emit_record(
+                        &mut sender,
+                        out,
+                        cfg.start_id,
+                        cfg.end_id,
+                        &mut emitted,
+                        &mut sent,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if let Some(next_token) = resp.next_page_token {
+            token = Some(next_token);
+        } else {
+            break;
+        }
+    }
+
+    while let Some(out) = reservoir.pop_random() {
+        scan_emit_record(
+            &mut sender,
+            out,
+            cfg.start_id,
+            cfg.end_id,
+            &mut emitted,
+            &mut sent,
+        )
+        .await?;
+    }
+    drop(sender);
+
+    tracing::info!(
+        target: "mx8_proof",
+        event = "gcs_scan_completed",
+        bucket = %cfg.bucket,
+        prefix = %cfg.list_prefix.as_deref().unwrap_or(""),
+        recursive = cfg.recursive,
+        objects_seen = objects_seen,
+        records_emitted = emitted,
+        records_sent = sent,
+        reservoir_size = cfg.reservoir_size as u64,
+        "completed zero-manifest gcs scan"
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
 struct S3ScanConfig {
     bucket: String,
     list_prefix: Option<String>,
@@ -1973,7 +2320,7 @@ struct S3ScanConfig {
     end_id: Option<u64>,
 }
 
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "gcs"))]
 async fn scan_emit_record(
     sender: &mut mpsc::Sender<mx8_core::types::ManifestRecord>,
     mut record: mx8_core::types::ManifestRecord,
@@ -2112,10 +2459,11 @@ async fn build_manifest_inflight_batch(
     rss_check_counter: Arc<AtomicU64>,
     records: &[mx8_core::types::ManifestRecord],
     s3_client: Option<&S3Client>,
+    gcs_client: Option<&GcsClient>,
     http_client: Option<&HttpClient>,
 ) -> Result<BatchLease> {
     enforce_process_rss_cap(caps, metrics.as_ref(), &rss_check_counter)?;
-    let plan = build_batch_plan(records, s3_client, http_client).await?;
+    let plan = build_batch_plan(records, s3_client, gcs_client, http_client).await?;
     let bytes = plan.total_bytes;
     anyhow::ensure!(
         bytes <= caps.max_inflight_bytes,
@@ -2143,7 +2491,7 @@ async fn build_manifest_inflight_batch(
     metrics.on_inflight_add(bytes);
     metrics.on_batch_payload_bytes(bytes);
 
-    let payload = match fetch_specs_payload(&plan.specs, s3_client, http_client).await {
+    let payload = match fetch_specs_payload(&plan.specs, s3_client, gcs_client, http_client).await {
         Ok(p) => p,
         Err(err) => {
             metrics.on_inflight_sub(bytes);
@@ -2245,6 +2593,20 @@ fn parse_s3_bucket_key(rest: &str) -> Result<(String, String)> {
     let key = key.trim();
     anyhow::ensure!(!bucket.is_empty(), "invalid s3 url (empty bucket)");
     anyhow::ensure!(!key.is_empty(), "invalid s3 url (empty key)");
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+#[cfg(feature = "gcs")]
+fn parse_gcs_bucket_key(rest: &str) -> Result<(String, String)> {
+    // rest = "<bucket>/<object...>"
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((bucket, key)) = rest.split_once('/') else {
+        anyhow::bail!("invalid gs url (missing object key): gs://{rest}");
+    };
+    let bucket = bucket.trim();
+    let key = key.trim();
+    anyhow::ensure!(!bucket.is_empty(), "invalid gs url (empty bucket)");
+    anyhow::ensure!(!key.is_empty(), "invalid gs url (empty object key)");
     Ok((bucket.to_string(), key.to_string()))
 }
 
