@@ -74,6 +74,45 @@ python -m pip index versions mx8
 Then install an available version, or publish the missing tag if you are the maintainer.
 
 
+## GCS ADC authentication failed
+
+If `gs://` loading fails with `GCS ADC authentication failed`, MX8 could not find Google Application Default Credentials.
+
+Use one of:
+
+- `GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json`
+- `gcloud auth application-default login`
+- GCE/GKE workload identity
+
+For local emulator-only testing without cloud credentials, set both:
+
+```bash
+MX8_GCS_ENDPOINT_URL=http://127.0.0.1:4443/storage/v1
+MX8_GCS_ANONYMOUS=1
+```
+
+`MX8_GCS_ANONYMOUS=1` requires `MX8_GCS_ENDPOINT_URL`.
+
+
+## Azure Blob authentication or emulator endpoint issues
+
+If `az://` loading fails with Azure auth errors, MX8 could not resolve usable credentials.
+
+Use one of:
+
+- `AZURE_STORAGE_CONNECTION_STRING=...`
+- `AZURE_STORAGE_ACCOUNT=...` plus `AZURE_STORAGE_ACCESS_KEY=...`
+
+For local emulator-only testing without credentials:
+
+```bash
+MX8_AZURE_ENDPOINT_URL=http://127.0.0.1:10000/devstoreaccount1
+MX8_AZURE_ANONYMOUS=1
+```
+
+`MX8_AZURE_ANONYMOUS=1` requires `MX8_AZURE_ENDPOINT_URL`.
+
+
 ## Vision decode regression debugging
 
 To compare decode backends or validate Rust decode behavior, set `MX8_DECODE_BACKEND=rust` and configure the Rust path:

@@ -31,7 +31,21 @@ type GcsClient = google_cloud_storage::client::Client;
 #[cfg(not(feature = "gcs"))]
 type GcsClient = ();
 
+#[cfg(feature = "azure")]
+type AzureClient = azure_storage_blobs::prelude::ClientBuilder;
+
+#[cfg(not(feature = "azure"))]
+type AzureClient = ();
+
 type HttpClient = reqwest::Client;
+
+#[derive(Clone)]
+struct StorageClients<'a> {
+    s3: Option<&'a S3Client>,
+    gcs: Option<&'a GcsClient>,
+    azure: Option<&'a AzureClient>,
+    http: Option<&'a HttpClient>,
+}
 
 const PERMIT_UNIT_BYTES: u64 = 1024;
 const BATCH_JITTER_WINDOW: usize = 128;
@@ -332,6 +346,22 @@ impl Pipeline {
             None
         };
 
+        let has_azure = records.iter().any(|r| r.location.starts_with("az://"));
+        let azure_client: Option<AzureClient> = if has_azure {
+            #[cfg(feature = "azure")]
+            {
+                Some(crate::azure::client_builder_from_env()?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!(
+                    "manifest contains az:// locations but mx8-runtime was built without feature 'azure'"
+                );
+            }
+        } else {
+            None
+        };
+
         let http_client: Option<HttpClient> = if has_http {
             Some(
                 reqwest::Client::builder()
@@ -347,7 +377,14 @@ impl Pipeline {
         let pipeline = self.clone();
         let task = tokio::spawn(async move {
             pipeline
-                .produce_manifest_batches(tx, records, s3_client, gcs_client, http_client)
+                .produce_manifest_batches(
+                    tx,
+                    records,
+                    s3_client,
+                    gcs_client,
+                    azure_client,
+                    http_client,
+                )
                 .await
         });
         Ok((rx, task))
@@ -400,6 +437,22 @@ impl Pipeline {
             None
         };
 
+        let has_azure = records.iter().any(|r| r.location.starts_with("az://"));
+        let azure_client: Option<AzureClient> = if has_azure {
+            #[cfg(feature = "azure")]
+            {
+                Some(crate::azure::client_builder_from_env()?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!(
+                    "manifest contains az:// locations but mx8-runtime was built without feature 'azure'"
+                );
+            }
+        } else {
+            None
+        };
+
         let http_client: Option<HttpClient> = if has_http {
             Some(
                 reqwest::Client::builder()
@@ -424,7 +477,14 @@ impl Pipeline {
         let pipeline = self.clone();
         let task = tokio::spawn(async move {
             pipeline
-                .produce_manifest_batches(tx, records, s3_client, gcs_client, http_client)
+                .produce_manifest_batches(
+                    tx,
+                    records,
+                    s3_client,
+                    gcs_client,
+                    azure_client,
+                    http_client,
+                )
                 .await
         });
         Ok((rx, task))
@@ -510,7 +570,7 @@ impl Pipeline {
             });
 
             let producer_res = pipeline
-                .produce_manifest_record_batches(tx, record_rx, Some(s3_client), None, None)
+                .produce_manifest_record_batches(tx, record_rx, Some(s3_client), None, None, None)
                 .await;
             let scan_res = scanner.await.map_err(anyhow::Error::from)?;
             producer_res?;
@@ -566,7 +626,7 @@ impl Pipeline {
             });
 
             let producer_res = pipeline
-                .produce_manifest_record_batches(tx, record_rx, None, Some(gcs_client), None)
+                .produce_manifest_record_batches(tx, record_rx, None, Some(gcs_client), None, None)
                 .await;
             let scan_res = scanner.await.map_err(anyhow::Error::from)?;
             producer_res?;
@@ -704,6 +764,22 @@ impl Pipeline {
             None
         };
 
+        let has_azure = records.iter().any(|r| r.location.starts_with("az://"));
+        let azure_client: Option<AzureClient> = if has_azure {
+            #[cfg(feature = "azure")]
+            {
+                Some(crate::azure::client_builder_from_env()?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!(
+                    "manifest contains az:// locations but mx8-runtime was built without feature 'azure'"
+                );
+            }
+        } else {
+            None
+        };
+
         let http_client: Option<HttpClient> = if has_http {
             Some(
                 reqwest::Client::builder()
@@ -716,8 +792,15 @@ impl Pipeline {
         };
 
         let (tx, sink_task) = self.spawn_sink(sink)?;
-        self.produce_manifest_batches(tx.clone(), records, s3_client, gcs_client, http_client)
-            .await?;
+        self.produce_manifest_batches(
+            tx.clone(),
+            records,
+            s3_client,
+            gcs_client,
+            azure_client,
+            http_client,
+        )
+        .await?;
         drop(tx);
         sink_task.await??;
         Ok(())
@@ -837,6 +920,7 @@ impl Pipeline {
         records: Vec<mx8_core::types::ManifestRecord>,
         s3_client: Option<S3Client>,
         gcs_client: Option<GcsClient>,
+        azure_client: Option<AzureClient>,
         http_client: Option<HttpClient>,
     ) -> Result<()> {
         let (band_lower_pct, band_upper_pct) = self.current_batch_band_pcts();
@@ -852,9 +936,12 @@ impl Pipeline {
                     self.inflight_sem.clone(),
                     self.rss_check_counter.clone(),
                     &records[range.start..range.end],
-                    s3_client.as_ref(),
-                    gcs_client.as_ref(),
-                    http_client.as_ref(),
+                    StorageClients {
+                        s3: s3_client.as_ref(),
+                        gcs: gcs_client.as_ref(),
+                        azure: azure_client.as_ref(),
+                        http: http_client.as_ref(),
+                    },
                 )
                 .await?;
                 sender.send(inflight).await?;
@@ -885,6 +972,7 @@ impl Pipeline {
                 let ranges = ranges.clone();
                 let s3_client = s3_client.clone();
                 let gcs_client = gcs_client.clone();
+                let azure_client = azure_client.clone();
                 let http_client = http_client.clone();
 
                 joinset.spawn(async move {
@@ -895,9 +983,12 @@ impl Pipeline {
                         sem,
                         rss_check_counter,
                         &records[range.start..range.end],
-                        s3_client.as_ref(),
-                        gcs_client.as_ref(),
-                        http_client.as_ref(),
+                        StorageClients {
+                            s3: s3_client.as_ref(),
+                            gcs: gcs_client.as_ref(),
+                            azure: azure_client.as_ref(),
+                            http: http_client.as_ref(),
+                        },
                     )
                     .await;
                     (batch_id, inflight)
@@ -923,13 +1014,14 @@ impl Pipeline {
         Ok(())
     }
 
-    #[cfg(any(feature = "s3", feature = "gcs"))]
+    #[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
     async fn produce_manifest_record_batches(
         &self,
         tx: mpsc::Sender<BatchLease>,
         mut records_rx: mpsc::Receiver<mx8_core::types::ManifestRecord>,
         s3_client: Option<S3Client>,
         gcs_client: Option<GcsClient>,
+        azure_client: Option<AzureClient>,
         http_client: Option<HttpClient>,
     ) -> Result<()> {
         let sample_cap = std::cmp::max(1, self.caps.batch_size_samples);
@@ -1013,6 +1105,7 @@ impl Pipeline {
                     &mut batch_records,
                     s3_client.as_ref(),
                     gcs_client.as_ref(),
+                    azure_client.as_ref(),
                     http_client.as_ref(),
                 )
                 .await?;
@@ -1033,6 +1126,7 @@ impl Pipeline {
                 &mut batch_records,
                 s3_client.as_ref(),
                 gcs_client.as_ref(),
+                azure_client.as_ref(),
                 http_client.as_ref(),
             )
             .await?;
@@ -1041,13 +1135,14 @@ impl Pipeline {
         Ok(())
     }
 
-    #[cfg(any(feature = "s3", feature = "gcs"))]
+    #[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
     async fn flush_manifest_record_batch(
         &self,
         sender: &mut mpsc::Sender<BatchLease>,
         records: &mut Vec<mx8_core::types::ManifestRecord>,
         s3_client: Option<&S3Client>,
         gcs_client: Option<&GcsClient>,
+        azure_client: Option<&AzureClient>,
         http_client: Option<&HttpClient>,
     ) -> Result<()> {
         if records.is_empty() {
@@ -1060,9 +1155,12 @@ impl Pipeline {
             self.inflight_sem.clone(),
             self.rss_check_counter.clone(),
             owned.as_slice(),
-            s3_client,
-            gcs_client,
-            http_client,
+            StorageClients {
+                s3: s3_client,
+                gcs: gcs_client,
+                azure: azure_client,
+                http: http_client,
+            },
         )
         .await?;
         self.maybe_adjust_jitter_guardrail();
@@ -1488,6 +1586,11 @@ enum SpecLocation {
         bucket: String,
         key: String,
     },
+    #[cfg(feature = "azure")]
+    Azure {
+        container: String,
+        blob: String,
+    },
     Http {
         url: String,
     },
@@ -1543,12 +1646,15 @@ async fn build_batch_plan(
     records: &[mx8_core::types::ManifestRecord],
     s3_client: Option<&S3Client>,
     gcs_client: Option<&GcsClient>,
+    azure_client: Option<&AzureClient>,
     http_client: Option<&HttpClient>,
 ) -> Result<BatchPlan> {
     #[cfg(not(feature = "s3"))]
     let _ = s3_client;
     #[cfg(not(feature = "gcs"))]
     let _ = gcs_client;
+    #[cfg(not(feature = "azure"))]
+    let _ = azure_client;
 
     let mut sample_ids = Vec::with_capacity(records.len());
     let mut label_ids: Vec<Option<u64>> = Vec::with_capacity(records.len());
@@ -1604,12 +1710,33 @@ async fn build_batch_plan(
                             ..Default::default()
                         })
                         .await
-                        .map_err(|e| anyhow::anyhow!("gcs head_object failed gs://{bucket}/{key}: {e:?}"))?;
-                    let size = u64::try_from(meta.size)
-                        .map_err(|_| anyhow::anyhow!("gcs object size out of range: gs://{bucket}/{key}"))?;
+                        .map_err(|e| {
+                            anyhow::anyhow!("gcs head_object failed gs://{bucket}/{key}: {e:?}")
+                        })?;
+                    let size = u64::try_from(meta.size).map_err(|_| {
+                        anyhow::anyhow!("gcs object size out of range: gs://{bucket}/{key}")
+                    })?;
                     anyhow::ensure!(
                         size > 0,
                         "gcs object has unknown/zero size: gs://{bucket}/{key}"
+                    );
+                    (0u64, size, false)
+                }
+                #[cfg(feature = "azure")]
+                SpecLocation::Azure { container, blob } => {
+                    let builder = azure_client.ok_or_else(|| {
+                        anyhow::anyhow!("azure client not configured but az:// location present")
+                    })?;
+                    let blob_client = builder.clone().blob_client(container, blob);
+                    let props = blob_client.get_properties().await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "azure get_properties failed az://{container}/{blob}: {e:?}"
+                        )
+                    })?;
+                    let size = props.blob.properties.content_length;
+                    anyhow::ensure!(
+                        size > 0,
+                        "azure blob has unknown/zero size: az://{container}/{blob}"
                     );
                     (0u64, size, false)
                 }
@@ -1671,12 +1798,23 @@ async fn fetch_specs_payload(
     specs: &[ReadSpec],
     s3_client: Option<&S3Client>,
     gcs_client: Option<&GcsClient>,
+    azure_client: Option<&AzureClient>,
     http_client: Option<&HttpClient>,
 ) -> Result<Vec<u8>> {
     #[cfg(not(feature = "s3"))]
     let _ = s3_client;
     #[cfg(not(feature = "gcs"))]
     let _ = gcs_client;
+    #[cfg(not(feature = "azure"))]
+    let _ = azure_client;
+
+    #[cfg(feature = "azure")]
+    let mut azure_fallback_blob_cache: std::collections::HashMap<
+        (String, String),
+        Arc<Vec<u8>>,
+    > = std::collections::HashMap::new();
+    #[cfg(feature = "azure")]
+    let azure_emulator_compat = azure_endpoint_looks_like_emulator();
 
     let mut total: u64 = 0;
     for s in specs {
@@ -1784,10 +1922,98 @@ async fn fetch_specs_payload(
                         &GcsRange(Some(start), Some(end)),
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("gcs range download failed gs://{bucket}/{key}: {e:?}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("gcs range download failed gs://{bucket}/{key}: {e:?}")
+                    })?;
                 anyhow::ensure!(
                     b.len() == len,
                     "gcs returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
+                );
+                payload.extend_from_slice(&b);
+            }
+            #[cfg(feature = "azure")]
+            SpecLocation::Azure { container, blob } => {
+                let builder = azure_client.ok_or_else(|| {
+                    anyhow::anyhow!("azure client not configured but az:// location present")
+                })?;
+                let blob_client = builder.clone().blob_client(container, blob);
+                let start = s.offset;
+                let end_exclusive = start
+                    .checked_add(s.len)
+                    .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+
+                let b = if azure_emulator_compat {
+                    // Azurite can fail small ranged reads that request CRC64.
+                    // In emulator mode, read each blob once and slice samples from memory.
+                    let key = (container.clone(), blob.clone());
+                    let full_blob: Arc<Vec<u8>> = if let Some(cached) =
+                        azure_fallback_blob_cache.get(&key)
+                    {
+                        cached.clone()
+                    } else {
+                        let full = blob_client.get_content().await.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "azure emulator full-blob download failed az://{container}/{blob}: {e:?}"
+                                )
+                            })?;
+                        tracing::debug!(
+                            target: "mx8_proof",
+                            container = container.as_str(),
+                            blob = blob.as_str(),
+                            "azure emulator mode enabled; using full-blob reads with in-memory slicing"
+                        );
+                        let full = Arc::new(full);
+                        azure_fallback_blob_cache.insert(key, full.clone());
+                        full
+                    };
+                    let start_idx = usize::try_from(start)
+                        .map_err(|_| anyhow::anyhow!("azure offset too large"))?;
+                    let end_idx = usize::try_from(end_exclusive)
+                        .map_err(|_| anyhow::anyhow!("azure range end too large"))?;
+                    anyhow::ensure!(
+                        end_idx <= full_blob.len(),
+                        "azure emulator range out of bounds: requested [{}..{}) but blob length is {} (sample_id={})",
+                        start_idx,
+                        end_idx,
+                        full_blob.len(),
+                        s.sample_id
+                    );
+                    full_blob[start_idx..end_idx].to_vec()
+                } else {
+                    use futures::StreamExt;
+                    let mut stream = blob_client
+                        .get()
+                        .range(azure_core::request_options::Range::new(
+                            start,
+                            end_exclusive,
+                        ))
+                        .into_stream();
+                    let mut out = Vec::<u8>::with_capacity(len);
+                    while let Some(value) = stream.next().await {
+                        let mut body = value
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "azure range download failed az://{container}/{blob}: {e:?}"
+                                )
+                            })?
+                            .data;
+                        while let Some(chunk) = body.next().await {
+                            let chunk = chunk.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "azure stream read failed az://{container}/{blob}: {e:?}"
+                                )
+                            })?;
+                            out.extend(&chunk);
+                        }
+                    }
+                    out
+                };
+                anyhow::ensure!(
+                    b.len() == len,
+                    "azure returned {} bytes, expected {} (sample_id={})",
                     b.len(),
                     len,
                     s.sample_id
@@ -1872,6 +2098,31 @@ where
     }
 }
 
+#[cfg(feature = "azure")]
+fn azure_endpoint_looks_like_emulator() -> bool {
+    let anonymous = std::env::var("MX8_AZURE_ANONYMOUS")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "y" | "on")
+        })
+        .unwrap_or(false);
+    if anonymous {
+        return true;
+    }
+
+    std::env::var("MX8_AZURE_ENDPOINT_URL")
+        .ok()
+        .map(|u| {
+            let s = u.to_ascii_lowercase();
+            s.contains("127.0.0.1")
+                || s.contains("localhost")
+                || s.contains("azurite")
+                || s.contains("host.docker.internal")
+        })
+        .unwrap_or(false)
+}
+
 fn parse_location(location: &str) -> Result<SpecLocation> {
     if let Some(rest) = location.strip_prefix("s3://") {
         #[cfg(not(feature = "s3"))]
@@ -1895,6 +2146,18 @@ fn parse_location(location: &str) -> Result<SpecLocation> {
         {
             let (bucket, key) = parse_gcs_bucket_key(rest)?;
             return Ok(SpecLocation::Gcs { bucket, key });
+        }
+    }
+    if let Some(rest) = location.strip_prefix("az://") {
+        #[cfg(not(feature = "azure"))]
+        {
+            let _ = rest;
+            anyhow::bail!("azure support not enabled (rebuild mx8-runtime with --features azure)");
+        }
+        #[cfg(feature = "azure")]
+        {
+            let (container, blob) = parse_azure_container_blob(rest)?;
+            return Ok(SpecLocation::Azure { container, blob });
         }
     }
     if location.starts_with("http://") || location.starts_with("https://") {
@@ -2203,8 +2466,8 @@ async fn scan_gcs_prefix_records_to_channel(
     client: GcsClient,
     tx: mpsc::Sender<mx8_core::types::ManifestRecord>,
 ) -> Result<()> {
-    use std::collections::HashMap;
     use google_cloud_storage::http::objects::list::ListObjectsRequest;
+    use std::collections::HashMap;
 
     let mut sender = tx;
     let seed = std::env::var("MX8_GCS_SCAN_SHUFFLE_SEED")
@@ -2458,12 +2721,17 @@ async fn build_manifest_inflight_batch(
     inflight_sem: Arc<Semaphore>,
     rss_check_counter: Arc<AtomicU64>,
     records: &[mx8_core::types::ManifestRecord],
-    s3_client: Option<&S3Client>,
-    gcs_client: Option<&GcsClient>,
-    http_client: Option<&HttpClient>,
+    clients: StorageClients<'_>,
 ) -> Result<BatchLease> {
     enforce_process_rss_cap(caps, metrics.as_ref(), &rss_check_counter)?;
-    let plan = build_batch_plan(records, s3_client, gcs_client, http_client).await?;
+    let plan = build_batch_plan(
+        records,
+        clients.s3,
+        clients.gcs,
+        clients.azure,
+        clients.http,
+    )
+    .await?;
     let bytes = plan.total_bytes;
     anyhow::ensure!(
         bytes <= caps.max_inflight_bytes,
@@ -2491,7 +2759,15 @@ async fn build_manifest_inflight_batch(
     metrics.on_inflight_add(bytes);
     metrics.on_batch_payload_bytes(bytes);
 
-    let payload = match fetch_specs_payload(&plan.specs, s3_client, gcs_client, http_client).await {
+    let payload = match fetch_specs_payload(
+        &plan.specs,
+        clients.s3,
+        clients.gcs,
+        clients.azure,
+        clients.http,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(err) => {
             metrics.on_inflight_sub(bytes);
@@ -2608,6 +2884,20 @@ fn parse_gcs_bucket_key(rest: &str) -> Result<(String, String)> {
     anyhow::ensure!(!bucket.is_empty(), "invalid gs url (empty bucket)");
     anyhow::ensure!(!key.is_empty(), "invalid gs url (empty object key)");
     Ok((bucket.to_string(), key.to_string()))
+}
+
+#[cfg(feature = "azure")]
+fn parse_azure_container_blob(rest: &str) -> Result<(String, String)> {
+    // rest = "<container>/<blob...>"
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((container, blob)) = rest.split_once('/') else {
+        anyhow::bail!("invalid az url (missing blob name): az://{rest}");
+    };
+    let container = container.trim();
+    let blob = blob.trim();
+    anyhow::ensure!(!container.is_empty(), "invalid az url (empty container)");
+    anyhow::ensure!(!blob.is_empty(), "invalid az url (empty blob name)");
+    Ok((container.to_string(), blob.to_string()))
 }
 
 fn parse_canonical_manifest_tsv(bytes: &[u8]) -> Result<Vec<mx8_core::types::ManifestRecord>> {
@@ -3004,6 +3294,38 @@ mod s3_parse_tests {
         assert_eq!(out.len(), 25);
         for (idx, sid) in out.iter().enumerate() {
             assert_eq!(*sid as usize, idx);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "azure"))]
+mod azure_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_azure_container_blob_ok() -> Result<()> {
+        let (c, b) = parse_azure_container_blob("mycontainer/path/to/blob.bin")?;
+        assert_eq!(c, "mycontainer");
+        assert_eq!(b, "path/to/blob.bin");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_azure_container_blob_rejects_missing_blob() {
+        let err = parse_azure_container_blob("mycontainer").unwrap_err();
+        assert!(err.to_string().contains("missing blob name"));
+    }
+
+    #[test]
+    fn parse_location_azure_scheme() -> Result<()> {
+        let loc = parse_location("az://container/blob.bin")?;
+        match loc {
+            SpecLocation::Azure { container, blob } => {
+                assert_eq!(container, "container");
+                assert_eq!(blob, "blob.bin");
+                Ok(())
+            }
+            other => anyhow::bail!("expected azure location, got {other:?}"),
         }
     }
 }

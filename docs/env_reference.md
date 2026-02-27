@@ -13,7 +13,7 @@ Generation command:
 rg -o --no-filename "MX8_[A-Z0-9_]+" crates scripts | sort -u
 ```
 
-Current inventory size: `255` variables.
+Current inventory size: `264` variables.
 
 ## Stability Classes
 
@@ -79,6 +79,10 @@ Current inventory size: `255` variables.
 | `MX8_SEED_FILE` | unset | `mx8-seed-s3` | local file path | stable |
 | `MX8_S3_ENDPOINT_URL` | unset | all S3 clients | URL | stable |
 | `MX8_S3_FORCE_PATH_STYLE` | unset (auto-true when endpoint override exists) | all S3 clients | bool (`true/false/1/0`) | stable |
+| `MX8_AZURE_ENDPOINT_URL` | unset | all Azure Blob clients | URL (Azure or emulator endpoint) | stable |
+| `MX8_AZURE_ANONYMOUS` | `false` | all Azure Blob clients | bool (`true/false/1/0`) | stable |
+| `MX8_GCS_ENDPOINT_URL` | unset | all GCS clients | URL (emulator or custom endpoint) | stable |
+| `MX8_GCS_ANONYMOUS` | `false` | all GCS clients | bool (`true/false/1/0`) | stable |
 | `MX8_LOG` | fallback: `RUST_LOG`, then `info` | all Rust binaries | tracing filter string | stable |
 
 ## Feature/Performance Knobs (`experimental`)
@@ -89,6 +93,7 @@ Current inventory size: `255` variables.
 | `MX8_ZERO_MANIFEST_RESERVOIR` | `100000` | Python DataLoader | integer >= 1 | experimental |
 | `MX8_DEV_LEASE_WANT` | `0` (agent) | agent dev lease loop | integer >= 0 | experimental |
 | `MX8_S3_SCAN_SHUFFLE_SEED` | current unix time | runtime S3 scanner | integer (`u64`) | experimental |
+| `MX8_GCS_SCAN_SHUFFLE_SEED` | current unix time | runtime GCS scanner | integer (`u64`) | experimental |
 | `MX8_AGENT_MANIFEST_STREAM_MAX_LINE_BYTES` | `8388608` | agent manifest parser | integer >= 1 | experimental |
 | `MX8_SNAPSHOT_S3_EXTERNAL_SORT` | `false` | snapshot indexer | bool (`true/false/1/0`) | experimental |
 | `MX8_SNAPSHOT_S3_SPILL_KEYS_PER_RUN` | `100000` | snapshot indexer | integer >= 1 | experimental |
@@ -140,6 +145,12 @@ MX8_AGENT_MANIFEST_STREAM_MAX_LINE_BYTES
 MX8_AUTOTUNE
 MX8_AUTOTUNE_AB_MODE
 MX8_AUTOTUNE_PROFILE
+MX8_AZURE_ANONYMOUS
+MX8_AZURE_BLOB
+MX8_AZURE_CONTAINER
+MX8_AZURE_ENDPOINT_URL
+MX8_AZURITE_BLOB_PORT
+MX8_AZURITE_IMAGE
 MX8_BATCH_SIZE_SAMPLES
 MX8_BENCH_WANTS
 MX8_BURNIN_LOG_DIR
@@ -172,6 +183,9 @@ MX8_DEV_TOTAL_SAMPLES
 MX8_END_ID
 MX8_EPOCH
 MX8_FFMPEG_BIN
+MX8_GCS_ANONYMOUS
+MX8_GCS_ENDPOINT_URL
+MX8_GCS_SCAN_SHUFFLE_SEED
 MX8_GRPC_MAX_MESSAGE_BYTES
 MX8_HEARTBEAT_INTERVAL_MS
 MX8_HTTP_BANDWIDTH_BPS
