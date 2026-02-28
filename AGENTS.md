@@ -46,6 +46,7 @@ Every code change should end with:
 - `cargo clippy --all-targets --all-features`
 - `cargo test --workspace`
 - A demo/test “gate” for the milestone (update an existing demo like `mx8-demo1`/`mx8-demo2` or add a new one) that proves the new invariant/behavior, plus the exact command to run it (prefer offline/deterministic when possible). Prefer “examples as docs”: make the demo/example show the safe/idiomatic usage pattern (don’t rely on warnings people won’t read).
+- For every **major change** (new surface area, behavior change, or production-path refactor), run the **full end-to-end gate** relevant to that surface (for example, the actual `scripts/*_gate.sh` flow), not just compile/lint/unit subsets. If a full gate cannot be run, treat the implementation as incomplete and explicitly report the blocker.
 - A brief note on hot-path time/memory complexity (big-O + growth drivers).
 - Any new/changed invariants reflected in `ARCHITECTURE.MD` (if applicable).
 
