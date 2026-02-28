@@ -169,6 +169,11 @@ Runtime loop:
 - Get next range from local agent.
 - Fetch/decode/pack/deliver with bounded queues + backpressure.
 
+Image augmentation contract (v1.8):
+- Augmentation order is fixed: `decode -> resize -> crop -> flip -> jitter -> normalize`.
+- Augment RNG is deterministic per sample using `(manifest_hash, seed, epoch, sample_id)`.
+- Determinism must not bypass bounded-memory/backpressure constraints.
+
 ## Default Lease + Membership Policies (v1.8)
 - Membership: dynamic registration + barrier to `world_size=N`, then freeze for the run.
   - Rank assignment: stable rule (sort by `node_id`) unless explicit ranks are provided.

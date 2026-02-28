@@ -215,6 +215,56 @@ for step, batch in enumerate(loader):
 Alert when `ram_high_water_bytes` approaches your `MX8_MAX_PROCESS_RSS_BYTES` cap, when `batch_jitter_slo_breaches_total` is rising steadily, or when `inflight_bytes` is pegged at the cap for many consecutive steps.
 
 
+## Text loader
+
+`mx8.text` tokenizes text samples inside Rust and emits fixed-shape token batches for direct model input.
+
+```python
+import mx8
+
+loader = mx8.text(
+    "s3://bucket/corpus@refresh",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    add_bos=False,
+    add_eos=True,
+    batch_size_samples=32,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    token_ids = batch.token_ids            # [B, sequence_length] int64
+    attention = batch.attention_mask       # [B, sequence_length] bool (or None)
+    sample_ids = batch.sample_ids          # [B] int64
+```
+
+Text loader arguments:
+
+`tokenizer` — tokenizer reference. Supports `"gpt2"` or a local `tokenizer.json` path.
+
+`sequence_length` — fixed output token length for each emitted row.
+
+`stride` — step size for chunking long tokenized sequences (use `stride < sequence_length` for overlap).
+
+`add_bos`, `add_eos` — prepend/append BOS/EOS token IDs when available in tokenizer config.
+
+`truncate` — long-sequence handling (`"right"` or `"error"`).
+
+`return_attention_mask` — emit `batch.attention_mask` when `True`.
+
+`decode_error_policy` — UTF-8 decode handling (`"error"` default, `"skip"` optional).
+
+`job_id`, `cluster_url`, `resume_from` — same distributed/restore contract as `mx8.load`.
+
+`loader.checkpoint()` returns an opaque token compatible with `mx8.text(..., resume_from=token)`.
+
+`loader.stats()` for the text loader includes tokenization fields (`text_tokenize_samples_total`, `text_tokenize_failures_total`, `text_tokens_produced_total`, `text_tokens_per_sample_p50`, `text_tokens_per_sample_p95`), the selected tokenizer (`text_tokenizer`), and standard pipeline counters shared with all loaders.
+
+Gate commands for the text loader: `./scripts/text_gate.sh`.
+
+
 ## Image loader
 
 `mx8.image` delivers decoded images and labels as tensors. Use it when your dataset includes ImageFolder label hints.
@@ -236,9 +286,36 @@ for images, labels in loader:
     pass  # images: [B,C,H,W] float32, labels: [B] int64
 ```
 
+With the augmentation preset:
+
+```python
+loader = mx8.image(
+    "s3://bucket/mx8/train/@refresh",
+    augment="imagenet",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    seed=42,
+)
+
+for images, labels in loader:
+    pass  # images: [B,C,H,W] float32, augmented and normalized
+```
+
 Image loader arguments:
 
 `resize_hw` — `(height, width)` tuple to resize all images before batching (e.g. `resize_hw=(224, 224)`). If not set, images are returned at their original size. All images in a batch must have the same decoded dimensions; mixed-size batches are an error.
+
+`augment` — optional preset alias. `augment="imagenet"` (or `"standard"`) expands defaults for common classification training: `resize_hw=(256,256)` when unset, `crop_hw=(224,224)`, `horizontal_flip_p=0.5`, `color_jitter_{brightness,contrast,saturation}=0.4`, and ImageNet normalization (`mean=(0.485,0.456,0.406)`, `std=(0.229,0.224,0.225)`).
+
+`crop_hw` — optional random crop size `(height, width)` applied after decode/resize.
+
+`horizontal_flip_p` — per-sample horizontal flip probability in `[0, 1]`.
+
+`color_jitter_brightness`, `color_jitter_contrast`, `color_jitter_saturation` — non-negative jitter magnitudes. `color_jitter_hue` is currently accepted only as `0.0` (hue jitter is not yet implemented).
+
+`normalize_mean`, `normalize_std` — optional per-channel normalization tuples. Pass both together. `std` values must be `> 0`.
+
+`seed`, `epoch` — deterministic augmentation controls. For a fixed snapshot (`manifest_hash`), `seed`, `epoch`, and `sample_id`, augment choices are reproducible.
 
 `to_float` (default `True`) — normalize pixel values to `float32` in `[0, 1]`. Set `to_float=False` to get raw `uint8` tensors.
 
@@ -251,6 +328,10 @@ Image loader arguments:
 `autopack` and `autopack_shard_mb` — same as the core loader.
 
 The default decode backend in v1.8 is Python/Pillow. To use the experimental Rust decode path, set `MX8_DECODE_BACKEND=rust`. The Rust path supports additional options: `MX8_DECODE_THREADS` for worker count, `MX8_RUST_JPEG_CODEC` for JPEG codec selection (`zune`, `image`, or `turbo`), and `MX8_RUST_RESIZE_BACKEND` for resize algorithm (`fast` or `image`).
+
+Augmentation order is fixed and deterministic: `decode -> resize -> crop -> flip -> jitter -> normalize`.
+
+Gate commands for the image loader: `./scripts/image_aug_gate.sh`, `./scripts/py_local_image_pillow_gate.sh`, and `./scripts/py_minio_image_pillow_gate.sh`.
 
 
 ## Video loader

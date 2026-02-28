@@ -19,6 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString, PyTuple};
 use rayon::prelude::*;
+use tokenizers::Tokenizer;
 use turbojpeg::PixelFormat as TurboPixelFormat;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::JpegDecoder;
@@ -117,10 +118,58 @@ enum ImageLoaderInner {
     Distributed(DistributedDataLoader),
 }
 
+enum TextLoaderInner {
+    Local(DataLoader),
+    Distributed(DistributedDataLoader),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextTruncateMode {
+    Right,
+    Error,
+}
+
+impl TextTruncateMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "right" => Ok(Self::Right),
+            "error" => Ok(Self::Error),
+            _ => anyhow::bail!("invalid truncate={raw:?} (expected: right|error)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDecodeErrorPolicy {
+    Error,
+    Skip,
+}
+
+impl TextDecodeErrorPolicy {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "error" => Ok(Self::Error),
+            "skip" => Ok(Self::Skip),
+            _ => anyhow::bail!("invalid decode_error_policy={raw:?} (expected: error|skip)"),
+        }
+    }
+}
+
 #[pyclass]
 struct ImageLoader {
     loader: ImageLoaderInner,
     resize_hw: Option<(u32, u32)>,
+    crop_hw: Option<(u32, u32)>,
+    horizontal_flip_p: f32,
+    color_jitter_brightness: f32,
+    color_jitter_contrast: f32,
+    color_jitter_saturation: f32,
+    color_jitter_hue: f32,
+    normalize_mean: Option<[f32; 3]>,
+    normalize_std: Option<[f32; 3]>,
+    seed: u64,
+    epoch: u64,
+    manifest_hash_seed: u64,
     to_float: bool,
     decode_backend: DecodeBackend,
     rust_jpeg_codec: RustJpegCodec,
@@ -128,6 +177,31 @@ struct ImageLoader {
     decode_threads: usize,
     decode_pool: Option<Arc<rayon::ThreadPool>>,
     classes: Option<Vec<String>>,
+}
+
+#[pyclass]
+struct TextLoader {
+    loader: TextLoaderInner,
+    tokenizer: Arc<Tokenizer>,
+    sequence_length: usize,
+    stride: usize,
+    add_bos: bool,
+    add_eos: bool,
+    bos_token_id: Option<u32>,
+    eos_token_id: Option<u32>,
+    pad_token_id: i64,
+    truncate: TextTruncateMode,
+    return_attention_mask: bool,
+    decode_error_policy: TextDecodeErrorPolicy,
+}
+
+#[pyclass]
+struct TextBatch {
+    token_ids: Vec<i64>,
+    attention_mask: Option<Vec<u8>>,
+    sample_ids: Vec<i64>,
+    batch_rows: usize,
+    sequence_length: usize,
 }
 
 #[pyclass]
@@ -1338,6 +1412,67 @@ fn render_human_stats(stats: &Bound<'_, PyDict>) -> String {
     lines.join("\n")
 }
 
+fn resolve_special_token_id(tokenizer: &Tokenizer, names: &[&str]) -> Option<u32> {
+    names.iter().find_map(|name| tokenizer.token_to_id(name))
+}
+
+fn text_pad_token_id(tokenizer: &Tokenizer, eos_token_id: Option<u32>) -> i64 {
+    if let Some(padding) = tokenizer.get_padding() {
+        return i64::from(padding.pad_id);
+    }
+    eos_token_id.map(i64::from).unwrap_or(0)
+}
+
+fn load_text_tokenizer(tokenizer_ref: &str) -> PyResult<Tokenizer> {
+    let trimmed = tokenizer_ref.trim();
+    if trimmed.is_empty() {
+        return Err(PyValueError::new_err(
+            "tokenizer must be non-empty (expected tokenizer preset like \"gpt2\" or tokenizer.json path)",
+        ));
+    }
+    if std::path::Path::new(trimmed).exists() {
+        return Tokenizer::from_file(trimmed).map_err(|e| {
+            PyValueError::new_err(format!("failed to load tokenizer file {trimmed:?}: {e}"))
+        });
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "gpt2" => Tokenizer::from_pretrained("gpt2", None)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to load gpt2 tokenizer: {e}"))),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported tokenizer {trimmed:?}; pass \"gpt2\" or a tokenizer.json path"
+        ))),
+    }
+}
+
+fn stable_hash64(bytes: &[u8]) -> u64 {
+    // FNV-1a 64-bit for deterministic per-run hashing.
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+fn unit_f32(manifest_hash_seed: u64, seed: u64, sample_id: u64, stream_id: u64, epoch: u64) -> f32 {
+    let x = manifest_hash_seed
+        .wrapping_add(seed.rotate_left(7))
+        .wrapping_add(sample_id.rotate_left(17))
+        .wrapping_add(stream_id.rotate_left(29))
+        .wrapping_add(epoch.rotate_left(41));
+    let bits = splitmix64(x);
+    // Map to [0, 1).
+    (bits as f64 / (u64::MAX as f64 + 1.0)) as f32
+}
+
 fn decode_backend_from_env() -> PyResult<DecodeBackend> {
     let raw = std::env::var("MX8_DECODE_BACKEND").unwrap_or_else(|_| "python".to_string());
     let v = raw.trim().to_ascii_lowercase();
@@ -1959,7 +2094,11 @@ impl DataLoader {
             };
             match scan_result {
                 Ok((rx, task)) => {
-                    let backend = if dataset_base.starts_with("gs://") { "gcs" } else { "s3" };
+                    let backend = if dataset_base.starts_with("gs://") {
+                        "gcs"
+                    } else {
+                        "s3"
+                    };
                     tracing::info!(
                         target: "mx8_proof",
                         event = "zero_manifest_scan_enabled",
@@ -4249,7 +4388,506 @@ impl VideoDataLoader {
     }
 }
 
+impl TextLoader {
+    fn tokenize_lease(&self, lease: BatchLease) -> PyResult<TextBatch> {
+        let mut token_ids = Vec::<i64>::new();
+        let mut attention_mask = if self.return_attention_mask {
+            Some(Vec::<u8>::new())
+        } else {
+            None
+        };
+        let mut sample_ids = Vec::<i64>::new();
+        let mut rows = 0usize;
+        let step = self.stride.max(1);
+
+        for i in 0..lease.batch.sample_count() {
+            let start = lease.batch.offsets[i] as usize;
+            let end = lease.batch.offsets[i + 1] as usize;
+            if end < start || end > lease.batch.payload.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "bad offsets for sample_id {} (start={} end={} payload_len={})",
+                    lease.batch.sample_ids[i],
+                    start,
+                    end,
+                    lease.batch.payload.len()
+                )));
+            }
+            let sample_id = lease.batch.sample_ids[i];
+            let sample_id_i64 = i64::try_from(sample_id).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "sample_id overflow converting u64 -> i64 (sample_id={sample_id})"
+                ))
+            })?;
+            let text_bytes = &lease.batch.payload[start..end];
+            let text = match std::str::from_utf8(text_bytes) {
+                Ok(v) => v,
+                Err(err) => match self.decode_error_policy {
+                    TextDecodeErrorPolicy::Error => {
+                        return Err(PyValueError::new_err(format!(
+                            "utf8 decode failed for sample_id={sample_id}: {err}"
+                        )));
+                    }
+                    TextDecodeErrorPolicy::Skip => continue,
+                },
+            };
+
+            let encoding = self.tokenizer.encode(text, false).map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "tokenization failed for sample_id={sample_id}: {e}"
+                ))
+            })?;
+            let mut ids: Vec<i64> = encoding.get_ids().iter().map(|v| i64::from(*v)).collect();
+            if self.add_bos {
+                let bos = self.bos_token_id.ok_or_else(|| {
+                    PyValueError::new_err("add_bos=True but tokenizer has no bos token id")
+                })?;
+                ids.insert(0, i64::from(bos));
+            }
+            if self.add_eos {
+                let eos = self.eos_token_id.ok_or_else(|| {
+                    PyValueError::new_err("add_eos=True but tokenizer has no eos token id")
+                })?;
+                ids.push(i64::from(eos));
+            }
+
+            if self.truncate == TextTruncateMode::Error && ids.len() > self.sequence_length {
+                return Err(PyValueError::new_err(format!(
+                    "token sequence too long for sample_id={sample_id} (tokens={} > sequence_length={})",
+                    ids.len(),
+                    self.sequence_length
+                )));
+            }
+
+            if ids.is_empty() {
+                sample_ids.push(sample_id_i64);
+                token_ids.extend(std::iter::repeat_n(self.pad_token_id, self.sequence_length));
+                if let Some(mask) = attention_mask.as_mut() {
+                    mask.extend(std::iter::repeat_n(0u8, self.sequence_length));
+                }
+                rows = rows.saturating_add(1);
+                continue;
+            }
+
+            let mut cursor = 0usize;
+            loop {
+                let end_idx = cursor.saturating_add(self.sequence_length).min(ids.len());
+                let window = &ids[cursor..end_idx];
+                sample_ids.push(sample_id_i64);
+                token_ids.extend_from_slice(window);
+                if window.len() < self.sequence_length {
+                    token_ids.extend(std::iter::repeat_n(
+                        self.pad_token_id,
+                        self.sequence_length - window.len(),
+                    ));
+                }
+                if let Some(mask) = attention_mask.as_mut() {
+                    mask.extend(std::iter::repeat_n(1u8, window.len()));
+                    if window.len() < self.sequence_length {
+                        mask.extend(std::iter::repeat_n(
+                            0u8,
+                            self.sequence_length - window.len(),
+                        ));
+                    }
+                }
+                rows = rows.saturating_add(1);
+
+                if end_idx >= ids.len() || self.truncate == TextTruncateMode::Error {
+                    break;
+                }
+                cursor = cursor.saturating_add(step);
+                if cursor >= ids.len() {
+                    break;
+                }
+            }
+        }
+
+        Ok(TextBatch {
+            token_ids,
+            attention_mask,
+            sample_ids,
+            batch_rows: rows,
+            sequence_length: self.sequence_length,
+        })
+    }
+}
+
+#[pymethods]
+impl TextLoader {
+    #[getter]
+    fn sequence_length(&self) -> usize {
+        self.sequence_length
+    }
+
+    #[getter]
+    fn stride(&self) -> usize {
+        self.stride
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stats = match &self.loader {
+            TextLoaderInner::Local(loader) => loader.stats(py)?,
+            TextLoaderInner::Distributed(loader) => loader.stats(py)?,
+        };
+        let dict = stats.downcast::<PyDict>()?;
+        dict.set_item("text_sequence_length", self.sequence_length)?;
+        dict.set_item("text_stride", self.stride)?;
+        dict.set_item("text_return_attention_mask", self.return_attention_mask)?;
+        Ok(stats)
+    }
+
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        match &self.loader {
+            TextLoaderInner::Local(loader) => loader.checkpoint(py),
+            TextLoaderInner::Distributed(loader) => loader.checkpoint(py),
+        }
+    }
+
+    fn print_stats(&self, py: Python<'_>) -> PyResult<()> {
+        match &self.loader {
+            TextLoaderInner::Local(loader) => loader.print_stats(py),
+            TextLoaderInner::Distributed(loader) => {
+                let stats = loader.stats(py)?;
+                let stats = stats.downcast::<PyDict>()?;
+                let text = render_human_stats(stats).replace('\n', " | ");
+                eprintln!("[mx8] {text}");
+                Ok(())
+            }
+        }
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        loop {
+            let lease = match &mut self.loader {
+                TextLoaderInner::Local(loader) => {
+                    let lease =
+                        py.allow_threads(|| loader.rt.block_on(async { loader.rx.recv().await }));
+                    let Some(lease) = lease else {
+                        let Some(task) = loader.task.take() else {
+                            return Err(PyStopIteration::new_err(()));
+                        };
+                        let out = py.allow_threads(|| loader.rt.block_on(task));
+                        return match out {
+                            Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                            Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                            Err(err) => Err(PyRuntimeError::new_err(format!(
+                                "producer task failed: {err}"
+                            ))),
+                        };
+                    };
+                    loader.on_batch_delivered(&lease);
+                    lease
+                }
+                TextLoaderInner::Distributed(loader) => {
+                    let wait_started = Instant::now();
+                    let lease =
+                        py.allow_threads(|| loader.rt.block_on(async { loader.rx.recv().await }));
+                    let Some(lease) = lease else {
+                        let Some(task) = loader.task.take() else {
+                            return Err(PyStopIteration::new_err(()));
+                        };
+                        let out = py.allow_threads(|| loader.rt.block_on(task));
+                        return match out {
+                            Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                            Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                            Err(err) => Err(PyRuntimeError::new_err(format!(
+                                "producer task failed: {err}"
+                            ))),
+                        };
+                    };
+                    loader.autotune.on_wait(wait_started.elapsed());
+                    lease
+                }
+            };
+            let batch = self.tokenize_lease(lease)?;
+            if batch.batch_rows == 0 {
+                continue;
+            }
+            let out = Py::new(py, batch)?;
+            return Ok(out.into_bound(py).into_any());
+        }
+    }
+
+    fn close(&mut self) {
+        match &mut self.loader {
+            TextLoaderInner::Local(loader) => loader.close(),
+            TextLoaderInner::Distributed(loader) => loader.close(),
+        }
+    }
+
+    fn __del__(&mut self) {
+        self.close();
+    }
+}
+
+#[pymethods]
+impl TextBatch {
+    #[getter]
+    fn sample_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use TextBatch): {e}"
+            ))
+        })?;
+        let torch_int64 = torch.getattr("int64")?;
+        let values = PyList::new_bound(py, self.sample_ids.iter().copied());
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        torch.call_method("tensor", (values,), Some(&kwargs))
+    }
+
+    #[getter]
+    fn token_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use TextBatch): {e}"
+            ))
+        })?;
+        let torch_int64 = torch.getattr("int64")?;
+        let values = PyList::new_bound(py, self.token_ids.iter().copied());
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        let flat = torch.call_method("tensor", (values,), Some(&kwargs))?;
+        let rows = i64::try_from(self.batch_rows)
+            .map_err(|_| PyValueError::new_err("text batch rows do not fit i64"))?;
+        let seq = i64::try_from(self.sequence_length)
+            .map_err(|_| PyValueError::new_err("sequence_length does not fit i64"))?;
+        flat.call_method1("view", (rows, seq))
+    }
+
+    #[getter]
+    fn attention_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let Some(mask_raw) = &self.attention_mask else {
+            return Ok(py.None().into_bound(py).into_any());
+        };
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use TextBatch): {e}"
+            ))
+        })?;
+        let torch_bool = torch.getattr("bool")?;
+        let values = PyList::new_bound(py, mask_raw.iter().map(|v| *v != 0));
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_bool)?;
+        let flat = torch.call_method("tensor", (values,), Some(&kwargs))?;
+        let rows = i64::try_from(self.batch_rows)
+            .map_err(|_| PyValueError::new_err("text batch rows do not fit i64"))?;
+        let seq = i64::try_from(self.sequence_length)
+            .map_err(|_| PyValueError::new_err("sequence_length does not fit i64"))?;
+        flat.call_method1("view", (rows, seq))
+    }
+
+    fn to_torch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let token_ids = self.token_ids(py)?;
+        let sample_ids = self.sample_ids(py)?;
+        if self.attention_mask.is_some() {
+            let attention_mask = self.attention_mask(py)?;
+            let out = PyTuple::new_bound(
+                py,
+                [
+                    token_ids.to_object(py),
+                    attention_mask.to_object(py),
+                    sample_ids.to_object(py),
+                ],
+            );
+            return Ok(out.into_any());
+        }
+        let out = PyTuple::new_bound(py, [token_ids.to_object(py), sample_ids.to_object(py)]);
+        Ok(out.into_any())
+    }
+}
+
 impl ImageLoader {
+    fn apply_image_augmentations<'py>(
+        &self,
+        py: Python<'py>,
+        torch: &Bound<'py, PyModule>,
+        images: Bound<'py, PyAny>,
+        sample_ids: &[u64],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let augment_enabled = self.crop_hw.is_some()
+            || self.horizontal_flip_p > 0.0
+            || self.color_jitter_brightness > 0.0
+            || self.color_jitter_contrast > 0.0
+            || self.color_jitter_saturation > 0.0
+            || self.color_jitter_hue > 0.0
+            || (self.normalize_mean.is_some() && self.normalize_std.is_some());
+        if !augment_enabled || sample_ids.is_empty() {
+            return Ok(images);
+        }
+        if self.color_jitter_hue > 0.0 {
+            return Err(PyValueError::new_err(
+                "color_jitter_hue > 0 is not supported yet (set hue to 0.0)",
+            ));
+        }
+
+        let shape_obj = images.getattr("shape")?;
+        let shape = shape_obj.downcast::<PyTuple>()?;
+        if shape.len() != 4 {
+            return Err(PyRuntimeError::new_err(
+                "expected images tensor shape [B,C,H,W] for augmentations",
+            ));
+        }
+        let src_h = shape.get_item(2)?.extract::<i64>()?;
+        let src_w = shape.get_item(3)?.extract::<i64>()?;
+        let mut crop_h_i64 = src_h;
+        let mut crop_w_i64 = src_w;
+        if let Some((crop_h, crop_w)) = self.crop_hw {
+            crop_h_i64 = i64::from(crop_h);
+            crop_w_i64 = i64::from(crop_w);
+            if crop_h_i64 <= 0 || crop_w_i64 <= 0 {
+                return Err(PyValueError::new_err("crop_hw must be positive"));
+            }
+            if crop_h_i64 > src_h || crop_w_i64 > src_w {
+                return Err(PyValueError::new_err(format!(
+                    "crop_hw {:?} exceeds image shape {}x{}",
+                    self.crop_hw, src_h, src_w
+                )));
+            }
+        }
+
+        let mut out_samples: Vec<PyObject> = Vec::with_capacity(sample_ids.len());
+        for (i, sample_id) in sample_ids.iter().enumerate() {
+            let mut sample = images.call_method1("__getitem__", (i as i64,))?;
+
+            if self.crop_hw.is_some() {
+                let top_max = src_h - crop_h_i64;
+                let left_max = src_w - crop_w_i64;
+                let top = if top_max > 0 {
+                    let u = unit_f32(
+                        self.manifest_hash_seed,
+                        self.seed,
+                        *sample_id,
+                        1,
+                        self.epoch,
+                    );
+                    (((top_max + 1) as f32) * u)
+                        .floor()
+                        .clamp(0.0, top_max as f32) as i64
+                } else {
+                    0
+                };
+                let left = if left_max > 0 {
+                    let u = unit_f32(
+                        self.manifest_hash_seed,
+                        self.seed,
+                        *sample_id,
+                        2,
+                        self.epoch,
+                    );
+                    (((left_max + 1) as f32) * u)
+                        .floor()
+                        .clamp(0.0, left_max as f32) as i64
+                } else {
+                    0
+                };
+                sample = sample
+                    .call_method1("narrow", (1i64, top, crop_h_i64))?
+                    .call_method1("narrow", (2i64, left, crop_w_i64))?;
+            }
+
+            if self.horizontal_flip_p > 0.0 {
+                let u = unit_f32(
+                    self.manifest_hash_seed,
+                    self.seed,
+                    *sample_id,
+                    3,
+                    self.epoch,
+                );
+                if u < self.horizontal_flip_p {
+                    let dims = PyTuple::new_bound(py, [2i64]);
+                    sample = sample.call_method1("flip", (dims,))?;
+                }
+            }
+
+            if self.color_jitter_brightness > 0.0
+                || self.color_jitter_contrast > 0.0
+                || self.color_jitter_saturation > 0.0
+            {
+                sample = sample.call_method0("float")?;
+                sample = sample.call_method1("clamp", (0.0f32, 1.0f32))?;
+            }
+
+            if self.color_jitter_brightness > 0.0 {
+                let u = unit_f32(
+                    self.manifest_hash_seed,
+                    self.seed,
+                    *sample_id,
+                    11,
+                    self.epoch,
+                );
+                let factor = 1.0 + (u * 2.0 - 1.0) * self.color_jitter_brightness;
+                sample = sample
+                    .call_method1("mul", (factor,))?
+                    .call_method1("clamp", (0.0f32, 1.0f32))?;
+            }
+
+            if self.color_jitter_contrast > 0.0 {
+                let u = unit_f32(
+                    self.manifest_hash_seed,
+                    self.seed,
+                    *sample_id,
+                    12,
+                    self.epoch,
+                );
+                let factor = 1.0 + (u * 2.0 - 1.0) * self.color_jitter_contrast;
+                let mean = sample.call_method0("mean")?;
+                sample = sample
+                    .call_method1("sub", (mean.clone(),))?
+                    .call_method1("mul", (factor,))?
+                    .call_method1("add", (mean,))?
+                    .call_method1("clamp", (0.0f32, 1.0f32))?;
+            }
+
+            if self.color_jitter_saturation > 0.0 {
+                let u = unit_f32(
+                    self.manifest_hash_seed,
+                    self.seed,
+                    *sample_id,
+                    13,
+                    self.epoch,
+                );
+                let factor = 1.0 + (u * 2.0 - 1.0) * self.color_jitter_saturation;
+                let kwargs = PyDict::new_bound(py);
+                kwargs.set_item("dim", PyTuple::new_bound(py, [0i64]))?;
+                kwargs.set_item("keepdim", true)?;
+                let gray = sample.call_method("mean", (), Some(&kwargs))?;
+                sample = sample
+                    .call_method1("sub", (gray.clone(),))?
+                    .call_method1("mul", (factor,))?
+                    .call_method1("add", (gray,))?
+                    .call_method1("clamp", (0.0f32, 1.0f32))?;
+            }
+
+            out_samples.push(sample.to_object(py));
+        }
+
+        let xs_list = PyList::new_bound(py, out_samples);
+        let mut out = torch.getattr("stack")?.call1((xs_list, 0i64))?;
+        if let (Some(mean), Some(std)) = (self.normalize_mean, self.normalize_std) {
+            out = out.call_method0("float")?;
+            let dtype = out.getattr("dtype")?;
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("dtype", dtype)?;
+
+            let mean_values = PyList::new_bound(py, mean);
+            let std_values = PyList::new_bound(py, std);
+            let mean_t = torch
+                .call_method("tensor", (mean_values,), Some(&kwargs))?
+                .call_method1("view", (1i64, 3i64, 1i64, 1i64))?;
+            let std_t = torch
+                .call_method("tensor", (std_values,), Some(&kwargs))?
+                .call_method1("view", (1i64, 3i64, 1i64, 1i64))?;
+            out = out
+                .call_method1("sub", (mean_t,))?
+                .call_method1("div", (std_t,))?;
+        }
+        Ok(out)
+    }
+
     fn next_python_decode<'py>(
         &self,
         py: Python<'py>,
@@ -4327,6 +4965,7 @@ impl ImageLoader {
 
         let xs_list = PyList::new_bound(py, xs);
         let images = torch.getattr("stack")?.call1((xs_list, 0i64))?;
+        let images = self.apply_image_augmentations(py, &torch, images, &lease.batch.sample_ids)?;
         let labels = labels_to_torch_i64(py, labels)?;
         let out = PyTuple::new_bound(py, [images.to_object(py), labels.to_object(py)]);
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -4394,6 +5033,7 @@ impl ImageLoader {
         } else {
             images
         };
+        let images = self.apply_image_augmentations(py, &torch, images, &lease.batch.sample_ids)?;
 
         let labels = labels_to_torch_i64(py, labels)?;
         let out = PyTuple::new_bound(py, [images.to_object(py), labels.to_object(py)]);
@@ -4439,6 +5079,16 @@ impl ImageLoader {
         profile=None,
         autotune=None,
         resize_hw=None,
+        crop_hw=None,
+        horizontal_flip_p=0.0,
+        color_jitter_brightness=0.0,
+        color_jitter_contrast=0.0,
+        color_jitter_saturation=0.0,
+        color_jitter_hue=0.0,
+        normalize_mean=None,
+        normalize_std=None,
+        seed=0,
+        epoch=0,
         to_float=true,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -4461,6 +5111,16 @@ impl ImageLoader {
         profile: Option<String>,
         autotune: Option<bool>,
         resize_hw: Option<(u32, u32)>,
+        crop_hw: Option<(u32, u32)>,
+        horizontal_flip_p: f32,
+        color_jitter_brightness: f32,
+        color_jitter_contrast: f32,
+        color_jitter_saturation: f32,
+        color_jitter_hue: f32,
+        normalize_mean: Option<(f32, f32, f32)>,
+        normalize_std: Option<(f32, f32, f32)>,
+        seed: u64,
+        epoch: u64,
         to_float: bool,
     ) -> PyResult<Self> {
         let loader = DataLoader::new(
@@ -4514,9 +5174,23 @@ impl ImageLoader {
             rust_resize_backend = rust_resize_backend_name(rust_resize_backend),
             "vision decode backend selected"
         );
+        let normalize_mean = normalize_mean.map(|(r, g, b)| [r, g, b]);
+        let normalize_std = normalize_std.map(|(r, g, b)| [r, g, b]);
+        let manifest_hash_seed = stable_hash64(loader.manifest_hash.as_bytes());
         Ok(Self {
             loader: ImageLoaderInner::Local(loader),
             resize_hw,
+            crop_hw,
+            horizontal_flip_p,
+            color_jitter_brightness,
+            color_jitter_contrast,
+            color_jitter_saturation,
+            color_jitter_hue,
+            normalize_mean,
+            normalize_std,
+            seed,
+            epoch,
+            manifest_hash_seed,
             to_float,
             decode_backend,
             rust_jpeg_codec,
@@ -5455,6 +6129,290 @@ fn run<'py>(
 }
 
 #[pyfunction]
+#[pyo3(name = "text")]
+#[pyo3(signature = (
+    dataset_link,
+    *,
+    manifest_store=None,
+    manifest_path=None,
+    recursive=true,
+    batch_size_samples=32,
+    max_inflight_bytes=128*1024*1024,
+    max_queue_batches=64,
+    prefetch_batches=1,
+    target_batch_bytes=None,
+    max_batch_bytes=None,
+    start_id=None,
+    end_id=None,
+    resume_from=None,
+    job_id=None,
+    cluster_url=None,
+    node_id=None,
+    max_ram_gb=None,
+    profile=None,
+    autotune=None,
+    constraints=None,
+    runtime=None,
+    tokenizer="gpt2".to_string(),
+    sequence_length=2048,
+    stride=2048,
+    add_bos=false,
+    add_eos=true,
+    truncate="right".to_string(),
+    return_attention_mask=true,
+    decode_error_policy="error".to_string(),
+    autopack=false,
+    autopack_shard_mb=512,
+))]
+#[allow(clippy::too_many_arguments)]
+fn py_text(
+    py: Python<'_>,
+    dataset_link: String,
+    manifest_store: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    recursive: bool,
+    batch_size_samples: usize,
+    max_inflight_bytes: u64,
+    max_queue_batches: usize,
+    prefetch_batches: usize,
+    target_batch_bytes: Option<u64>,
+    max_batch_bytes: Option<u64>,
+    start_id: Option<u64>,
+    end_id: Option<u64>,
+    resume_from: Option<Vec<u8>>,
+    job_id: Option<String>,
+    cluster_url: Option<String>,
+    node_id: Option<String>,
+    max_ram_gb: Option<f64>,
+    profile: Option<String>,
+    autotune: Option<bool>,
+    constraints: Option<Py<Constraints>>,
+    runtime: Option<Py<RuntimeConfig>>,
+    tokenizer: String,
+    sequence_length: usize,
+    stride: usize,
+    add_bos: bool,
+    add_eos: bool,
+    truncate: String,
+    return_attention_mask: bool,
+    decode_error_policy: String,
+    autopack: bool,
+    autopack_shard_mb: u64,
+) -> PyResult<Py<TextLoader>> {
+    let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
+    if sequence_length == 0 {
+        return Err(PyValueError::new_err("sequence_length must be > 0"));
+    }
+    if stride == 0 {
+        return Err(PyValueError::new_err("stride must be > 0"));
+    }
+    let truncate_mode =
+        TextTruncateMode::parse(&truncate).map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let decode_policy = TextDecodeErrorPolicy::parse(&decode_error_policy)
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+
+    if autopack && dataset_link.starts_with("s3://") && !dataset_link.contains('@') {
+        maybe_autopack(py, &dataset_link, autopack_shard_mb)?;
+    }
+
+    let tokenizer = Arc::new(load_text_tokenizer(&tokenizer)?);
+    let bos_token_id = resolve_special_token_id(
+        tokenizer.as_ref(),
+        &[
+            "<|bos|>",
+            "<bos>",
+            "<s>",
+            "[BOS]",
+            "<|startoftext|>",
+            "<|endoftext|>",
+        ],
+    );
+    let eos_token_id = resolve_special_token_id(
+        tokenizer.as_ref(),
+        &["<|eos|>", "</s>", "<eos>", "[EOS]", "<|endoftext|>"],
+    );
+    if add_bos && bos_token_id.is_none() {
+        return Err(PyValueError::new_err(
+            "add_bos=True but tokenizer has no known BOS token id",
+        ));
+    }
+    if add_eos && eos_token_id.is_none() {
+        return Err(PyValueError::new_err(
+            "add_eos=True but tokenizer has no known EOS token id",
+        ));
+    }
+    let pad_token_id = text_pad_token_id(tokenizer.as_ref(), eos_token_id);
+
+    let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
+    let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
+    let selected_profile = AutotuneProfile::from_name(profile.as_deref());
+    let defaults = ProfileDefaults::for_profile(selected_profile);
+
+    let mut effective_max_inflight_bytes = defaults.max_inflight_bytes;
+    let mut effective_max_queue_batches = defaults.max_queue_batches;
+    let mut effective_prefetch_batches = defaults.prefetch_batches;
+    let mut effective_max_process_rss_bytes = env_u64("MX8_MAX_PROCESS_RSS_BYTES");
+    let max_ram_bytes_from_gb = max_ram_gb_to_bytes(max_ram_gb)?;
+
+    {
+        let _autotune_enabled = autotune.unwrap_or(true);
+
+        if let Some(runtime_cfg) = &runtime_cfg {
+            if let Some(prefetch) = runtime_cfg.prefetch_batches {
+                effective_prefetch_batches = prefetch.max(1);
+            }
+            if let Some(max_queue) = runtime_cfg.max_queue_batches {
+                effective_max_queue_batches = max_queue.max(1);
+            }
+        }
+
+        if let Some(constraints_cfg) = &constraints_cfg {
+            if let Some(max_inflight) = constraints_cfg.max_inflight_bytes {
+                effective_max_inflight_bytes = max_inflight.max(1);
+            }
+            if let Some(max_process) = constraints_cfg.max_process_rss_bytes {
+                effective_max_process_rss_bytes = Some(max_process.max(1));
+            }
+        }
+        if let Some(max_ram_bytes) = max_ram_bytes_from_gb {
+            if constraints_cfg
+                .as_ref()
+                .and_then(|c| c.max_process_rss_bytes)
+                .is_some()
+            {
+                return Err(PyValueError::new_err(
+                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                ));
+            }
+            effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
+        }
+
+        if effective_max_process_rss_bytes.is_none() {
+            effective_max_process_rss_bytes = derive_default_max_process_rss_bytes(
+                selected_profile,
+                effective_max_inflight_bytes,
+            );
+            if let Some(cap) = effective_max_process_rss_bytes {
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "rss_cap_defaulted",
+                    mode = "text",
+                    profile = profile_name(selected_profile),
+                    max_inflight_bytes = effective_max_inflight_bytes,
+                    max_process_rss_bytes = cap,
+                    "defaulted process RSS cap from profile and node memory limit"
+                );
+            }
+        }
+
+        if let Some(max_process) = effective_max_process_rss_bytes {
+            if effective_max_inflight_bytes > max_process {
+                effective_max_inflight_bytes = max_process;
+            }
+        }
+    }
+
+    if distributed_requested(cluster_url.as_deref()) {
+        if start_id.is_some() || end_id.is_some() {
+            return Err(PyValueError::new_err(
+                "start_id/end_id are unsupported in distributed mode",
+            ));
+        }
+        if autopack {
+            return Err(PyValueError::new_err(
+                "autopack is unsupported in distributed mode",
+            ));
+        }
+        if manifest_store.is_some() || manifest_path.is_some() {
+            return Err(PyValueError::new_err(
+                "manifest_store/manifest_path are unsupported in distributed mode; coordinator owns snapshot resolution",
+            ));
+        }
+        let coord_url = effective_cluster_url(cluster_url).ok_or_else(|| {
+            PyValueError::new_err(
+                "distributed mode requires cluster_url (or MX8_CLUSTER_URL / MX8_COORD_URL)",
+            )
+        })?;
+        let job_id = job_id.or_else(|| env_string("MX8_JOB_ID")).ok_or_else(|| {
+            PyValueError::new_err("distributed mode requires job_id (or MX8_JOB_ID)")
+        })?;
+        let rank = rank_from_env();
+        let node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
+        let distributed_loader = DistributedDataLoader::new(
+            py,
+            coord_url,
+            job_id,
+            node_id,
+            batch_size_samples,
+            effective_max_inflight_bytes,
+            effective_max_queue_batches,
+            effective_prefetch_batches,
+            target_batch_bytes,
+            max_batch_bytes,
+            1,
+            max_ram_gb,
+            profile.clone(),
+            autotune,
+            constraints,
+            runtime,
+            500,
+            DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+            resume_from,
+        )?;
+        let out = TextLoader {
+            loader: TextLoaderInner::Distributed(distributed_loader),
+            tokenizer,
+            sequence_length,
+            stride,
+            add_bos,
+            add_eos,
+            bos_token_id,
+            eos_token_id,
+            pad_token_id,
+            truncate: truncate_mode,
+            return_attention_mask,
+            decode_error_policy: decode_policy,
+        };
+        return Py::new(py, out);
+    }
+
+    let loader = DataLoader::new(
+        dataset_link,
+        manifest_store,
+        manifest_path,
+        recursive,
+        batch_size_samples,
+        effective_max_inflight_bytes,
+        effective_max_queue_batches,
+        effective_prefetch_batches,
+        target_batch_bytes,
+        max_batch_bytes,
+        effective_max_process_rss_bytes,
+        start_id,
+        end_id,
+        resume_from,
+        node_id,
+        profile,
+        autotune,
+    )?;
+    let out = TextLoader {
+        loader: TextLoaderInner::Local(loader),
+        tokenizer,
+        sequence_length,
+        stride,
+        add_bos,
+        add_eos,
+        bos_token_id,
+        eos_token_id,
+        pad_token_id,
+        truncate: truncate_mode,
+        return_attention_mask,
+        decode_error_policy: decode_policy,
+    };
+    Py::new(py, out)
+}
+
+#[pyfunction]
 #[pyo3(name = "image")]
 #[pyo3(signature = (
     dataset_link,
@@ -5479,7 +6437,18 @@ fn run<'py>(
     autotune=None,
     constraints=None,
     runtime=None,
+    augment=None,
     resize_hw=None,
+    crop_hw=None,
+    horizontal_flip_p=None,
+    color_jitter_brightness=None,
+    color_jitter_contrast=None,
+    color_jitter_saturation=None,
+    color_jitter_hue=None,
+    normalize_mean=None,
+    normalize_std=None,
+    seed=0,
+    epoch=0,
     to_float=true,
     autopack=false,
     autopack_shard_mb=512,
@@ -5508,7 +6477,18 @@ fn py_image(
     autotune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    augment: Option<String>,
     resize_hw: Option<(u32, u32)>,
+    crop_hw: Option<(u32, u32)>,
+    horizontal_flip_p: Option<f32>,
+    color_jitter_brightness: Option<f32>,
+    color_jitter_contrast: Option<f32>,
+    color_jitter_saturation: Option<f32>,
+    color_jitter_hue: Option<f32>,
+    normalize_mean: Option<(f32, f32, f32)>,
+    normalize_std: Option<(f32, f32, f32)>,
+    seed: u64,
+    epoch: u64,
     to_float: bool,
     autopack: bool,
     autopack_shard_mb: u64,
@@ -5523,6 +6503,120 @@ fn py_image(
     let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
     let selected_profile = AutotuneProfile::from_name(profile.as_deref());
     let defaults = ProfileDefaults::for_profile(selected_profile);
+    let mut resolved_resize_hw = resize_hw;
+    let mut resolved_crop_hw = crop_hw;
+    let mut resolved_horizontal_flip_p = horizontal_flip_p.unwrap_or(0.0);
+    let mut resolved_color_jitter_brightness = color_jitter_brightness.unwrap_or(0.0);
+    let mut resolved_color_jitter_contrast = color_jitter_contrast.unwrap_or(0.0);
+    let mut resolved_color_jitter_saturation = color_jitter_saturation.unwrap_or(0.0);
+    let mut resolved_color_jitter_hue = color_jitter_hue.unwrap_or(0.0);
+    let mut resolved_normalize_mean = normalize_mean.map(|(r, g, b)| [r, g, b]);
+    let mut resolved_normalize_std = normalize_std.map(|(r, g, b)| [r, g, b]);
+
+    if let Some(augment_name_raw) = augment.as_deref() {
+        let augment_name = augment_name_raw.trim().to_ascii_lowercase();
+        match augment_name.as_str() {
+            "imagenet" | "standard" => {
+                if resolved_resize_hw.is_none() {
+                    resolved_resize_hw = Some((256, 256));
+                }
+                if resolved_crop_hw.is_none() {
+                    resolved_crop_hw = Some((224, 224));
+                }
+                if horizontal_flip_p.is_none() {
+                    resolved_horizontal_flip_p = 0.5;
+                }
+                if color_jitter_brightness.is_none() {
+                    resolved_color_jitter_brightness = 0.4;
+                }
+                if color_jitter_contrast.is_none() {
+                    resolved_color_jitter_contrast = 0.4;
+                }
+                if color_jitter_saturation.is_none() {
+                    resolved_color_jitter_saturation = 0.4;
+                }
+                if color_jitter_hue.is_none() {
+                    resolved_color_jitter_hue = 0.0;
+                }
+                if resolved_normalize_mean.is_none() {
+                    resolved_normalize_mean = Some([0.485, 0.456, 0.406]);
+                }
+                if resolved_normalize_std.is_none() {
+                    resolved_normalize_std = Some([0.229, 0.224, 0.225]);
+                }
+            }
+            "" => {
+                return Err(PyValueError::new_err(
+                    "augment must be non-empty when provided",
+                ));
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported augment={augment_name_raw:?} (expected: imagenet|standard)"
+                )));
+            }
+        }
+    }
+
+    if let Some((crop_h, crop_w)) = resolved_crop_hw {
+        if crop_h == 0 || crop_w == 0 {
+            return Err(PyValueError::new_err("crop_hw must be positive"));
+        }
+        if let Some((resize_h, resize_w)) = resolved_resize_hw {
+            if crop_h > resize_h || crop_w > resize_w {
+                return Err(PyValueError::new_err(format!(
+                    "crop_hw {:?} exceeds resize_hw {:?}",
+                    (crop_h, crop_w),
+                    (resize_h, resize_w)
+                )));
+            }
+        }
+    }
+    if !resolved_horizontal_flip_p.is_finite() || !(0.0..=1.0).contains(&resolved_horizontal_flip_p)
+    {
+        return Err(PyValueError::new_err(format!(
+            "horizontal_flip_p must be in [0, 1], got {}",
+            resolved_horizontal_flip_p
+        )));
+    }
+    for (name, value) in [
+        ("color_jitter_brightness", resolved_color_jitter_brightness),
+        ("color_jitter_contrast", resolved_color_jitter_contrast),
+        ("color_jitter_saturation", resolved_color_jitter_saturation),
+        ("color_jitter_hue", resolved_color_jitter_hue),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "{name} must be finite and >= 0, got {value}"
+            )));
+        }
+    }
+    if resolved_color_jitter_hue > 0.0 {
+        return Err(PyValueError::new_err(
+            "color_jitter_hue > 0 is not supported yet (set color_jitter_hue=0.0)",
+        ));
+    }
+    if resolved_normalize_mean.is_some() ^ resolved_normalize_std.is_some() {
+        return Err(PyValueError::new_err(
+            "normalize_mean and normalize_std must be provided together",
+        ));
+    }
+    if let (Some(mean), Some(std)) = (resolved_normalize_mean, resolved_normalize_std) {
+        for (idx, m) in mean.iter().enumerate() {
+            if !m.is_finite() {
+                return Err(PyValueError::new_err(format!(
+                    "normalize_mean[{idx}] must be finite"
+                )));
+            }
+        }
+        for (idx, s) in std.iter().enumerate() {
+            if !s.is_finite() || *s <= 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "normalize_std[{idx}] must be finite and > 0"
+                )));
+            }
+        }
+    }
 
     let mut effective_max_inflight_bytes = defaults.max_inflight_bytes;
     let mut effective_max_queue_batches = defaults.max_queue_batches;
@@ -5653,9 +6747,21 @@ fn py_image(
         } else {
             None
         };
+        let manifest_hash_seed = stable_hash64(distributed_loader.manifest_hash().as_bytes());
         let out = ImageLoader {
             loader: ImageLoaderInner::Distributed(distributed_loader),
-            resize_hw,
+            resize_hw: resolved_resize_hw,
+            crop_hw: resolved_crop_hw,
+            horizontal_flip_p: resolved_horizontal_flip_p,
+            color_jitter_brightness: resolved_color_jitter_brightness,
+            color_jitter_contrast: resolved_color_jitter_contrast,
+            color_jitter_saturation: resolved_color_jitter_saturation,
+            color_jitter_hue: resolved_color_jitter_hue,
+            normalize_mean: resolved_normalize_mean,
+            normalize_std: resolved_normalize_std,
+            seed,
+            epoch,
+            manifest_hash_seed,
             to_float,
             decode_backend,
             rust_jpeg_codec,
@@ -5685,7 +6791,17 @@ fn py_image(
         node_id,
         profile,
         autotune,
-        resize_hw,
+        resolved_resize_hw,
+        resolved_crop_hw,
+        resolved_horizontal_flip_p,
+        resolved_color_jitter_brightness,
+        resolved_color_jitter_contrast,
+        resolved_color_jitter_saturation,
+        resolved_color_jitter_hue,
+        resolved_normalize_mean.map(|v| (v[0], v[1], v[2])),
+        resolved_normalize_std.map(|v| (v[0], v[1], v[2])),
+        seed,
+        epoch,
         to_float,
     )?;
     Py::new(py, loader)
@@ -6622,6 +7738,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.setattr("_internal", &internal)?;
 
     m.add_class::<DataLoader>()?;
+    m.add_class::<TextLoader>()?;
     m.add_class::<ImageLoader>()?;
     m.add_class::<MixedDataLoader>()?;
     m.add_class::<VideoDataLoader>()?;
@@ -6630,10 +7747,12 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Constraints>()?;
     m.add_class::<RuntimeConfig>()?;
     m.add_class::<PyBatch>()?;
+    m.add_class::<TextBatch>()?;
     m.add_function(wrap_pyfunction!(pack, m)?)?;
     m.add_function(wrap_pyfunction!(pack_dir, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(py_text, m)?)?;
     m.add_function(wrap_pyfunction!(py_image, m)?)?;
     m.add_function(wrap_pyfunction!(video, m)?)?;
     m.add_function(wrap_pyfunction!(mix, m)?)?;
@@ -8759,5 +9878,31 @@ mod mix_scheduler_tests {
         let epoch0 = run(77, 0);
         let epoch1 = run(77, 1);
         assert_ne!(epoch0, epoch1);
+    }
+}
+
+#[cfg(test)]
+mod image_aug_tests {
+    use super::{stable_hash64, unit_f32};
+
+    #[test]
+    fn image_aug_rng_is_deterministic_for_fixed_inputs() {
+        let manifest = stable_hash64(b"manifest-abc");
+        let a = unit_f32(manifest, 7, 42, 3, 0);
+        let b = unit_f32(manifest, 7, 42, 3, 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn image_aug_rng_changes_with_epoch() {
+        let manifest = stable_hash64(b"manifest-abc");
+        let epoch0 = unit_f32(manifest, 7, 42, 3, 0);
+        let epoch1 = unit_f32(manifest, 7, 42, 3, 1);
+        assert_ne!(epoch0, epoch1);
+    }
+
+    #[test]
+    fn stable_hash64_is_stable() {
+        assert_eq!(stable_hash64(b"mx8"), 0x07ba8b1917254288);
     }
 }

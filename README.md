@@ -52,7 +52,18 @@ import mx8
 loader = mx8.load("s3://bucket/data/", batch_size_samples=512, max_ram_gb=24)
 
 # image
-loader = mx8.image("s3://bucket/images/", batch_size_samples=64, resize_hw=(224, 224), max_ram_gb=24)
+loader = mx8.image(
+    "s3://bucket/images/",
+    batch_size_samples=64,
+    resize_hw=(256, 256),
+    augment="imagenet",
+    seed=17,
+    epoch=0,
+    max_ram_gb=24,
+)
+
+# text
+loader = mx8.text("s3://bucket/corpus/", tokenizer="gpt2", sequence_length=2048, batch_size_samples=32, max_ram_gb=24)
 
 # video
 loader = mx8.video("s3://bucket/videos/", clip_len=16, stride=8, fps=8, batch_size_samples=32, max_ram_gb=24)
@@ -108,4 +119,5 @@ pip install mx8 pillow numpy torch
 cargo build --workspace
 cargo test --workspace
 ./scripts/prod_readiness.sh
+./scripts/azure_gate.sh
 ```
