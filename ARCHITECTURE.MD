@@ -174,6 +174,13 @@ Image augmentation contract (v1.8):
 - Augment RNG is deterministic per sample using `(manifest_hash, seed, epoch, sample_id)`.
 - Determinism must not bypass bounded-memory/backpressure constraints.
 
+Audio decode contract (v1.8):
+- Supported decode formats are `WAV` and `FLAC`.
+- Output is fixed-shape mono audio (`channels=1`) with `sample_count` frames per row.
+- Samples shorter than `sample_count` are zero-padded; longer samples are truncated.
+- `decode_error_policy` controls bad sample handling: `error` fails fast, `skip` drops invalid rows.
+- Optional `sample_rate_hz` enforces a strict decoded-rate check before emission.
+
 ## Default Lease + Membership Policies (v1.8)
 - Membership: dynamic registration + barrier to `world_size=N`, then freeze for the run.
   - Rank assignment: stable rule (sort by `node_id`) unless explicit ranks are provided.

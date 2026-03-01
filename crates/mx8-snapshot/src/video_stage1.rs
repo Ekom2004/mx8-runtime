@@ -261,8 +261,8 @@ pub fn parse_video_stage1_tsv(bytes: &[u8]) -> Result<Vec<VideoClipRecord>, Vide
 
     let mut records = Vec::new();
     for (line_no, raw) in lines.enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();

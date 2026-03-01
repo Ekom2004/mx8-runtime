@@ -334,6 +334,51 @@ Augmentation order is fixed and deterministic: `decode -> resize -> crop -> flip
 Gate commands for the image loader: `./scripts/image_aug_gate.sh`, `./scripts/py_local_image_pillow_gate.sh`, and `./scripts/py_minio_image_pillow_gate.sh`.
 
 
+## Audio loader
+
+`mx8.audio` decodes audio samples in Rust and emits fixed-shape mono tensors for model input.
+
+```python
+import mx8
+
+loader = mx8.audio(
+    "s3://bucket/audio@refresh",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    sample_rate_hz=16000,
+    decode_error_policy="error",
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    samples = batch.samples                  # [B, sample_count] float32
+    sample_rates_hz = batch.sample_rates_hz  # [B] int64
+    sample_ids = batch.sample_ids            # [B] int64
+```
+
+Audio loader arguments:
+
+`sample_count` — fixed output frame count per emitted row. Short clips are zero-padded; long clips are truncated.
+
+`channels` — output channels. v1.8 supports `channels=1` only (mono output).
+
+`sample_rate_hz` — optional strict sample-rate check. When set, samples with mismatched decoded rates follow `decode_error_policy`.
+
+`decode_error_policy` — decode failure handling (`"error"` default, `"skip"` optional).
+
+`job_id`, `cluster_url`, `resume_from` — same distributed/restore contract as `mx8.load`.
+
+`loader.checkpoint()` returns an opaque token compatible with `mx8.audio(..., resume_from=token)`.
+
+Supported formats in v1.8: WAV and FLAC.
+
+`loader.stats()` for the audio loader includes decode fields (`audio_sample_count`, `audio_channels`, `audio_expected_sample_rate_hz`, `audio_decode_samples_total`, `audio_decode_failures_total`, `audio_decoded_frames_total`) plus shared pipeline counters.
+
+Gate command for the audio loader: `./scripts/audio_gate.sh`.
+
+
 ## Video loader
 
 `mx8.video` delivers decoded video clips with bounded decode and runtime rails.
@@ -379,7 +424,7 @@ Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./script
 
 ## Distributed loader
 
-Distributed attach is built into `mx8.load` and `mx8.image` directly, and into `mx8.mix` via distributed source loaders. `mx8.video` supports deterministic rank/world sharding with the same attach arguments.
+Distributed attach is built into `mx8.load`, `mx8.text`, `mx8.image`, and `mx8.audio` directly, and into `mx8.mix` via distributed source loaders. `mx8.video` supports deterministic rank/world sharding with the same attach arguments.
 
 ```python
 import mx8

@@ -41,7 +41,7 @@ for batch in loader:
 - Zero-manifest loading from raw S3 prefixes.
 - Deterministic replay via pinned `manifest_hash`.
 - Recovery-oriented distributed lease model.
-- Image, video, and mix loaders under one API family.
+- Text, image, audio, video, and mix loaders under one API family.
 
 ## API At A Glance
 
@@ -64,6 +64,17 @@ loader = mx8.image(
 
 # text
 loader = mx8.text("s3://bucket/corpus/", tokenizer="gpt2", sequence_length=2048, batch_size_samples=32, max_ram_gb=24)
+
+# audio
+loader = mx8.audio(
+    "s3://bucket/audio/",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    sample_rate_hz=16000,
+    decode_error_policy="error",
+    max_ram_gb=24,
+)
 
 # video
 loader = mx8.video("s3://bucket/videos/", clip_len=16, stride=8, fps=8, batch_size_samples=32, max_ram_gb=24)

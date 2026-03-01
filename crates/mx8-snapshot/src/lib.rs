@@ -456,8 +456,8 @@ fn parse_canonical_manifest_tsv_bytes(
 
     let mut records: Vec<ManifestRecord> = Vec::new();
     for (line_no, raw) in lines.enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
@@ -1897,6 +1897,19 @@ fn manifest_record_tsv_line(r: &ManifestRecord) -> String {
 mod tests {
     use super::*;
     use mx8_manifest_store::fs::FsManifestStore;
+
+    #[test]
+    fn canonical_manifest_parser_accepts_empty_decode_hint_column() -> anyhow::Result<()> {
+        let bytes = format!(
+            "schema_version={}\n0\ts3://bucket/a\t\t\t\n",
+            MANIFEST_SCHEMA_VERSION
+        );
+        let (records, canonical) = parse_canonical_manifest_tsv_bytes(bytes.as_bytes())?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decode_hint, None);
+        assert_eq!(canonical, canonicalize_manifest_bytes(&records));
+        Ok(())
+    }
 
     #[test]
     fn canonical_hash_is_deterministic() -> anyhow::Result<()> {
