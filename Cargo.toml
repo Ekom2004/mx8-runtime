@@ -22,7 +22,7 @@ anyhow = "1"
 futures = "0.3"
 aws-config = "1"
 aws-sdk-s3 = "1"
-google-cloud-storage = "0.22"
+google-cloud-storage = { version = "0.22", default-features = false, features = ["auth", "rustls-tls"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 prost = "0.12"
@@ -35,3 +35,6 @@ tonic = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pyo3 = { version = "0.21", features = ["abi3-py38"] }
+
+[patch.crates-io]
+hf-hub = { path = "patches/hf-hub" }
