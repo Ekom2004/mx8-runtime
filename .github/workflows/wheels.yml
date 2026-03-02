@@ -16,10 +16,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
+            manylinux: auto
           - os: ubuntu-latest
             target: aarch64
+            manylinux: "2_28"
           - os: macos-14
             target: universal2
+            manylinux: auto
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +42,7 @@ jobs:
           command: build
           args: --release --out dist --manifest-path crates/mx8-py/Cargo.toml
           target: ${{ matrix.target }}
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux }}
           before-script-linux: |
             set -euxo pipefail
             if command -v dnf >/dev/null 2>&1; then
