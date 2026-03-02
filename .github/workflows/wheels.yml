@@ -38,6 +38,16 @@ jobs:
           args: --release --out dist --manifest-path crates/mx8-py/Cargo.toml
           target: ${{ matrix.target }}
           manylinux: auto
+          before-script-linux: |
+            set -euxo pipefail
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y openssl-devel pkgconfig
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y openssl-devel pkgconfig
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y libssl-dev pkg-config
+            fi
       - name: Install test (import)
         if: matrix.target == 'x86_64' || matrix.target == 'universal2'
         run: |
