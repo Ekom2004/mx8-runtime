@@ -122,6 +122,7 @@ pip install mx8 pillow numpy torch
 | [Autotune](docs/v1_autotune_api_contract.md) | Startup/runtime autotune contract |
 | [Mix API](docs/mix_v17_contract.md) | Multi-dataset blending |
 | [Production Runbook](docs/prod_runbook.md) | Incident handling |
+| [Design Partner Onboarding](docs/design_partner_onboarding_checklist.md) | Partner launch readiness checklist |
 | [CLI Reference](docs/cli_reference.md) | `mx8-pack-s3`, `mx8-snapshot-resolve` |
 
 ## Development

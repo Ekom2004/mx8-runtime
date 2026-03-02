@@ -972,6 +972,7 @@ impl Pipeline {
                 let ranges = ranges.clone();
                 let s3_client = s3_client.clone();
                 let gcs_client = gcs_client.clone();
+                #[allow(clippy::clone_on_copy)]
                 let azure_client = azure_client.clone();
                 let http_client = http_client.clone();
 

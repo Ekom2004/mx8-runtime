@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+#![allow(unexpected_cfgs)]
 
-pub mod pipeline;
 #[cfg(feature = "gcs")]
 pub mod gcs;
+pub mod pipeline;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod sink;
