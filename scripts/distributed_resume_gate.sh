@@ -50,6 +50,12 @@ BLOCK_SIZE="${MX8_DEV_BLOCK_SIZE:-${BATCH_SIZE_SAMPLES}}"
 PHASE1_BATCHES="${MX8_PHASE1_BATCHES:-8}"
 WORLD_SIZE=1
 JOB_ID="${MX8_JOB_ID:-m5-distributed-resume-gate}"
+COORD_HA_ENABLE="${MX8_COORD_HA_ENABLE:-false}"
+COORD_STATE_STORE_ENABLE="${MX8_COORD_STATE_STORE_ENABLE:-false}"
+COORD_HA_LEASE_PATH="${TMP_ROOT}/coordinator_ha.leader_lease"
+COORD_STATE_STORE_PATH_BASE="${TMP_ROOT}/coordinator_state"
+COORD_START_SEQ=0
+COORD_LEADER_ID=""
 
 TOTAL_BYTES="$(( TOTAL_SAMPLES * BYTES_PER_SAMPLE ))"
 truncate -s "${TOTAL_BYTES}" "${DATA_FILE}"
@@ -72,6 +78,10 @@ COORD_URL="http://127.0.0.1:${COORD_PORT}"
 
 start_coordinator() {
   local coord_log="$1"
+  local state_store_path=""
+  COORD_START_SEQ=$((COORD_START_SEQ + 1))
+  COORD_LEADER_ID="mx8-distributed-resume-gate-${COORD_START_SEQ}"
+  state_store_path="${COORD_STATE_STORE_PATH_BASE}-${COORD_START_SEQ}.json"
   MX8_COORD_BIND_ADDR="127.0.0.1:${COORD_PORT}" \
   MX8_WORLD_SIZE="${WORLD_SIZE}" \
   MX8_MIN_WORLD_SIZE="${WORLD_SIZE}" \
@@ -83,9 +93,14 @@ start_coordinator() {
   MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
   MX8_DEV_BLOCK_SIZE="${BLOCK_SIZE}" \
   MX8_LEASE_LOG_PATH=none \
+  MX8_COORD_HA_ENABLE="${COORD_HA_ENABLE}" \
+  MX8_COORD_HA_LEASE_PATH="${COORD_HA_LEASE_PATH}" \
+  MX8_COORD_HA_LEADER_ID="${COORD_LEADER_ID}" \
+  MX8_COORD_STATE_STORE_ENABLE="${COORD_STATE_STORE_ENABLE}" \
+  MX8_COORD_STATE_STORE_PATH="${state_store_path}" \
   MX8_METRICS_SNAPSHOT_INTERVAL_MS=0 \
   target/debug/mx8-coordinator --world-size "${WORLD_SIZE}" --min-world-size "${WORLD_SIZE}" >"${coord_log}" 2>&1 &
-  echo "$!"
+  COORD_PID="$!"
 }
 
 wait_coordinator_ready() {
@@ -110,6 +125,36 @@ wait_coordinator_ready() {
   return 1
 }
 
+wait_coordinator_leader() {
+  local pid="$1"
+  local coord_log="$2"
+  local expected_leader_id="$3"
+  local tries=300
+  for ((i=0; i<tries; i++)); do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      echo "[mx8] coordinator exited before write-leader acquisition (pid=${pid})" >&2
+      echo "[mx8] coordinator log (${coord_log}):" >&2
+      tail -n 200 "${coord_log}" >&2 || true
+      return 1
+    fi
+
+    local observed_leader_id=""
+    observed_leader_id="$(awk -F= '/^leader_id=/{print $2; exit}' "${COORD_HA_LEASE_PATH}" 2>/dev/null || true)"
+    if [[ "${observed_leader_id}" == "${expected_leader_id}" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[mx8] coordinator did not become write leader in time (pid=${pid}, expected_leader_id=${expected_leader_id})" >&2
+  if [[ -f "${COORD_HA_LEASE_PATH}" ]]; then
+    echo "[mx8] current lease file (${COORD_HA_LEASE_PATH}):" >&2
+    tail -n 20 "${COORD_HA_LEASE_PATH}" >&2 || true
+  fi
+  echo "[mx8] coordinator log (${coord_log}):" >&2
+  tail -n 200 "${coord_log}" >&2 || true
+  return 1
+}
+
 stop_coordinator() {
   local pid="$1"
   local sig="${2:-TERM}"
@@ -122,8 +167,11 @@ trap '[[ -n "${COORD_PID}" ]] && stop_coordinator "${COORD_PID}" TERM || true; r
 
 COORD_LOG1="${TMP_ROOT}/coordinator_phase1.log"
 echo "[mx8] starting coordinator phase1 (url=${COORD_URL})"
-COORD_PID="$(start_coordinator "${COORD_LOG1}")"
+start_coordinator "${COORD_LOG1}"
 wait_coordinator_ready "${COORD_PID}" "${COORD_LOG1}"
+if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+  wait_coordinator_leader "${COORD_PID}" "${COORD_LOG1}" "${COORD_LEADER_ID}"
+fi
 
 echo "[mx8] capture checkpoint token"
 MX8_COORD_URL="${COORD_URL}" \
@@ -145,8 +193,11 @@ COORD_PID=""
 
 COORD_LOG2="${TMP_ROOT}/coordinator_phase2.log"
 echo "[mx8] restart coordinator phase2"
-COORD_PID="$(start_coordinator "${COORD_LOG2}")"
+start_coordinator "${COORD_LOG2}"
 wait_coordinator_ready "${COORD_PID}" "${COORD_LOG2}"
+if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+  wait_coordinator_leader "${COORD_PID}" "${COORD_LOG2}" "${COORD_LEADER_ID}"
+fi
 
 echo "[mx8] resume from checkpoint token"
 MX8_COORD_URL="${COORD_URL}" \

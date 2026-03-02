@@ -70,9 +70,19 @@ PY
 COORD_URL="http://127.0.0.1:${COORD_PORT}"
 WORLD_SIZE="${WORLD_SIZE:-2}"
 JOB_ID="${MX8_JOB_ID:-m5-ddp-demo}"
+COORD_HA_ENABLE="${MX8_COORD_HA_ENABLE:-false}"
+COORD_STATE_STORE_ENABLE="${MX8_COORD_STATE_STORE_ENABLE:-false}"
+COORD_HA_LEASE_PATH="${TMP_ROOT}/coordinator_ha.leader_lease"
+COORD_STATE_STORE_PATH_BASE="${TMP_ROOT}/coordinator_state"
+COORD_START_SEQ=0
+COORD_LEADER_ID=""
 
 start_coordinator() {
   local coord_log="$1"
+  local state_store_path=""
+  COORD_START_SEQ=$((COORD_START_SEQ + 1))
+  COORD_LEADER_ID="mx8-torch-ddp-gate-${COORD_START_SEQ}"
+  state_store_path="${COORD_STATE_STORE_PATH_BASE}-${COORD_START_SEQ}.json"
   MX8_COORD_BIND_ADDR="127.0.0.1:${COORD_PORT}" \
   MX8_WORLD_SIZE="${WORLD_SIZE}" \
   MX8_SHUFFLE="${MX8_SHUFFLE:-true}" \
@@ -82,9 +92,15 @@ start_coordinator() {
   MX8_MANIFEST_STORE_ROOT="${STORE_ROOT}" \
   MX8_DEV_MANIFEST_PATH="${DEV_MANIFEST}" \
   MX8_DEV_BLOCK_SIZE="${MX8_DEV_BLOCK_SIZE:-1000}" \
+  MX8_LEASE_LOG_PATH=none \
+  MX8_COORD_HA_ENABLE="${COORD_HA_ENABLE}" \
+  MX8_COORD_HA_LEASE_PATH="${COORD_HA_LEASE_PATH}" \
+  MX8_COORD_HA_LEADER_ID="${COORD_LEADER_ID}" \
+  MX8_COORD_STATE_STORE_ENABLE="${COORD_STATE_STORE_ENABLE}" \
+  MX8_COORD_STATE_STORE_PATH="${state_store_path}" \
   MX8_METRICS_SNAPSHOT_INTERVAL_MS=0 \
   target/debug/mx8-coordinator --world-size "${WORLD_SIZE}" >"${coord_log}" 2>&1 &
-  echo "$!"
+  COORD_PID="$!"
 }
 
 wait_coordinator_ready() {
@@ -104,6 +120,36 @@ wait_coordinator_ready() {
     sleep 0.1
   done
   echo "[mx8] coordinator not ready on 127.0.0.1:${COORD_PORT} (pid=${pid})" >&2
+  echo "[mx8] coordinator log (${coord_log}):" >&2
+  tail -n 200 "${coord_log}" >&2 || true
+  return 1
+}
+
+wait_coordinator_leader() {
+  local pid="$1"
+  local coord_log="$2"
+  local expected_leader_id="$3"
+  local tries=300
+  for ((i=0; i<tries; i++)); do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      echo "[mx8] coordinator exited before write-leader acquisition (pid=${pid})" >&2
+      echo "[mx8] coordinator log (${coord_log}):" >&2
+      tail -n 200 "${coord_log}" >&2 || true
+      return 1
+    fi
+
+    local observed_leader_id=""
+    observed_leader_id="$(awk -F= '/^leader_id=/{print $2; exit}' "${COORD_HA_LEASE_PATH}" 2>/dev/null || true)"
+    if [[ "${observed_leader_id}" == "${expected_leader_id}" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "[mx8] coordinator did not become write leader in time (pid=${pid}, expected_leader_id=${expected_leader_id})" >&2
+  if [[ -f "${COORD_HA_LEASE_PATH}" ]]; then
+    echo "[mx8] current lease file (${COORD_HA_LEASE_PATH}):" >&2
+    tail -n 20 "${COORD_HA_LEASE_PATH}" >&2 || true
+  fi
   echo "[mx8] coordinator log (${coord_log}):" >&2
   tail -n 200 "${coord_log}" >&2 || true
   return 1
@@ -129,8 +175,11 @@ echo "[mx8] maturin develop"
 
 COORD_LOG="${TMP_ROOT}/coordinator.log"
 echo "[mx8] starting coordinator (world_size=${WORLD_SIZE}, url=${COORD_URL})"
-COORD_PID="$(start_coordinator "${COORD_LOG}")"
+start_coordinator "${COORD_LOG}"
 wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+  wait_coordinator_leader "${COORD_PID}" "${COORD_LOG}" "${COORD_LEADER_ID}"
+fi
 
 echo "[mx8] running ddp demo (local spawn)"
 MX8_COORD_URL="${COORD_URL}" \
@@ -146,8 +195,11 @@ COORD_PID=""
 if [[ "${MX8_TORCH_DDP_NODUPES:-0}" == "1" ]]; then
   COORD_LOG="${TMP_ROOT}/coordinator_nodupes.log"
   echo "[mx8] starting coordinator (nodupes, world_size=${WORLD_SIZE}, url=${COORD_URL})"
-  COORD_PID="$(start_coordinator "${COORD_LOG}")"
+  start_coordinator "${COORD_LOG}"
   wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+  if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+    wait_coordinator_leader "${COORD_PID}" "${COORD_LOG}" "${COORD_LEADER_ID}"
+  fi
   echo "[mx8] running ddp nodupes gate (local spawn)"
   MX8_COORD_URL="${COORD_URL}" \
   MX8_JOB_ID="${MX8_JOB_ID_NODUPES:-m5-ddp-nodupes}" \
@@ -179,8 +231,11 @@ if [[ "${MX8_TORCH_DDP_AUTOTUNE_AB:-0}" == "1" ]]; then
     local out_log="${TMP_ROOT}/ddp_autotune_ab_${mode}.log"
 
     echo "[mx8] starting coordinator (autotune_ab mode=${mode})" >&2
-    COORD_PID="$(start_coordinator "${coord_log}")"
+    start_coordinator "${coord_log}"
     wait_coordinator_ready "${COORD_PID}" "${coord_log}"
+    if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+      wait_coordinator_leader "${COORD_PID}" "${coord_log}" "${COORD_LEADER_ID}"
+    fi
 
     MX8_COORD_URL="${COORD_URL}" \
     MX8_JOB_ID="${MX8_JOB_ID_AUTOTUNE_AB:-m5-ddp-autotune-ab}-${mode}" \
@@ -256,8 +311,11 @@ if [[ "${MX8_TORCH_DDP_DETERMINISM:-0}" == "1" ]]; then
     local out_log="${TMP_ROOT}/ddp_nodupes_${tag}.log"
 
     echo "[mx8] starting coordinator (determinism tag=${tag}, epoch=${epoch})" >&2
-    MX8_EPOCH="${epoch}" COORD_PID="$(start_coordinator "${coord_log}")"
+    MX8_EPOCH="${epoch}" start_coordinator "${coord_log}"
     wait_coordinator_ready "${COORD_PID}" "${coord_log}"
+    if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+      wait_coordinator_leader "${COORD_PID}" "${coord_log}" "${COORD_LEADER_ID}"
+    fi
     MX8_COORD_URL="${COORD_URL}" \
     MX8_JOB_ID="${MX8_JOB_ID_DETERMINISM:-m5-ddp-determinism}" \
     WORLD_SIZE="${WORLD_SIZE}" \
@@ -321,8 +379,11 @@ if [[ "${MX8_TORCH_DDP_RESTART:-0}" == "1" ]]; then
     local out_log="${TMP_ROOT}/ddp_restart_nodupes_${tag}.log"
 
     echo "[mx8] starting coordinator (restart tag=${tag}, epoch=0)" >&2
-    MX8_EPOCH=0 COORD_PID="$(start_coordinator "${coord_log}")"
+    MX8_EPOCH=0 start_coordinator "${coord_log}"
     wait_coordinator_ready "${COORD_PID}" "${coord_log}"
+    if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+      wait_coordinator_leader "${COORD_PID}" "${coord_log}" "${COORD_LEADER_ID}"
+    fi
 
     MX8_COORD_URL="${COORD_URL}" \
     MX8_JOB_ID="${MX8_JOB_ID_RESTART:-m5-ddp-restart}" \
@@ -349,8 +410,11 @@ if [[ "${MX8_TORCH_DDP_RESTART:-0}" == "1" ]]; then
   CKPT_PATH="${TMP_ROOT}/ckpt.pt"
   COORD_LOG="${TMP_ROOT}/coordinator_restart_crash.log"
   echo "[mx8] starting coordinator (restart crash run, epoch=0)" >&2
-  MX8_EPOCH=0 COORD_PID="$(start_coordinator "${COORD_LOG}")"
+  MX8_EPOCH=0 start_coordinator "${COORD_LOG}"
   wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+  if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+    wait_coordinator_leader "${COORD_PID}" "${COORD_LOG}" "${COORD_LEADER_ID}"
+  fi
 
   echo "[mx8] running crash train (expect DDP failure; checkpoint should exist)" >&2
   set +e
@@ -390,8 +454,11 @@ if [[ "${MX8_TORCH_DDP_RESTART:-0}" == "1" ]]; then
 
   COORD_LOG="${TMP_ROOT}/coordinator_restart_load.log"
   echo "[mx8] starting coordinator (restart load run, epoch=0)" >&2
-  MX8_EPOCH=0 COORD_PID="$(start_coordinator "${COORD_LOG}")"
+  MX8_EPOCH=0 start_coordinator "${COORD_LOG}"
   wait_coordinator_ready "${COORD_PID}" "${COORD_LOG}"
+  if [[ "${COORD_HA_ENABLE}" == "true" ]]; then
+    wait_coordinator_leader "${COORD_PID}" "${COORD_LOG}" "${COORD_LEADER_ID}"
+  fi
 
   echo "[mx8] running load-from-checkpoint train (should succeed)" >&2
   MX8_COORD_URL="${COORD_URL}" \

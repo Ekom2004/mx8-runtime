@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import mx8
@@ -68,6 +69,22 @@ def _new_loader(
     )
 
 
+def _completed_sample_count_from_token(token: bytes) -> int:
+    total = 0
+    for raw in token.decode("utf-8").splitlines():
+        line = raw.strip()
+        if not line.startswith("C "):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        start = int(parts[1])
+        end = int(parts[2])
+        if end > start:
+            total += end - start
+    return total
+
+
 def _capture(args: argparse.Namespace) -> None:
     loader = _new_loader(
         coord_url=args.coord_url,
@@ -84,9 +101,24 @@ def _capture(args: argparse.Namespace) -> None:
             raise SystemExit("capture produced zero samples")
         if len(set(seen)) != len(seen):
             raise SystemExit("capture observed duplicate sample ids")
-        token = bytes(loader.checkpoint())
-        if not token:
-            raise SystemExit("capture checkpoint token is empty")
+        # Checkpoint tokens encode only fully completed ranges (no partial range cursor).
+        # In-flight progress RPCs can lag briefly, so wait for token coverage to catch up.
+        deadline = time.monotonic() + max(2.0, (args.progress_interval_ms / 1000.0) * 20.0)
+        sleep_s = max(0.02, min(0.2, args.progress_interval_ms / 1000.0))
+        token = b""
+        covered = 0
+        while True:
+            token = bytes(loader.checkpoint())
+            if not token:
+                raise SystemExit("capture checkpoint token is empty")
+            covered = _completed_sample_count_from_token(token)
+            if covered >= len(seen):
+                break
+            if time.monotonic() >= deadline:
+                raise SystemExit(
+                    f"checkpoint coverage lagged behind consumed samples: covered={covered} seen={len(seen)}"
+                )
+            time.sleep(sleep_s)
     finally:
         loader.close()
 
@@ -98,11 +130,25 @@ def _capture(args: argparse.Namespace) -> None:
 
 def _resume(args: argparse.Namespace) -> None:
     token = Path(args.token_path).read_bytes()
+    token_covered = _completed_sample_count_from_token(token)
+    if token_covered <= 0:
+        raise SystemExit("resume token must cover at least one sample")
+    if token_covered > args.total_samples:
+        raise SystemExit(
+            f"resume token covers more samples than dataset: covered={token_covered} total={args.total_samples}"
+        )
+
     seen_phase1 = json.loads(Path(args.seen_path).read_text(encoding="utf-8"))["seen_ids"]
     seen_phase1 = [int(v) for v in seen_phase1]
     phase1_set = set(seen_phase1)
     if len(phase1_set) != len(seen_phase1):
         raise SystemExit("phase1 snapshot contains duplicates")
+
+    checkpoint_set = set(range(token_covered))
+    if not phase1_set.issubset(checkpoint_set):
+        raise SystemExit(
+            f"phase1 observed ids beyond checkpoint boundary: max_phase1={max(phase1_set)} covered={token_covered}"
+        )
 
     loader = _new_loader(
         coord_url=args.coord_url,
@@ -114,9 +160,9 @@ def _resume(args: argparse.Namespace) -> None:
         resume_from=token,
     )
     try:
-        expected_remaining = args.total_samples - len(phase1_set)
-        if expected_remaining <= 0:
-            raise SystemExit("phase1 already covers total samples; invalid gate config")
+        expected_remaining = args.total_samples - token_covered
+        if expected_remaining < 0:
+            raise SystemExit("invalid resume config: token covers past total samples")
         seen_phase2 = _consume_until(loader, expected_remaining, args.max_batches)
     finally:
         loader.close()
@@ -129,12 +175,12 @@ def _resume(args: argparse.Namespace) -> None:
     phase2_set = set(seen_phase2)
     if len(phase2_set) != len(seen_phase2):
         raise SystemExit("phase2 observed duplicate sample ids")
-    overlap = phase1_set.intersection(phase2_set)
+    overlap = checkpoint_set.intersection(phase2_set)
     if overlap:
         first = min(overlap)
-        raise SystemExit(f"resume overlap detected at sample_id={first}")
+        raise SystemExit(f"resume overlap with checkpoint boundary at sample_id={first}")
 
-    union = phase1_set.union(phase2_set)
+    union = checkpoint_set.union(phase2_set)
     if len(union) != args.total_samples:
         raise SystemExit(
             f"resume coverage mismatch: expected={args.total_samples} got={len(union)}"
@@ -143,6 +189,7 @@ def _resume(args: argparse.Namespace) -> None:
         raise SystemExit("resume sample-id bounds mismatch")
 
     print("phase1_ids:", len(seen_phase1))
+    print("checkpoint_ids:", token_covered)
     print("phase2_ids:", len(seen_phase2))
     print("union_ids:", len(union))
     print("overlap_ids:", len(overlap))
