@@ -10,6 +10,8 @@ jobs:
   build:
     name: build (${{ matrix.os }}, ${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # Keep experimental targets visible without blocking required release artifacts.
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
@@ -17,12 +19,15 @@ jobs:
           - os: ubuntu-latest
             target: x86_64
             manylinux: auto
+            experimental: false
           - os: ubuntu-latest
             target: aarch64
             manylinux: "2_28"
+            experimental: true
           - os: macos-14
             target: universal2
             manylinux: auto
+            experimental: false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
