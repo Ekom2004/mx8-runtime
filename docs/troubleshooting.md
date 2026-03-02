@@ -48,6 +48,45 @@ scripts/demo2_minio_scale.sh
 If you see `Cannot connect to the Docker daemon`, Docker is not running. Start Docker Desktop or the Docker daemon, then rerun the MinIO gate or script.
 
 
+## GitHub Actions `aarch64` wheel build fails with Docker exit code 1
+
+If the `wheels` workflow fails on `build (ubuntu-latest, aarch64)` with:
+
+```text
+💥 maturin failed
+Error: The process '/usr/bin/docker' failed with exit code 1
+```
+
+check for these known signatures in the job logs:
+
+- `ring` / `aws-lc-sys` assembler failures like `ARM assembler must define __ARM_ARCH`
+- `openssl-sys` failure like `fatal error: openssl/opensslv.h: No such file or directory`
+
+This incident happened on March 2, 2026 and had two separate causes:
+
+1. `manylinux2014-cross:aarch64` used an old cross compiler path that broke ARM assembly for `ring`/`aws-lc-sys`.
+2. Transitive `native-tls` pulled in `openssl-sys`, which requires target OpenSSL headers unavailable in the cross build path.
+
+Use this fix checklist:
+
+1. In `.github/workflows/wheels.yml`, set `aarch64` wheels to `manylinux: "2_28"` (not `auto`/`2014`).
+2. Keep Linux TLS deps on rustls-only paths:
+   - `google-cloud-storage = { default-features = false, features = ["auth", "rustls-tls"] }`
+   - patch `hf-hub` to avoid `native-tls` and use rustls-backed `reqwest`/`ureq`.
+3. Confirm OpenSSL is gone from the dependency graph:
+
+```bash
+cargo tree --target all -i openssl-sys
+cargo tree --target all -i native-tls
+```
+
+Both commands should report no matching package.
+
+4. Re-run the `wheels` workflow (`workflow_dispatch`) and verify:
+   - `build (ubuntu-latest, aarch64)` is `success`
+   - `build (ubuntu-latest, x86_64)` remains `success`
+
+
 ## TrustStore native roots panic during MinIO smoke
 
 You may see a panic from `aws-smithy-http-client` in local debug builds:
