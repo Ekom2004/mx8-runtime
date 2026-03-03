@@ -112,4 +112,4 @@ When changing a `stable` surface:
 ## Current Known Inconsistency to Resolve
 
 - Repo-level version labeling is not yet fully aligned across all top-level docs.
-- Run `DOC-201` from `docs/documentation_backlog.md` to normalize all version markers.
+- Normalize version markers across README and contract docs in the next docs pass.

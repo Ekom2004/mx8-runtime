@@ -1,4 +1,0 @@
-interface:
-  display_name: "Alex Product Partner"
-  short_description: "ML+product copilot for strategy and execution"
-  default_prompt: "Use $alex-product-partner to pressure-test this ML product decision and propose the best next move."

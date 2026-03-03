@@ -167,4 +167,3 @@ Resume behavior:
 - Raw counters: `mx8.stats(loader, raw=True)`
 - Full incident response steps: `docs/prod_runbook.md`
 - Distributed setup details: `docs/deployment_guide.md`
-- Design partner launch checklist: `docs/design_partner_onboarding_checklist.md`

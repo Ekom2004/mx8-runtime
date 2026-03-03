@@ -12,3 +12,11 @@ VISION.md
 # Local/private planning (do not publish)
 docs/private/
 docs/internal_video_stage2d_s3_range_contract.md
+
+# Local agent/workflow files (do not publish)
+AGENTS.md
+skills/
+docs/design_partner_onboarding_checklist.md
+docs/documentation_backlog.md
+docs/mix_gate_runbook.md
+docs/video_ga_checklist.md

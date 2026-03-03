@@ -52,4 +52,4 @@ All sources share one inflight cap. The effective shared cap is `min(source_caps
 
 ## Validation gates
 
-Run `./scripts/mix_gate.sh` to verify determinism, ratio accuracy, memory bounds, and exhaustion behavior. For stricter ratio tolerance, run `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`. For multi-rank no-overlap verification, run `./scripts/mix_multirank_gate.sh`. See `docs/mix_gate_runbook.md` for the full gate runbook.
+Run `./scripts/mix_gate.sh` to verify determinism, ratio accuracy, memory bounds, and exhaustion behavior. For stricter ratio tolerance, run `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`. For multi-rank no-overlap verification, run `./scripts/mix_multirank_gate.sh`.
