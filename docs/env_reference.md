@@ -100,7 +100,7 @@ Current inventory size: `264` variables.
 | `MX8_VIDEO_STAGE1_INDEX` | `false` | snapshot video indexing | bool (`1/true/yes/on`) | experimental |
 | `MX8_VIDEO_STAGE1_DISABLE_FFPROBE` | `false` | snapshot video indexing | bool (`1/true/yes/on`) | experimental |
 | `MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE` | `51200` | snapshot video indexing | integer >= 1 | experimental |
-| `MX8_VIDEO_DECODE_BACKEND` | `cli` | Python video loader | `cli|ffi` | experimental |
+| `MX8_VIDEO_DECODE_BACKEND` | `cli` | Python video loader | `cli|auto|ffi|nvdec|nvidia` | experimental |
 | `MX8_FFMPEG_BIN` | `ffmpeg` | Python video decode path | executable path | experimental |
 | `MX8_VIDEO_STAGE2D_MAX_RANGES` | `8` | Python video range planner | integer >= 1 | experimental |
 | `MX8_VIDEO_STAGE2D_MERGE_GAP_BYTES` | `0` | Python video range planner | integer >= 0 | experimental |

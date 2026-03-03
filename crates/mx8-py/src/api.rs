@@ -1930,6 +1930,7 @@ pub(crate) fn video(
             decode_failed_missing_stream: 0,
             decode_failed_backend_unavailable: 0,
             decode_failed_decode_failed: 0,
+            decode_backend_fallback_total: 0,
             decode_ms_total: 0,
             s3_range_requests_total: 0,
             s3_range_bytes_fetched_total: 0,

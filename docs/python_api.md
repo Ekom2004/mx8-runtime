@@ -442,11 +442,26 @@ Each batch includes `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offs
 
 The loader rejects invalid cap combinations at init — specifically when `batch_size_samples * bytes_per_clip > max_inflight_bytes`. Runtime autotune is enabled by default and adapts `max_inflight_bytes` within safe bounds. Pass `autotune=False` to disable.
 
-The default decode backend uses a local `ffmpeg` CLI. Override the binary path with `MX8_FFMPEG_BIN`. To use the native FFI path, set `MX8_VIDEO_DECODE_BACKEND=ffi` and build with `RUSTFLAGS="--cfg mx8_video_ffi"`. If the FFI path is requested but not compiled, MX8 falls back to CLI and emits a `video_decode_backend_fallback` proof event.
+The default decode backend uses a local `ffmpeg` CLI. Override the binary path with `MX8_FFMPEG_BIN`.
 
-`loader.stats()` for the video loader includes decode contract fields (`video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_clip_bytes`), backend selection (`video_decode_backend`), decode counters (`video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_total`, `video_decode_ms_total`), and autotune counters (`video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`).
+`MX8_VIDEO_DECODE_BACKEND` accepts `cli|auto|ffi|nvdec|nvidia` (`nvidia` is an alias of `nvdec`).
 
-Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, and `./scripts/video_ga_gate.sh`.
+Build-time flags:
+
+- FFI: `RUSTFLAGS="--cfg mx8_video_ffi"`
+- NVDEC: `RUSTFLAGS="--cfg mx8_video_nvdec"`
+
+Fallback behavior is fail-open:
+
+- `ffi` falls back to `cli` on any backend error.
+- `nvdec` falls back to `ffi`, then `cli` on any backend error.
+- `auto` tries `nvdec -> ffi -> cli`.
+
+Each fallback emits a `video_decode_backend_fallback` proof event.
+
+`loader.stats()` for the video loader includes decode contract fields (`video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_clip_bytes`), backend selection (`video_decode_backend`), fallback counters (`video_decode_backend_fallback_total`), decode counters (`video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_total`, `video_decode_ms_total`), and autotune counters (`video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`).
+
+Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, `./scripts/video_nvdec_fallback_gate.sh`, and `./scripts/video_ga_gate.sh`.
 
 
 ## Distributed loader

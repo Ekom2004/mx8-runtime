@@ -48,6 +48,7 @@ pub(crate) struct VideoDataLoader {
     pub(crate) decode_failed_missing_stream: u64,
     pub(crate) decode_failed_backend_unavailable: u64,
     pub(crate) decode_failed_decode_failed: u64,
+    pub(crate) decode_backend_fallback_total: u64,
     pub(crate) decode_ms_total: u64,
     pub(crate) s3_range_requests_total: u64,
     pub(crate) s3_range_bytes_fetched_total: u64,
@@ -596,29 +597,117 @@ impl VideoDataLoader {
         ))
     }
 
-    fn decode_clip_from_path(
+    #[cfg(mx8_video_nvdec)]
+    fn decode_clip_from_path_nvdec(
         &self,
+        path: &std::path::Path,
+        _start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        Err(Self::decode_error(
+            path,
+            "decode_backend_unavailable",
+            "nvdec backend is not implemented in this build",
+        ))
+    }
+
+    #[cfg(not(mx8_video_nvdec))]
+    fn decode_clip_from_path_nvdec(
+        &self,
+        path: &std::path::Path,
+        _start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        Err(Self::decode_error(
+            path,
+            "decode_backend_unavailable",
+            "nvdec backend not compiled (rebuild with RUSTFLAGS='--cfg mx8_video_nvdec')",
+        ))
+    }
+
+    fn decode_clip_with_backend(
+        &self,
+        backend: VideoDecodeBackend,
+        path: &std::path::Path,
+        start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        match backend {
+            VideoDecodeBackend::Cli => self.decode_clip_from_path_cli(path, start_seconds),
+            VideoDecodeBackend::Ffi => self.decode_clip_from_path_ffi(path, start_seconds),
+            VideoDecodeBackend::Nvdec => self.decode_clip_from_path_nvdec(path, start_seconds),
+            VideoDecodeBackend::Auto => Err(Self::decode_error(
+                path,
+                "decode_failed",
+                "auto backend must be resolved via fallback chain",
+            )),
+        }
+    }
+
+    fn decode_clip_with_fallback_chain(
+        &mut self,
+        path: &std::path::Path,
+        start_seconds: f64,
+        backends: &[VideoDecodeBackend],
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        for (idx, backend) in backends.iter().enumerate() {
+            match self.decode_clip_with_backend(*backend, path, start_seconds) {
+                Ok(v) => return Ok(v),
+                Err(err) => {
+                    if let Some(next_backend) = backends.get(idx + 1).copied() {
+                        self.decode_backend_fallback_total =
+                            self.decode_backend_fallback_total.saturating_add(1);
+                        tracing::warn!(
+                            target: "mx8_proof",
+                            event = "video_decode_backend_fallback",
+                            from_backend = video_decode_backend_name(*backend),
+                            to_backend = video_decode_backend_name(next_backend),
+                            fallback_total = self.decode_backend_fallback_total,
+                            class = err.class,
+                            path = %path.display(),
+                            detail = %err.detail,
+                            "video decode backend failed; falling back"
+                        );
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(Self::decode_error(
+            path,
+            "decode_failed",
+            "empty decode backend fallback chain",
+        ))
+    }
+
+    fn decode_clip_from_path(
+        &mut self,
         path: &std::path::Path,
         start_seconds: f64,
     ) -> Result<Vec<u8>, VideoDecodeError> {
         match self.decode_backend {
             VideoDecodeBackend::Cli => self.decode_clip_from_path_cli(path, start_seconds),
-            VideoDecodeBackend::Ffi => match self.decode_clip_from_path_ffi(path, start_seconds) {
-                Ok(v) => Ok(v),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "mx8_proof",
-                        event = "video_decode_backend_fallback",
-                        from_backend = "ffi",
-                        to_backend = "cli",
-                        class = err.class,
-                        path = %path.display(),
-                        detail = %err.detail,
-                        "ffi decode failed; falling back to cli backend"
-                    );
-                    self.decode_clip_from_path_cli(path, start_seconds)
-                }
-            },
+            VideoDecodeBackend::Ffi => self.decode_clip_with_fallback_chain(
+                path,
+                start_seconds,
+                &[VideoDecodeBackend::Ffi, VideoDecodeBackend::Cli],
+            ),
+            VideoDecodeBackend::Nvdec => self.decode_clip_with_fallback_chain(
+                path,
+                start_seconds,
+                &[
+                    VideoDecodeBackend::Nvdec,
+                    VideoDecodeBackend::Ffi,
+                    VideoDecodeBackend::Cli,
+                ],
+            ),
+            VideoDecodeBackend::Auto => self.decode_clip_with_fallback_chain(
+                path,
+                start_seconds,
+                &[
+                    VideoDecodeBackend::Nvdec,
+                    VideoDecodeBackend::Ffi,
+                    VideoDecodeBackend::Cli,
+                ],
+            ),
         }
     }
 
@@ -1403,6 +1492,10 @@ impl VideoDataLoader {
         out.set_item(
             "video_decode_failed_decode_failed_total",
             self.decode_failed_decode_failed,
+        )?;
+        out.set_item(
+            "video_decode_backend_fallback_total",
+            self.decode_backend_fallback_total,
         )?;
         let decode_failed_total = self.decode_failed_total();
         out.set_item("video_decode_failed_total", decode_failed_total)?;

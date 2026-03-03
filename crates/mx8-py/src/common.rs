@@ -19,8 +19,10 @@ pub(crate) const DATA_CHECKPOINT_EPOCH: u32 = 0;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum VideoDecodeBackend {
+    Auto,
     Cli,
     Ffi,
+    Nvdec,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,17 +187,21 @@ pub(crate) fn video_decode_backend_from_env() -> PyResult<VideoDecodeBackend> {
     let v = raw.trim().to_ascii_lowercase();
     match v.as_str() {
         "" | "cli" | "ffmpeg" => Ok(VideoDecodeBackend::Cli),
+        "auto" => Ok(VideoDecodeBackend::Auto),
         "ffi" | "ffmpeg_next" => Ok(VideoDecodeBackend::Ffi),
+        "nvdec" | "nvidia" => Ok(VideoDecodeBackend::Nvdec),
         _ => Err(PyValueError::new_err(format!(
-            "invalid MX8_VIDEO_DECODE_BACKEND={raw:?} (expected: cli|ffi)"
+            "invalid MX8_VIDEO_DECODE_BACKEND={raw:?} (expected: cli|auto|ffi|nvdec|nvidia)"
         ))),
     }
 }
 
 pub(crate) fn video_decode_backend_name(backend: VideoDecodeBackend) -> &'static str {
     match backend {
+        VideoDecodeBackend::Auto => "auto",
         VideoDecodeBackend::Cli => "cli",
         VideoDecodeBackend::Ffi => "ffi",
+        VideoDecodeBackend::Nvdec => "nvdec",
     }
 }
 

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mx8_video_ffi)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mx8_video_ffi)', 'cfg(mx8_video_nvdec)'] }
 
 [lib]
 name = "mx8"
