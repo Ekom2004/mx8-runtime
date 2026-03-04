@@ -270,9 +270,13 @@ impl VideoDataLoader {
         let mut gpu_ratio_available = false;
         if gpu_backend_selected {
             let now = Instant::now();
-            let should_sample_gpu = self.video_last_gpu_sample_at.is_none_or(|last| {
-                now.saturating_duration_since(last) >= Self::VIDEO_GPU_PRESSURE_MIN_SAMPLE_INTERVAL
-            });
+            let should_sample_gpu = match self.video_last_gpu_sample_at {
+                None => true,
+                Some(last) => {
+                    now.saturating_duration_since(last)
+                        >= Self::VIDEO_GPU_PRESSURE_MIN_SAMPLE_INTERVAL
+                }
+            };
             if should_sample_gpu {
                 self.video_last_gpu_sample_at = Some(now);
                 match Self::sample_gpu_pressure_ratio() {
