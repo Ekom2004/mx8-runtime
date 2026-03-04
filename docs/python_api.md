@@ -453,6 +453,7 @@ Build-time flags:
 
 Current NVDEC path uses FFmpeg CUDA hwaccel flags (`-hwaccel cuda`). It requires an FFmpeg build with CUDA/NVIDIA decode support on the host.
 When `nvdec`/`auto` is selected, video runtime autotune samples GPU memory pressure from `nvidia-smi` (override binary with `MX8_NVIDIA_SMI_BIN`).
+Sampling is rate-limited to once every 2 seconds minimum and reuses the latest cached value between samples.
 
 Fallback behavior is fail-open:
 

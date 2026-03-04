@@ -64,6 +64,7 @@ Current implementation path:
 - FFmpeg CLI with CUDA hwaccel flags (`-hwaccel cuda`, `-hwaccel_output_format cuda`) under `mx8_video_nvdec` builds.
 - If CUDA/NVIDIA support is unavailable on the host FFmpeg/runtime, backend fails open to `ffi`/`cli`.
 - GPU pressure is sampled from `nvidia-smi` (override path via `MX8_NVIDIA_SMI_BIN`), with deterministic gate override via `MX8_VIDEO_GPU_PRESSURE_RATIO`.
+- Sampling is rate-limited to at most one `nvidia-smi` query every 2 seconds; autotune ticks between samples reuse the cached value.
 
 ## Autotune Design (Dual Pressure)
 

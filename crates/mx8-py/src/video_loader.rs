@@ -62,8 +62,10 @@ pub(crate) struct VideoDataLoader {
     pub(crate) video_runtime_autotune_gpu_clamps_total: u64,
     pub(crate) video_runtime_autotune_pressure_milli: u64,
     pub(crate) video_gpu_pressure_milli: u64,
+    pub(crate) video_gpu_pressure_available: bool,
     pub(crate) video_gpu_pressure_unavailable_total: u64,
     pub(crate) video_gpu_recovery_streak: u64,
+    pub(crate) video_last_gpu_sample_at: Option<Instant>,
     pub(crate) video_max_process_rss_bytes: Option<u64>,
     pub(crate) assigned_rank: u32,
     pub(crate) world_size: u32,
@@ -169,6 +171,9 @@ impl VideoBatch {
 }
 
 impl VideoDataLoader {
+    const VIDEO_GPU_PRESSURE_MIN_SAMPLE_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(2);
+
     fn decode_failed_total(&self) -> u64 {
         self.decode_failed_io_read_failed
             .saturating_add(self.decode_failed_corrupt_media)
@@ -264,36 +269,50 @@ impl VideoDataLoader {
         let mut gpu_ratio = 0.0f64;
         let mut gpu_ratio_available = false;
         if gpu_backend_selected {
-            match Self::sample_gpu_pressure_ratio() {
-                Ok(ratio) => {
-                    gpu_ratio = ratio;
-                    gpu_ratio_available = true;
-                    self.video_gpu_pressure_milli = (ratio * 1000.0).round() as u64;
-                    if ratio < 0.80 {
-                        self.video_gpu_recovery_streak =
-                            self.video_gpu_recovery_streak.saturating_add(1);
-                    } else {
+            let now = Instant::now();
+            let should_sample_gpu = self.video_last_gpu_sample_at.is_none_or(|last| {
+                now.saturating_duration_since(last) >= Self::VIDEO_GPU_PRESSURE_MIN_SAMPLE_INTERVAL
+            });
+            if should_sample_gpu {
+                self.video_last_gpu_sample_at = Some(now);
+                match Self::sample_gpu_pressure_ratio() {
+                    Ok(ratio) => {
+                        gpu_ratio = ratio;
+                        gpu_ratio_available = true;
+                        self.video_gpu_pressure_milli = (ratio * 1000.0).round() as u64;
+                        self.video_gpu_pressure_available = true;
+                        if ratio < 0.80 {
+                            self.video_gpu_recovery_streak =
+                                self.video_gpu_recovery_streak.saturating_add(1);
+                        } else {
+                            self.video_gpu_recovery_streak = 0;
+                        }
+                    }
+                    Err(err) => {
+                        self.video_gpu_pressure_unavailable_total =
+                            self.video_gpu_pressure_unavailable_total.saturating_add(1);
+                        self.video_gpu_pressure_milli = 0;
+                        self.video_gpu_pressure_available = false;
                         self.video_gpu_recovery_streak = 0;
+                        tracing::warn!(
+                            target: "mx8_proof",
+                            event = "video_gpu_pressure_unavailable",
+                            decode_backend = video_decode_backend_name(self.decode_backend),
+                            unavailable_total = self.video_gpu_pressure_unavailable_total,
+                            detail = %err,
+                            "gpu pressure signal unavailable for video autotune"
+                        );
                     }
                 }
-                Err(err) => {
-                    self.video_gpu_pressure_unavailable_total =
-                        self.video_gpu_pressure_unavailable_total.saturating_add(1);
-                    self.video_gpu_pressure_milli = 0;
-                    self.video_gpu_recovery_streak = 0;
-                    tracing::warn!(
-                        target: "mx8_proof",
-                        event = "video_gpu_pressure_unavailable",
-                        decode_backend = video_decode_backend_name(self.decode_backend),
-                        unavailable_total = self.video_gpu_pressure_unavailable_total,
-                        detail = %err,
-                        "gpu pressure signal unavailable for video autotune"
-                    );
-                }
+            } else {
+                gpu_ratio_available = self.video_gpu_pressure_available;
+                gpu_ratio = self.video_gpu_pressure_milli as f64 / 1000.0;
             }
         } else {
             self.video_gpu_pressure_milli = 0;
+            self.video_gpu_pressure_available = false;
             self.video_gpu_recovery_streak = 0;
+            self.video_last_gpu_sample_at = None;
         }
         let mut pressure = rss_ratio.max(inflight_ratio);
         if gpu_ratio_available {
