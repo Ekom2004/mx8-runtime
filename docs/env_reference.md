@@ -13,7 +13,7 @@ Generation command:
 rg -o --no-filename "MX8_[A-Z0-9_]+" crates scripts | sort -u
 ```
 
-Current inventory size: `271` variables.
+Current inventory size: `274` variables.
 
 ## Stability Classes
 
@@ -101,6 +101,9 @@ Current inventory size: `271` variables.
 | `MX8_VIDEO_STAGE1_DISABLE_FFPROBE` | `false` | snapshot video indexing | bool (`1/true/yes/on`) | experimental |
 | `MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE` | `51200` | snapshot video indexing | integer >= 1 | experimental |
 | `MX8_VIDEO_DECODE_BACKEND` | `cli` | Python video loader | `cli|auto|ffi|nvdec|nvidia` | experimental |
+| `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT` | `false` | Python video loader (`batch.to_torch`) | bool (`1/true/yes/on`) | experimental |
+| `MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE` | `false` | Python video loader (`batch.to_torch`) | bool (`1/true/yes/on`) | experimental |
+| `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT_ENFORCE_STREAM` | `true` | Python video loader (`batch.to_torch`) | bool (`1/true/yes/on`) | experimental |
 | `MX8_FFMPEG_BIN` | `ffmpeg` | Python video decode path | executable path | experimental |
 | `MX8_NVIDIA_SMI_BIN` | `nvidia-smi` | Python video GPU pressure sampling | executable path | experimental |
 | `MX8_VIDEO_STAGE2D_MAX_RANGES` | `8` | Python video range planner | integer >= 1 | experimental |
@@ -352,6 +355,10 @@ MX8_TUI_SEARCH
 MX8_TUI_STALE_HEARTBEAT_MS
 MX8_VIDEO_AUTOTUNE_PERIOD_BATCHES
 MX8_VIDEO_DECODE_BACKEND
+MX8_VIDEO_DEVICE_OUTPUT_TMP_ROOT
+MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE
+MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT
+MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT_ENFORCE_STREAM
 MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE
 MX8_VIDEO_STAGE1_DISABLE_FFPROBE
 MX8_VIDEO_STAGE1_INDEX

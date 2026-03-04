@@ -22,6 +22,12 @@ Out of scope (M8.1):
 - New Python API surface for device-native video batches.
 - Cross-vendor GPU decode (handled in follow-up milestones).
 
+Zero-copy follow-up starts with a spike gate (no production contract change):
+
+- `./scripts/zero_copy_from_blob_spike.sh`
+- This validates `torch::from_blob` CUDA-pointer custom deleter timing across multiple CUDA streams before any API/implementation commitment.
+- Full fix-first implementation plan is in `docs/zero_copy_v2_fix_first.md` (Phases 1-4).
+
 ## Backend Model
 
 `MX8_VIDEO_DECODE_BACKEND` supports:
@@ -65,6 +71,8 @@ Current implementation path:
 - If CUDA/NVIDIA support is unavailable on the host FFmpeg/runtime, backend fails open to `ffi`/`cli`.
 - GPU pressure is sampled from `nvidia-smi` (override path via `MX8_NVIDIA_SMI_BIN`), with deterministic gate override via `MX8_VIDEO_GPU_PRESSURE_RATIO`.
 - Sampling is rate-limited to at most one `nvidia-smi` query every 2 seconds; autotune ticks between samples reuse the cached value.
+- Experimental v2 scaffolding: `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT=1` makes `VideoBatch.to_torch()` allocate Torch-owned CUDA output and use explicit stream plumbing (`current_stream`, non-blocking copy, `record_stream`) with fail-open CPU fallback on runtime write/stream errors.
+- `MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE=1` enables a direct-write staged-copy scaffold mode that emits destination-contract observability and stream-bound write attempts while native decode-to-destination integration is being wired.
 
 ## Autotune Design (Dual Pressure)
 

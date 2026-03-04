@@ -16,6 +16,8 @@ pub(crate) struct VideoBatch {
     stride_h: u64,
     stride_w: u64,
     stride_c: u64,
+    experimental_device_output_active: bool,
+    experimental_device_direct_write_active: bool,
 }
 
 #[pyclass]
@@ -61,6 +63,13 @@ pub(crate) struct VideoDataLoader {
     pub(crate) video_runtime_autotune_adjustments_total: u64,
     pub(crate) video_runtime_autotune_gpu_clamps_total: u64,
     pub(crate) video_runtime_autotune_pressure_milli: u64,
+    pub(crate) video_experimental_device_output_requested: bool,
+    pub(crate) video_experimental_device_output_active: bool,
+    pub(crate) video_experimental_device_output_fallback_total: u64,
+    pub(crate) video_experimental_device_direct_write_requested: bool,
+    pub(crate) video_experimental_device_direct_write_active: bool,
+    pub(crate) video_experimental_device_direct_write_fallback_total: u64,
+    pub(crate) video_experimental_device_direct_write_batches_total: u64,
     pub(crate) video_gpu_pressure_milli: u64,
     pub(crate) video_gpu_pressure_available: bool,
     pub(crate) video_gpu_pressure_unavailable_total: u64,
@@ -167,6 +176,158 @@ impl VideoBatch {
             py,
             [self.stride_t, self.stride_h, self.stride_w, self.stride_c],
         ))
+    }
+
+    fn to_torch<'py>(&self, py: Python<'py>) -> PyResult<TorchBatch3<'py>> {
+        let torch = py.import_bound("torch").map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "failed to import torch (install PyTorch to use video to_torch): {e}"
+            ))
+        })?;
+        let torch_uint8 = torch.getattr("uint8")?;
+        let torch_int64 = torch.getattr("int64")?;
+
+        let payload = PyByteArray::new_bound(py, &self.payload);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_uint8)?;
+        let payload_u8 = torch.call_method("frombuffer", (payload,), Some(&kwargs))?;
+
+        let rows = i64::try_from(self.sample_ids.len())
+            .map_err(|_| PyValueError::new_err("video batch rows do not fit i64"))?;
+        let frames = i64::from(self.frames_per_clip);
+        let height = i64::from(self.frame_height);
+        let width = i64::from(self.frame_width);
+        let channels = i64::from(self.channels);
+        let payload_view =
+            payload_u8.call_method1("view", (rows, frames, height, width, channels))?;
+
+        let payload_out = if self.experimental_device_output_active {
+            let cuda_attempt = (|| -> PyResult<Bound<'py, PyAny>> {
+                let cuda = torch.getattr("cuda")?;
+                let stream = cuda.call_method0("current_stream")?;
+                let stream_id = stream.getattr("cuda_stream")?.extract::<u64>()?;
+
+                let kwargs = PyDict::new_bound(py);
+                kwargs.set_item("dtype", &torch_uint8)?;
+                kwargs.set_item("device", "cuda")?;
+                let cuda_payload = torch.call_method(
+                    "empty",
+                    ((rows, frames, height, width, channels),),
+                    Some(&kwargs),
+                )?;
+
+                let shape = cuda_payload.getattr("shape")?;
+                let strides = cuda_payload.getattr("stride")?;
+                let data_ptr = cuda_payload.call_method0("data_ptr")?.extract::<u64>()?;
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "video_experimental_device_destination_contract",
+                    mode = if self.experimental_device_direct_write_active {
+                        "direct_write_scaffold"
+                    } else {
+                        "device_output"
+                    },
+                    stream_id = stream_id,
+                    data_ptr = data_ptr,
+                    shape = %shape.str()?,
+                    strides = %strides.str()?,
+                    bytes = self.payload.len() as u64,
+                    "prepared torch-owned cuda destination tensor contract for video payload"
+                );
+
+                if self.experimental_device_direct_write_active {
+                    tracing::info!(
+                        target: "mx8_proof",
+                        event = "video_experimental_device_direct_write_attempt",
+                        mode = "staged_copy_scaffold",
+                        stream_id = stream_id,
+                        bytes = self.payload.len() as u64,
+                        "attempting experimental direct-write scaffold into cuda destination tensor"
+                    );
+                }
+
+                let copy_kwargs = PyDict::new_bound(py);
+                copy_kwargs.set_item("non_blocking", true)?;
+                cuda_payload.call_method("copy_", (payload_view.clone(),), Some(&copy_kwargs))?;
+                if let Err(err) = cuda_payload.call_method1("record_stream", (stream.clone(),)) {
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "video_experimental_device_output_record_stream_failed",
+                        detail = %err,
+                        "record_stream failed for video experimental device output"
+                    );
+                }
+
+                if env_bool("MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT_ENFORCE_STREAM", true) {
+                    let post_stream_id = cuda
+                        .call_method0("current_stream")?
+                        .getattr("cuda_stream")?
+                        .extract::<u64>()?;
+                    if post_stream_id != stream_id {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "video device output stream changed during write (before={stream_id} after={post_stream_id})"
+                        )));
+                    }
+                }
+
+                tracing::info!(
+                    target: "mx8_proof",
+                    event = "video_experimental_device_output_write",
+                    mode = if self.experimental_device_direct_write_active {
+                        "direct_write_staged_copy_scaffold"
+                    } else {
+                        "torch_copy_scaffold"
+                    },
+                    stream_id = stream_id,
+                    data_ptr = data_ptr,
+                    bytes = self.payload.len() as u64,
+                    "video experimental device output wrote payload into torch-owned cuda tensor"
+                );
+                Ok(cuda_payload)
+            })();
+            match cuda_attempt {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "video_experimental_device_output_runtime_fallback",
+                        detail = %err,
+                        "video experimental device output runtime write failed; falling back to cpu tensor"
+                    );
+                    payload_view
+                }
+            }
+        } else {
+            payload_view
+        };
+
+        let mut offsets_i64 = Vec::with_capacity(self.offsets.len());
+        for &off in self.offsets.iter() {
+            offsets_i64.push(i64::try_from(off).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "offset overflow converting u64 -> i64 (offset={off})"
+                ))
+            })?);
+        }
+        let offsets_list = PyList::new_bound(py, offsets_i64);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        let offsets_i64 = torch.call_method("tensor", (offsets_list,), Some(&kwargs))?;
+
+        let mut sample_ids_i64 = Vec::with_capacity(self.sample_ids.len());
+        for &sid in self.sample_ids.iter() {
+            sample_ids_i64.push(i64::try_from(sid).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "sample_id overflow converting u64 -> i64 (sample_id={sid})"
+                ))
+            })?);
+        }
+        let ids_list = PyList::new_bound(py, sample_ids_i64);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("dtype", &torch_int64)?;
+        let sample_ids_i64 = torch.call_method("tensor", (ids_list,), Some(&kwargs))?;
+
+        Ok((payload_out, offsets_i64, sample_ids_i64))
     }
 }
 
@@ -1560,6 +1721,25 @@ impl VideoDataLoader {
             .delivered_samples
             .saturating_add(sample_ids.len() as u64);
         self.delivered_bytes = self.delivered_bytes.saturating_add(payload_bytes);
+        if self.video_experimental_device_output_requested
+            && !self.video_experimental_device_output_active
+        {
+            self.video_experimental_device_output_fallback_total = self
+                .video_experimental_device_output_fallback_total
+                .saturating_add(1);
+        }
+        if self.video_experimental_device_direct_write_requested
+            && !self.video_experimental_device_direct_write_active
+        {
+            self.video_experimental_device_direct_write_fallback_total = self
+                .video_experimental_device_direct_write_fallback_total
+                .saturating_add(1);
+        }
+        if self.video_experimental_device_direct_write_active {
+            self.video_experimental_device_direct_write_batches_total = self
+                .video_experimental_device_direct_write_batches_total
+                .saturating_add(1);
+        }
         self.maybe_run_runtime_autotune();
         let batch_decode_ms = batch_started
             .elapsed()
@@ -1595,6 +1775,9 @@ impl VideoDataLoader {
                 stride_h: self.decode_contract.stride_h,
                 stride_w: self.decode_contract.stride_w,
                 stride_c: self.decode_contract.stride_c,
+                experimental_device_output_active: self.video_experimental_device_output_active,
+                experimental_device_direct_write_active: self
+                    .video_experimental_device_direct_write_active,
             },
         )?;
         Ok(out.into_bound(py).into_any())
@@ -1646,6 +1829,34 @@ impl VideoDataLoader {
         out.set_item(
             "video_runtime_autotune_pressure",
             self.video_runtime_autotune_pressure_milli as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "video_experimental_device_output_requested",
+            self.video_experimental_device_output_requested,
+        )?;
+        out.set_item(
+            "video_experimental_device_output_active",
+            self.video_experimental_device_output_active,
+        )?;
+        out.set_item(
+            "video_experimental_device_output_fallback_total",
+            self.video_experimental_device_output_fallback_total,
+        )?;
+        out.set_item(
+            "video_experimental_device_direct_write_requested",
+            self.video_experimental_device_direct_write_requested,
+        )?;
+        out.set_item(
+            "video_experimental_device_direct_write_active",
+            self.video_experimental_device_direct_write_active,
+        )?;
+        out.set_item(
+            "video_experimental_device_direct_write_fallback_total",
+            self.video_experimental_device_direct_write_fallback_total,
+        )?;
+        out.set_item(
+            "video_experimental_device_direct_write_batches_total",
+            self.video_experimental_device_direct_write_batches_total,
         )?;
         out.set_item(
             "video_runtime_autotune_adjustments_total",

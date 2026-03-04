@@ -1628,6 +1628,73 @@ pub(crate) fn py_image(
     Py::new(py, loader)
 }
 
+fn detect_video_experimental_device_output(
+    py: Python<'_>,
+    requested: bool,
+) -> (bool, Option<String>) {
+    if !requested {
+        return (false, None);
+    }
+    let torch = match py.import_bound("torch") {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                false,
+                Some(format!("torch import failed for device output path: {err}")),
+            );
+        }
+    };
+    let cuda = match torch.getattr("cuda") {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                false,
+                Some(format!(
+                    "torch.cuda unavailable for device output path: {err}"
+                )),
+            );
+        }
+    };
+    match cuda.call_method0("is_available") {
+        Ok(v) => match v.is_truthy() {
+            Ok(true) => (true, None),
+            Ok(false) => (
+                false,
+                Some("torch.cuda.is_available() returned false".to_string()),
+            ),
+            Err(err) => (
+                false,
+                Some(format!(
+                    "failed reading torch.cuda.is_available() result: {err}"
+                )),
+            ),
+        },
+        Err(err) => (
+            false,
+            Some(format!("torch.cuda.is_available() call failed: {err}")),
+        ),
+    }
+}
+
+fn detect_video_experimental_device_direct_write(
+    requested: bool,
+    device_output_active: bool,
+) -> (bool, Option<String>) {
+    if !requested {
+        return (false, None);
+    }
+    if !device_output_active {
+        return (false, Some("device output path is not active".to_string()));
+    }
+    (
+        true,
+        Some(
+            "running direct-write staged-copy scaffold (native nvdec destination writer pending)"
+                .to_string(),
+        ),
+    )
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     dataset_link,
@@ -1811,6 +1878,39 @@ pub(crate) fn video(
     }
     let max_inflight_bytes = effective_max_inflight_bytes.max(1);
     let decode_backend = video_decode_backend_from_env()?;
+    let video_experimental_device_output_requested =
+        env_bool("MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT", false);
+    let (video_experimental_device_output_active, device_output_fallback_reason) =
+        detect_video_experimental_device_output(py, video_experimental_device_output_requested);
+    if let Some(reason) = device_output_fallback_reason.as_deref() {
+        tracing::warn!(
+            target: "mx8_proof",
+            event = "video_experimental_device_output_fallback",
+            requested = video_experimental_device_output_requested,
+            active = video_experimental_device_output_active,
+            reason = %reason,
+            "video experimental device output unavailable; using host payload path"
+        );
+    }
+    let video_experimental_device_direct_write_requested =
+        env_bool("MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE", false);
+    let (
+        video_experimental_device_direct_write_active,
+        device_direct_write_note_or_fallback_reason,
+    ) = detect_video_experimental_device_direct_write(
+        video_experimental_device_direct_write_requested,
+        video_experimental_device_output_active,
+    );
+    if let Some(reason) = device_direct_write_note_or_fallback_reason.as_deref() {
+        tracing::warn!(
+            target: "mx8_proof",
+            event = "video_experimental_device_direct_write_status",
+            requested = video_experimental_device_direct_write_requested,
+            active = video_experimental_device_direct_write_active,
+            reason = %reason,
+            "video experimental device direct-write mode status"
+        );
+    }
     let bytes_per_clip = env_usize("MX8_VIDEO_STAGE2_BYTES_PER_CLIP", 4096).max(1);
     let decode_contract = VideoDataLoader::derive_decode_contract(clip_len, bytes_per_clip)?;
     if batch_size_samples == 0 {
@@ -1883,6 +1983,10 @@ pub(crate) fn video(
         clips_total = clips_total,
         stage2d_sidecars = stage2d_sidecars.len() as u64,
         decode_backend = video_decode_backend_name(decode_backend),
+        device_output_requested = video_experimental_device_output_requested,
+        device_output_active = video_experimental_device_output_active,
+        device_direct_write_requested = video_experimental_device_direct_write_requested,
+        device_direct_write_active = video_experimental_device_direct_write_active,
         max_inflight_bytes = max_inflight_bytes,
         max_process_rss_bytes = effective_max_process_rss_bytes.unwrap_or(0),
         profile = match selected_profile {
@@ -1943,6 +2047,13 @@ pub(crate) fn video(
             video_runtime_autotune_adjustments_total: 0,
             video_runtime_autotune_gpu_clamps_total: 0,
             video_runtime_autotune_pressure_milli: 0,
+            video_experimental_device_output_requested,
+            video_experimental_device_output_active,
+            video_experimental_device_output_fallback_total: 0,
+            video_experimental_device_direct_write_requested,
+            video_experimental_device_direct_write_active,
+            video_experimental_device_direct_write_fallback_total: 0,
+            video_experimental_device_direct_write_batches_total: 0,
             video_gpu_pressure_milli: 0,
             video_gpu_pressure_available: false,
             video_gpu_pressure_unavailable_total: 0,
