@@ -298,22 +298,6 @@ impl VideoBatch {
         Ok(VideoDeviceWritePath::DirectWriteNativeV1)
     }
 
-    fn expected_clip_bytes(&self) -> Result<usize, String> {
-        let frames = usize::try_from(self.frames_per_clip)
-            .map_err(|_| "frames_per_clip conversion overflow".to_string())?;
-        let h = usize::try_from(self.frame_height)
-            .map_err(|_| "frame_height conversion overflow".to_string())?;
-        let w = usize::try_from(self.frame_width)
-            .map_err(|_| "frame_width conversion overflow".to_string())?;
-        let c = usize::try_from(self.channels)
-            .map_err(|_| "channels conversion overflow".to_string())?;
-        frames
-            .checked_mul(h)
-            .and_then(|v| v.checked_mul(w))
-            .and_then(|v| v.checked_mul(c))
-            .ok_or_else(|| "clip byte-size overflow".to_string())
-    }
-
     fn local_media_path_from_uri(media_uri: &str) -> Result<PathBuf, String> {
         if media_uri.starts_with("s3://")
             || media_uri.starts_with("gcs://")
@@ -338,84 +322,9 @@ impl VideoBatch {
         Ok(path)
     }
 
-    fn decode_clip_from_local_path_nvdec(
-        &self,
-        path: &std::path::Path,
-        clip_start: u64,
-    ) -> Result<Vec<u8>, String> {
-        let side = self.frame_width;
-        let clip_len_usize = usize::try_from(self.frames_per_clip)
-            .map_err(|_| "clip_len conversion overflow for decode contract".to_string())?;
-        let expected_clip_bytes = self.expected_clip_bytes()?;
-        let seek_seconds = (clip_start as f64) / f64::from(self.decode_fps.max(1));
-        let ffmpeg_bin = std::env::var("MX8_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
-        let vf_arg =
-            format!("hwdownload,format=nv12,scale={side}:{side}:flags=bilinear,format=rgb24");
-        let output = Command::new(&ffmpeg_bin)
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-nostdin")
-            .arg("-hwaccel")
-            .arg("cuda")
-            .arg("-hwaccel_output_format")
-            .arg("cuda")
-            .arg("-ss")
-            .arg(format!("{seek_seconds:.6}"))
-            .arg("-i")
-            .arg(path)
-            .arg("-an")
-            .arg("-sn")
-            .arg("-dn")
-            .arg("-frames:v")
-            .arg(clip_len_usize.to_string())
-            .arg("-vf")
-            .arg(vf_arg)
-            .arg("-pix_fmt")
-            .arg("rgb24")
-            .arg("-f")
-            .arg("rawvideo")
-            .arg("pipe:1")
-            .output()
-            .map_err(|e| {
-                format!(
-                    "failed running ffmpeg nvdec decode for {}: {e}",
-                    path.display()
-                )
-            })?;
-
-        if !output.status.success() {
-            let stderr_text = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr_text
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .map(str::trim)
-                .unwrap_or("ffmpeg nvdec decode failed");
-            return Err(format!(
-                "ffmpeg nvdec decode failed for {}: {}",
-                path.display(),
-                detail
-            ));
-        }
-        let mut decoded = output.stdout;
-        if decoded.len() < expected_clip_bytes {
-            return Err(format!(
-                "decoded bytes {} below expected {} for {}",
-                decoded.len(),
-                expected_clip_bytes,
-                path.display()
-            ));
-        }
-        if decoded.len() > expected_clip_bytes {
-            decoded.truncate(expected_clip_bytes);
-        }
-        Ok(decoded)
-    }
-
     fn try_decode_to_cuda_destination_nvdec<'py>(
         &self,
         torch: &Bound<'py, PyAny>,
-        torch_uint8: &Bound<'py, PyAny>,
         cuda_payload: &Bound<'py, PyAny>,
         stream: &Bound<'py, PyAny>,
         destination: &VideoDeviceDestinationContract,
@@ -436,9 +345,9 @@ impl VideoBatch {
         let ns = ops
             .getattr("mx8_video")
             .map_err(|err| format!("torch.ops.mx8_video unavailable: {err}"))?;
-        let direct_write_op = ns
-            .getattr("direct_write_u8")
-            .map_err(|err| format!("torch.ops.mx8_video.direct_write_u8 unavailable: {err}"))?;
+        let decode_into_op = ns.getattr("decode_file_nvdec_into_u8").map_err(|err| {
+            format!("torch.ops.mx8_video.decode_file_nvdec_into_u8 unavailable: {err}")
+        })?;
         let expected_clips = self.sample_ids.len();
         if self.media_uris.len() != expected_clips || self.clip_starts.len() != expected_clips {
             return Err(format!(
@@ -449,25 +358,11 @@ impl VideoBatch {
             ));
         }
         let frames = i64::from(self.frames_per_clip);
-        let height = i64::from(self.frame_height);
         let width = i64::from(self.frame_width);
-        let channels = i64::from(self.channels);
         for idx in 0..expected_clips {
             let media_uri = &self.media_uris[idx];
             let clip_start = self.clip_starts[idx];
             let local_path = Self::local_media_path_from_uri(media_uri)?;
-            let decoded = self.decode_clip_from_local_path_nvdec(&local_path, clip_start)?;
-            let src_buf = PyByteArray::new_bound(torch.py(), &decoded);
-            let kwargs = PyDict::new_bound(torch.py());
-            kwargs
-                .set_item("dtype", torch_uint8)
-                .map_err(|err| format!("failed setting torch.frombuffer dtype kwargs: {err}"))?;
-            let src_u8 = torch
-                .call_method("frombuffer", (src_buf,), Some(&kwargs))
-                .map_err(|err| format!("torch.frombuffer failed for decoded clip: {err}"))?;
-            let src_view = src_u8
-                .call_method1("view", (1_i64, frames, height, width, channels))
-                .map_err(|err| format!("torch.view failed for decoded clip: {err}"))?;
             let dst_view = cuda_payload
                 .call_method1(
                     "narrow",
@@ -478,9 +373,19 @@ impl VideoBatch {
                     ),
                 )
                 .map_err(|err| format!("torch.narrow failed for destination clip: {err}"))?;
-            direct_write_op
-                .call1((dst_view, src_view, destination.stream_id))
-                .map_err(|err| format!("direct_write_u8 failed for clip index {idx}: {err}"))?;
+            let seek_seconds = (clip_start as f64) / f64::from(self.decode_fps.max(1));
+            decode_into_op
+                .call1((
+                    dst_view,
+                    local_path.display().to_string(),
+                    seek_seconds,
+                    frames,
+                    width,
+                    destination.stream_id,
+                ))
+                .map_err(|err| {
+                    format!("decode_file_nvdec_into_u8 failed for clip index {idx}: {err}")
+                })?;
         }
         if let Err(err) = cuda_payload.call_method1("record_stream", (stream.clone(),)) {
             tracing::warn!(
@@ -644,7 +549,6 @@ impl VideoBatch {
                     if self.experimental_direct_decode_to_destination_active {
                         match self.try_decode_to_cuda_destination_nvdec(
                             &torch,
-                            &torch_uint8,
                             &cuda_payload,
                             &stream,
                             &destination,

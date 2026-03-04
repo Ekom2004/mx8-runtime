@@ -59,14 +59,22 @@ def main() -> None:
     )
     os.environ["MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT"] = "1"
     os.environ["MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE"] = "1"
+    direct_decode_requested = (
+        os.environ.get("MX8_VIDEO_EXPERIMENTAL_DIRECT_DECODE_TO_DESTINATION", "0")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
     op_library = os.environ.get("MX8_VIDEO_DIRECT_WRITE_OP_LIBRARY", "").strip()
     if op_library:
         torch.ops.load_library(op_library)
-        if not hasattr(torch.ops, "mx8_video") or not hasattr(
-            torch.ops.mx8_video, "direct_write_u8"
+        if (
+            not hasattr(torch.ops, "mx8_video")
+            or not hasattr(torch.ops.mx8_video, "direct_write_u8")
+            or not hasattr(torch.ops.mx8_video, "decode_file_nvdec_into_u8")
         ):
             raise RuntimeError(
-                "expected torch.ops.mx8_video.direct_write_u8 to be registered after load_library"
+                "expected torch.ops.mx8_video.direct_write_u8 and decode_file_nvdec_into_u8 after load_library"
             )
         if torch.cuda.is_available():
             src = torch.arange(24, dtype=torch.uint8, device="cpu").view(1, 2, 2, 2, 3)
@@ -75,6 +83,23 @@ def main() -> None:
             torch.ops.mx8_video.direct_write_u8(dst, src, stream_id)
             if not torch.equal(dst.cpu(), src):
                 raise RuntimeError("direct_write_u8 sanity check failed: dst bytes differ from src")
+            if direct_decode_requested:
+                decode_dst = torch.empty((1, 4, 18, 18, 3), dtype=torch.uint8, device="cuda")
+                try:
+                    torch.ops.mx8_video.decode_file_nvdec_into_u8(
+                        decode_dst,
+                        str(data_root / "clip_a.mp4"),
+                        0.0,
+                        4,
+                        18,
+                        stream_id,
+                    )
+                    if int(decode_dst.sum().item()) <= 0:
+                        raise RuntimeError(
+                            "decode_file_nvdec_into_u8 sanity check failed: destination remained empty"
+                        )
+                except Exception as err:
+                    print(f"  decode_file_nvdec_into_u8_sanity: skipped ({err})")
 
     loader = mx8.video(
         str(data_root),
@@ -141,6 +166,18 @@ def main() -> None:
     direct_batches_total = int(
         stats.get("video_experimental_device_direct_write_batches_total", 0)
     )
+    direct_decode_requested_stats = bool(
+        stats.get("video_experimental_direct_decode_to_destination_requested", False)
+    )
+    direct_decode_active_stats = bool(
+        stats.get("video_experimental_direct_decode_to_destination_active", False)
+    )
+    direct_decode_fallback_total = int(
+        stats.get("video_experimental_direct_decode_to_destination_fallback_total", 0)
+    )
+    direct_decode_batches_total = int(
+        stats.get("video_experimental_direct_decode_to_destination_batches_total", 0)
+    )
     if not requested:
         raise RuntimeError("expected video_experimental_device_output_requested=true")
     if active != expected_active:
@@ -163,6 +200,18 @@ def main() -> None:
             )
         if direct_batches_total <= 0:
             raise RuntimeError("expected direct-write batches_total > 0 when active")
+        if direct_decode_requested:
+            if not direct_decode_requested_stats:
+                raise RuntimeError("expected direct-decode requested=true")
+            if not direct_decode_active_stats:
+                raise RuntimeError("expected direct-decode active=true when CUDA active")
+            if direct_decode_fallback_total != 0:
+                raise RuntimeError(
+                    "expected direct-decode fallback_total=0 in local-media GPU gate "
+                    f"(got {direct_decode_fallback_total})"
+                )
+            if direct_decode_batches_total <= 0:
+                raise RuntimeError("expected direct-decode batches_total > 0 when active")
     else:
         if payload_u8.device.type != "cpu":
             raise RuntimeError(f"expected CPU payload tensor fallback, got {payload_u8.device}")
@@ -176,6 +225,19 @@ def main() -> None:
             raise RuntimeError("expected direct-write fallback_total > 0 when inactive")
         if direct_batches_total != 0:
             raise RuntimeError("expected direct-write batches_total == 0 when inactive")
+        if direct_decode_requested:
+            if not direct_decode_requested_stats:
+                raise RuntimeError("expected direct-decode requested=true")
+            if direct_decode_active_stats:
+                raise RuntimeError("expected direct-decode active=false when CUDA unavailable")
+            if direct_decode_fallback_total <= 0:
+                raise RuntimeError(
+                    "expected direct-decode fallback_total > 0 when CUDA unavailable"
+                )
+            if direct_decode_batches_total != 0:
+                raise RuntimeError(
+                    "expected direct-decode batches_total == 0 when CUDA unavailable"
+                )
 
     print("video_device_output_gate_summary")
     print(f"  torch_cuda_available: {expected_active}")
@@ -187,6 +249,10 @@ def main() -> None:
     print(f"  direct_active: {direct_active}")
     print(f"  direct_fallback_total: {direct_fallback_total}")
     print(f"  direct_batches_total: {direct_batches_total}")
+    print(f"  direct_decode_requested: {direct_decode_requested_stats}")
+    print(f"  direct_decode_active: {direct_decode_active_stats}")
+    print(f"  direct_decode_fallback_total: {direct_decode_fallback_total}")
+    print(f"  direct_decode_batches_total: {direct_decode_batches_total}")
     print(f"  payload_shape: {tuple(payload_u8.shape)}")
     print(f"  sample_ids: {int(sample_ids_i64.numel())}")
 

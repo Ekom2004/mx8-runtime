@@ -68,9 +68,13 @@ def main() -> None:
         raise RuntimeError(f"built library path does not exist: {lib_path}")
 
     torch.ops.load_library(str(lib_path))
-    op = getattr(getattr(torch.ops, "mx8_video"), "direct_write_u8", None)
+    ns = getattr(torch.ops, "mx8_video", None)
+    op = getattr(ns, "direct_write_u8", None) if ns is not None else None
+    decode_op = getattr(ns, "decode_file_nvdec_into_u8", None) if ns is not None else None
     if op is None:
         raise RuntimeError("torch.ops.mx8_video.direct_write_u8 was not registered")
+    if decode_op is None:
+        raise RuntimeError("torch.ops.mx8_video.decode_file_nvdec_into_u8 was not registered")
 
     print(str(lib_path))
 
