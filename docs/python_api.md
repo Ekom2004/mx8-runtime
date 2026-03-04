@@ -451,6 +451,9 @@ Build-time flags:
 - FFI: `RUSTFLAGS="--cfg mx8_video_ffi"`
 - NVDEC: `RUSTFLAGS="--cfg mx8_video_nvdec"`
 
+Current NVDEC path uses FFmpeg CUDA hwaccel flags (`-hwaccel cuda`). It requires an FFmpeg build with CUDA/NVIDIA decode support on the host.
+When `nvdec`/`auto` is selected, video runtime autotune samples GPU memory pressure from `nvidia-smi` (override binary with `MX8_NVIDIA_SMI_BIN`).
+
 Fallback behavior is fail-open:
 
 - `ffi` falls back to `cli` on any backend error.
@@ -459,9 +462,9 @@ Fallback behavior is fail-open:
 
 Each fallback emits a `video_decode_backend_fallback` proof event.
 
-`loader.stats()` for the video loader includes decode contract fields (`video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_clip_bytes`), backend selection (`video_decode_backend`), fallback counters (`video_decode_backend_fallback_total`), decode counters (`video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_total`, `video_decode_ms_total`), and autotune counters (`video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`).
+`loader.stats()` for the video loader includes decode contract fields (`video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_clip_bytes`), backend selection (`video_decode_backend`), fallback counters (`video_decode_backend_fallback_total`), decode counters (`video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_total`, `video_decode_ms_total`), GPU pressure counters (`video_gpu_pressure`, `video_gpu_pressure_unavailable_total`), and autotune counters (`video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`, `video_runtime_autotune_gpu_clamps_total`).
 
-Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, `./scripts/video_nvdec_fallback_gate.sh`, and `./scripts/video_ga_gate.sh`.
+Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, `./scripts/video_nvdec_fallback_gate.sh`, `./scripts/video_nvdec_compiled_fallback_gate.sh`, `./scripts/video_nvdec_pressure_gate.sh`, `./scripts/video_nvdec_throughput_gate.sh`, and `./scripts/video_ga_gate.sh`. For strict hardware throughput enforcement, set `MX8_VIDEO_NVDEC_THROUGHPUT_REQUIRE_HW=1`.
 
 
 ## Distributed loader

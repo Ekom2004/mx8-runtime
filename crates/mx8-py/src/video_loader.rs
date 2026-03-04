@@ -59,7 +59,11 @@ pub(crate) struct VideoDataLoader {
     pub(crate) video_runtime_autotune_period_batches: u64,
     pub(crate) video_runtime_autotune_last_batch: u64,
     pub(crate) video_runtime_autotune_adjustments_total: u64,
+    pub(crate) video_runtime_autotune_gpu_clamps_total: u64,
     pub(crate) video_runtime_autotune_pressure_milli: u64,
+    pub(crate) video_gpu_pressure_milli: u64,
+    pub(crate) video_gpu_pressure_unavailable_total: u64,
+    pub(crate) video_gpu_recovery_streak: u64,
     pub(crate) video_max_process_rss_bytes: Option<u64>,
     pub(crate) assigned_rank: u32,
     pub(crate) world_size: u32,
@@ -175,6 +179,60 @@ impl VideoDataLoader {
             .saturating_add(self.decode_failed_decode_failed)
     }
 
+    fn sample_gpu_pressure_ratio() -> Result<f64, String> {
+        if let Some(raw) = env_string("MX8_VIDEO_GPU_PRESSURE_RATIO") {
+            let parsed = raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("invalid MX8_VIDEO_GPU_PRESSURE_RATIO={raw:?}"))?;
+            if !parsed.is_finite() || parsed < 0.0 {
+                return Err(format!(
+                    "invalid MX8_VIDEO_GPU_PRESSURE_RATIO={raw:?} (expected finite >= 0)"
+                ));
+            }
+            return Ok(parsed.clamp(0.0, 2.0));
+        }
+        let smi_bin = std::env::var("MX8_NVIDIA_SMI_BIN").unwrap_or_else(|_| "nvidia-smi".into());
+        let output = Command::new(&smi_bin)
+            .arg("--query-gpu=memory.used,memory.total")
+            .arg("--format=csv,noheader,nounits")
+            .output()
+            .map_err(|e| format!("failed to execute {smi_bin}: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "{smi_bin} failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut max_ratio: Option<f64> = None;
+        for line in stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let mut parts = line.split(',').map(str::trim);
+            let used = parts
+                .next()
+                .ok_or_else(|| format!("malformed {smi_bin} output line: {line}"))?
+                .parse::<f64>()
+                .map_err(|_| format!("invalid used-memory token in {smi_bin} output: {line}"))?;
+            let total = parts
+                .next()
+                .ok_or_else(|| format!("malformed {smi_bin} output line: {line}"))?
+                .parse::<f64>()
+                .map_err(|_| format!("invalid total-memory token in {smi_bin} output: {line}"))?;
+            if total <= 0.0 {
+                continue;
+            }
+            let ratio = (used / total).clamp(0.0, 2.0);
+            max_ratio = Some(max_ratio.map_or(ratio, |cur| cur.max(ratio)));
+        }
+        max_ratio.ok_or_else(|| format!("{smi_bin} returned no GPU memory rows"))
+    }
+
     fn maybe_run_runtime_autotune(&mut self) {
         if !self.video_runtime_autotune_enabled {
             return;
@@ -199,7 +257,48 @@ impl VideoDataLoader {
         let rss_ratio = (rss_bytes as f64 / max_process_rss_bytes as f64).clamp(0.0, 2.0);
         let inflight_ratio =
             (self.max_inflight_bytes as f64 / max_process_rss_bytes as f64).clamp(0.0, 2.0);
-        let pressure = rss_ratio.max(inflight_ratio);
+        let gpu_backend_selected = matches!(
+            self.decode_backend,
+            VideoDecodeBackend::Nvdec | VideoDecodeBackend::Auto
+        );
+        let mut gpu_ratio = 0.0f64;
+        let mut gpu_ratio_available = false;
+        if gpu_backend_selected {
+            match Self::sample_gpu_pressure_ratio() {
+                Ok(ratio) => {
+                    gpu_ratio = ratio;
+                    gpu_ratio_available = true;
+                    self.video_gpu_pressure_milli = (ratio * 1000.0).round() as u64;
+                    if ratio < 0.80 {
+                        self.video_gpu_recovery_streak =
+                            self.video_gpu_recovery_streak.saturating_add(1);
+                    } else {
+                        self.video_gpu_recovery_streak = 0;
+                    }
+                }
+                Err(err) => {
+                    self.video_gpu_pressure_unavailable_total =
+                        self.video_gpu_pressure_unavailable_total.saturating_add(1);
+                    self.video_gpu_pressure_milli = 0;
+                    self.video_gpu_recovery_streak = 0;
+                    tracing::warn!(
+                        target: "mx8_proof",
+                        event = "video_gpu_pressure_unavailable",
+                        decode_backend = video_decode_backend_name(self.decode_backend),
+                        unavailable_total = self.video_gpu_pressure_unavailable_total,
+                        detail = %err,
+                        "gpu pressure signal unavailable for video autotune"
+                    );
+                }
+            }
+        } else {
+            self.video_gpu_pressure_milli = 0;
+            self.video_gpu_recovery_streak = 0;
+        }
+        let mut pressure = rss_ratio.max(inflight_ratio);
+        if gpu_ratio_available {
+            pressure = pressure.max(gpu_ratio);
+        }
         self.video_runtime_autotune_pressure_milli = (pressure * 1000.0).round() as u64;
 
         let min_inflight = (self.batch_size_samples as u64)
@@ -208,12 +307,44 @@ impl VideoDataLoader {
         let max_inflight = max_process_rss_bytes.max(min_inflight);
         let old_inflight = self.max_inflight_bytes;
         let mut next_inflight = old_inflight;
-        if rss_ratio > 0.92 {
+        let mut trigger = "none";
+        let mut gpu_clamp = false;
+        if gpu_backend_selected && !gpu_ratio_available {
+            next_inflight = ((old_inflight as f64) * 0.75).round() as u64;
+            trigger = "gpu_telemetry_unavailable";
+            gpu_clamp = true;
+        } else if gpu_ratio_available && gpu_ratio >= 0.97 {
+            next_inflight = min_inflight;
+            trigger = "gpu_hard_cut";
+            gpu_clamp = true;
+        } else if gpu_ratio_available && gpu_ratio >= 0.92 {
             next_inflight = ((old_inflight as f64) * 0.85).round() as u64;
-        } else if rss_ratio < 0.60 {
-            next_inflight = ((old_inflight as f64) * 1.05).round() as u64;
+            trigger = "gpu_soft_cut";
+            gpu_clamp = true;
+        } else if rss_ratio > 0.92 {
+            next_inflight = ((old_inflight as f64) * 0.85).round() as u64;
+            trigger = "cpu_soft_cut";
+        } else {
+            let can_scale_up = if gpu_backend_selected {
+                gpu_ratio_available && self.video_gpu_recovery_streak >= 3
+            } else {
+                true
+            };
+            if can_scale_up && pressure < 0.60 {
+                next_inflight = ((old_inflight as f64) * 1.05).round() as u64;
+                trigger = if gpu_backend_selected {
+                    "gpu_recovery_scale_up"
+                } else {
+                    "cpu_scale_up"
+                };
+            }
         }
         next_inflight = next_inflight.clamp(min_inflight, max_inflight);
+        if gpu_clamp {
+            self.video_runtime_autotune_gpu_clamps_total = self
+                .video_runtime_autotune_gpu_clamps_total
+                .saturating_add(1);
+        }
         if next_inflight != old_inflight {
             self.max_inflight_bytes = next_inflight;
             self.video_runtime_autotune_adjustments_total = self
@@ -224,10 +355,15 @@ impl VideoDataLoader {
                 event = "video_runtime_autotune_adjustment",
                 pressure = pressure,
                 rss_ratio = rss_ratio,
+                inflight_ratio = inflight_ratio,
+                gpu_ratio = if gpu_ratio_available { gpu_ratio } else { -1.0 },
+                gpu_recovery_streak = self.video_gpu_recovery_streak,
+                trigger = trigger,
                 max_process_rss_bytes = max_process_rss_bytes,
                 old_max_inflight_bytes = old_inflight,
                 new_max_inflight_bytes = next_inflight,
                 adjustments_total = self.video_runtime_autotune_adjustments_total,
+                gpu_clamps_total = self.video_runtime_autotune_gpu_clamps_total,
                 "video runtime autotune adjusted max inflight"
             );
         }
@@ -342,10 +478,12 @@ impl VideoDataLoader {
         }
     }
 
-    fn decode_clip_from_path_cli(
+    fn decode_clip_from_path_with_ffmpeg(
         &self,
         path: &std::path::Path,
         start_seconds: f64,
+        ffmpeg_input_args: &[&str],
+        vf_arg: &str,
     ) -> Result<Vec<u8>, VideoDecodeError> {
         let side = self.decode_contract.frame_width;
         let clip_len_usize =
@@ -361,14 +499,22 @@ impl VideoDataLoader {
                 Self::decode_error(path, "decode_failed", "clip_bytes conversion overflow")
             })?;
         let seek_arg = format!("{start_seconds:.6}");
-        let scale_arg = format!("scale={side}:{side}:flags=bilinear");
+        let vf_arg = if vf_arg.is_empty() {
+            format!("scale={side}:{side}:flags=bilinear")
+        } else {
+            vf_arg.to_string()
+        };
         let ffmpeg_bin = std::env::var("MX8_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
 
-        let output = Command::new(&ffmpeg_bin)
-            .arg("-hide_banner")
+        let mut cmd = Command::new(&ffmpeg_bin);
+        cmd.arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
-            .arg("-nostdin")
+            .arg("-nostdin");
+        for arg in ffmpeg_input_args {
+            cmd.arg(arg);
+        }
+        let output = cmd
             .arg("-ss")
             .arg(seek_arg)
             .arg("-i")
@@ -379,7 +525,7 @@ impl VideoDataLoader {
             .arg("-frames:v")
             .arg(clip_len_usize.to_string())
             .arg("-vf")
-            .arg(scale_arg)
+            .arg(vf_arg)
             .arg("-pix_fmt")
             .arg("rgb24")
             .arg("-f")
@@ -422,6 +568,14 @@ impl VideoDataLoader {
             decoded.truncate(expected_clip_bytes);
         }
         Ok(decoded)
+    }
+
+    fn decode_clip_from_path_cli(
+        &self,
+        path: &std::path::Path,
+        start_seconds: f64,
+    ) -> Result<Vec<u8>, VideoDecodeError> {
+        self.decode_clip_from_path_with_ffmpeg(path, start_seconds, &[], "")
     }
 
     #[cfg(mx8_video_ffi)]
@@ -601,13 +755,38 @@ impl VideoDataLoader {
     fn decode_clip_from_path_nvdec(
         &self,
         path: &std::path::Path,
-        _start_seconds: f64,
+        start_seconds: f64,
     ) -> Result<Vec<u8>, VideoDecodeError> {
-        Err(Self::decode_error(
+        // Decode on CUDA when available, then download to host and normalize to rgb24.
+        let side = self.decode_contract.frame_width;
+        let vf_arg =
+            format!("hwdownload,format=nv12,scale={side}:{side}:flags=bilinear,format=rgb24");
+        let err = match self.decode_clip_from_path_with_ffmpeg(
             path,
-            "decode_backend_unavailable",
-            "nvdec backend is not implemented in this build",
-        ))
+            start_seconds,
+            &["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
+            &vf_arg,
+        ) {
+            Ok(v) => return Ok(v),
+            Err(err) => err,
+        };
+        let lower = err.detail.to_ascii_lowercase();
+        if lower.contains("cuda")
+            || lower.contains("cuvid")
+            || lower.contains("hwaccel")
+            || lower.contains("cannot load libcuda")
+            || lower.contains("no device")
+            || lower.contains("device type cuda needed for codec")
+            || lower.contains("operation not permitted")
+            || lower.contains("not compiled")
+        {
+            return Err(Self::decode_error(
+                path,
+                "decode_backend_unavailable",
+                &err.detail,
+            ));
+        }
+        Err(err)
     }
 
     #[cfg(not(mx8_video_nvdec))]
@@ -1448,6 +1627,18 @@ impl VideoDataLoader {
         out.set_item(
             "video_runtime_autotune_adjustments_total",
             self.video_runtime_autotune_adjustments_total,
+        )?;
+        out.set_item(
+            "video_runtime_autotune_gpu_clamps_total",
+            self.video_runtime_autotune_gpu_clamps_total,
+        )?;
+        out.set_item(
+            "video_gpu_pressure",
+            self.video_gpu_pressure_milli as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "video_gpu_pressure_unavailable_total",
+            self.video_gpu_pressure_unavailable_total,
         )?;
         out.set_item("clips_total", self.clips.len() as u64)?;
         out.set_item(

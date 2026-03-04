@@ -59,6 +59,12 @@ NVDEC path:
 
 This keeps all higher-level batching, checkpointing, and stats semantics unchanged.
 
+Current implementation path:
+
+- FFmpeg CLI with CUDA hwaccel flags (`-hwaccel cuda`, `-hwaccel_output_format cuda`) under `mx8_video_nvdec` builds.
+- If CUDA/NVIDIA support is unavailable on the host FFmpeg/runtime, backend fails open to `ffi`/`cli`.
+- GPU pressure is sampled from `nvidia-smi` (override path via `MX8_NVIDIA_SMI_BIN`), with deterministic gate override via `MX8_VIDEO_GPU_PRESSURE_RATIO`.
+
 ## Autotune Design (Dual Pressure)
 
 Current video autotune pressure is CPU-centric (`rss_ratio` and inflight pressure).  
@@ -103,6 +109,7 @@ Expose backend and safety behavior in stats/proof logs:
 - `video_decode_backend_fallback_reason`
 - `video_gpu_pressure`
 - `video_gpu_pressure_unavailable_total`
+- `video_runtime_autotune_gpu_clamps_total`
 - existing `video_decode_failed_backend_unavailable_total`
 
 These fields are required for rollout debugging and SLO validation.
@@ -124,6 +131,7 @@ M8.1 is complete only when all gates pass:
    - Request NVDEC on a non-NVIDIA/disabled build.
    - Verify deterministic fallback and successful job completion.
    - Gate command: `./scripts/video_nvdec_fallback_gate.sh`
+   - Compiled-path fallback command: `./scripts/video_nvdec_compiled_fallback_gate.sh`
 2. **Decode parity**
    - Fixed fixtures compared between NVDEC and CPU path.
    - Verify shape/format contract and acceptable pixel-difference tolerance.
@@ -131,13 +139,19 @@ M8.1 is complete only when all gates pass:
 3. **VRAM pressure safety**
    - Stress test near VRAM limits.
    - Verify autotune downshift/hard clamp; no GPU OOM crash.
+   - Gate command: `./scripts/video_nvdec_pressure_gate.sh`
 4. **Throughput benchmark**
    - Measure vs `cli` baseline on representative 1080p/4K clips.
    - Record speedup and fallback rates.
+   - Gate command: `./scripts/video_nvdec_throughput_gate.sh`
 
 ## Rollout
 
 1. Ship behind `auto` with kill-switch to force CPU backend.
 2. Start with canary users/workloads.
-3. Monitor fallback rate, pressure excursions, and throughput deltas.
-4. Promote to broader usage only after stable gate and canary outcomes.
+3. Monitor fallback rate, pressure excursions, clamp events, and throughput deltas.
+4. Canary success targets:
+   - no crash regressions
+   - non-zero fallback handling on unsupported nodes
+   - no repeated high-pressure clamp oscillation under steady load
+5. Promote to broader usage only after stable gate and canary outcomes.

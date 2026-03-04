@@ -13,7 +13,7 @@ Generation command:
 rg -o --no-filename "MX8_[A-Z0-9_]+" crates scripts | sort -u
 ```
 
-Current inventory size: `264` variables.
+Current inventory size: `271` variables.
 
 ## Stability Classes
 
@@ -102,11 +102,13 @@ Current inventory size: `264` variables.
 | `MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE` | `51200` | snapshot video indexing | integer >= 1 | experimental |
 | `MX8_VIDEO_DECODE_BACKEND` | `cli` | Python video loader | `cli|auto|ffi|nvdec|nvidia` | experimental |
 | `MX8_FFMPEG_BIN` | `ffmpeg` | Python video decode path | executable path | experimental |
+| `MX8_NVIDIA_SMI_BIN` | `nvidia-smi` | Python video GPU pressure sampling | executable path | experimental |
 | `MX8_VIDEO_STAGE2D_MAX_RANGES` | `8` | Python video range planner | integer >= 1 | experimental |
 | `MX8_VIDEO_STAGE2D_MERGE_GAP_BYTES` | `0` | Python video range planner | integer >= 0 | experimental |
 | `MX8_VIDEO_STAGE2_MAX_CLIPS_IN_MEMORY` | `2000000` | Python video stage1 index | integer >= 1 | experimental |
 | `MX8_VIDEO_STAGE2_BYTES_PER_CLIP` | `4096` | Python video loader | integer >= 1 | experimental |
 | `MX8_VIDEO_AUTOTUNE_PERIOD_BATCHES` | `16` | Python video runtime autotune | integer >= 1 | experimental |
+| `MX8_VIDEO_GPU_PRESSURE_RATIO` | unset | Python video autotune (test override) | float >= 0 | experimental |
 | `MX8_MIX_AUTOTUNE_PERIOD_TICKS` | `32` | Python mix runtime autotune | integer >= 1 | experimental |
 | `MX8_MIX_SNAPSHOT` | `false` | Python mix diagnostics | bool (`1/true/yes/on`) | experimental |
 | `MX8_MIX_SNAPSHOT_PERIOD_TICKS` | `64` | Python mix diagnostics | integer >= 1 | experimental |
