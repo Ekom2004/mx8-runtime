@@ -1689,7 +1689,7 @@ fn detect_video_experimental_device_direct_write(
     (
         true,
         Some(
-            "running direct-write staged-copy scaffold (native nvdec destination writer pending)"
+            "running direct-write mode (native-op path with staged-copy fail-open fallback)"
                 .to_string(),
         ),
     )
@@ -1911,6 +1911,43 @@ pub(crate) fn video(
             "video experimental device direct-write mode status"
         );
     }
+    let video_experimental_direct_decode_to_destination_requested =
+        env_bool("MX8_VIDEO_EXPERIMENTAL_DIRECT_DECODE_TO_DESTINATION", false);
+    let (video_experimental_direct_decode_to_destination_active, direct_decode_status_reason) =
+        if !video_experimental_direct_decode_to_destination_requested {
+            (false, None)
+        } else if !video_experimental_device_direct_write_active {
+            (false, Some("direct-write mode is not active".to_string()))
+        } else if !matches!(
+            decode_backend,
+            VideoDecodeBackend::Nvdec | VideoDecodeBackend::Auto
+        ) {
+            (
+                false,
+                Some(format!(
+                    "decode backend {} is not nvdec/auto",
+                    video_decode_backend_name(decode_backend)
+                )),
+            )
+        } else {
+            (
+                true,
+                Some(
+                    "running experimental decode-to-destination nvdec path with fail-open fallback"
+                        .to_string(),
+                ),
+            )
+        };
+    if let Some(reason) = direct_decode_status_reason.as_deref() {
+        tracing::warn!(
+            target: "mx8_proof",
+            event = "video_experimental_direct_decode_to_destination_status",
+            requested = video_experimental_direct_decode_to_destination_requested,
+            active = video_experimental_direct_decode_to_destination_active,
+            reason = %reason,
+            "video experimental direct decode-to-destination mode status"
+        );
+    }
     let bytes_per_clip = env_usize("MX8_VIDEO_STAGE2_BYTES_PER_CLIP", 4096).max(1);
     let decode_contract = VideoDataLoader::derive_decode_contract(clip_len, bytes_per_clip)?;
     if batch_size_samples == 0 {
@@ -1987,6 +2024,8 @@ pub(crate) fn video(
         device_output_active = video_experimental_device_output_active,
         device_direct_write_requested = video_experimental_device_direct_write_requested,
         device_direct_write_active = video_experimental_device_direct_write_active,
+        direct_decode_to_destination_requested = video_experimental_direct_decode_to_destination_requested,
+        direct_decode_to_destination_active = video_experimental_direct_decode_to_destination_active,
         max_inflight_bytes = max_inflight_bytes,
         max_process_rss_bytes = effective_max_process_rss_bytes.unwrap_or(0),
         profile = match selected_profile {
@@ -2054,6 +2093,10 @@ pub(crate) fn video(
             video_experimental_device_direct_write_active,
             video_experimental_device_direct_write_fallback_total: 0,
             video_experimental_device_direct_write_batches_total: 0,
+            video_experimental_direct_decode_to_destination_requested,
+            video_experimental_direct_decode_to_destination_active,
+            video_experimental_direct_decode_to_destination_fallback_total: 0,
+            video_experimental_direct_decode_to_destination_batches_total: 0,
             video_gpu_pressure_milli: 0,
             video_gpu_pressure_available: false,
             video_gpu_pressure_unavailable_total: 0,

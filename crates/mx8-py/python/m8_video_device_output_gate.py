@@ -71,7 +71,8 @@ def main() -> None:
         if torch.cuda.is_available():
             src = torch.arange(24, dtype=torch.uint8, device="cpu").view(1, 2, 2, 2, 3)
             dst = torch.empty_like(src, device="cuda")
-            torch.ops.mx8_video.direct_write_u8(dst, src, 0)
+            stream_id = int(torch.cuda.current_stream().cuda_stream)
+            torch.ops.mx8_video.direct_write_u8(dst, src, stream_id)
             if not torch.equal(dst.cpu(), src):
                 raise RuntimeError("direct_write_u8 sanity check failed: dst bytes differ from src")
 
