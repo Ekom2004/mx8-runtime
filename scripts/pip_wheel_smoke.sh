@@ -66,9 +66,9 @@ loader = mx8.image(
     f"{out_dir}@refresh",
     manifest_store=store_root,
     batch_size_samples=2,
-    max_inflight_bytes=64 * 1024,
-    max_queue_batches=4,
-    prefetch_batches=4,
+    constraints=mx8.Constraints(max_inflight_bytes=64 * 1024),
+    runtime=mx8.RuntimeConfig(prefetch_batches=4, max_queue_batches=4),
+    autotune=False,
     to_float=True,
 )
 
@@ -80,6 +80,11 @@ assert images.shape[0] == 2
 assert labels.shape[0] == 2
 
 stats = loader.stats()
-assert stats["ram_high_water_bytes"] <= 64 * 1024, stats
+assert stats["max_inflight_bytes"] == 64 * 1024, stats
+assert stats["inflight_bytes"] <= 64 * 1024, stats
+assert stats["max_queue_batches"] == 4, stats
+assert stats["prefetch_batches"] == 4, stats
+assert stats["effective_max_queue_batches"] == 4, stats
+assert stats["effective_prefetch_batches"] == 4, stats
 print("[mx8] pip_wheel_smoke OK")
 PY
