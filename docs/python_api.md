@@ -447,7 +447,9 @@ The default decode backend uses a local `ffmpeg` CLI. Override the binary path w
 
 `MX8_VIDEO_DECODE_BACKEND` accepts `cli|auto|ffi|nvdec|nvidia` (`nvidia` is an alias of `nvdec`).
 `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT=1` enables an experimental device-output path for `batch.to_torch()`: when CUDA is available, `payload_u8` is returned as a Torch-owned CUDA tensor; otherwise it fails open to CPU tensor output.
-`MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE=1` enables an experimental direct-write scaffold mode on top of device-output mode; current behavior keeps stream-bound staged copy semantics while emitting destination-contract observability for native direct-write integration.
+`MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE=1` enables an experimental direct-write mode on top of device-output mode: MX8 first attempts `torch.ops.mx8_video.direct_write_u8(...)` (if registered), and fails open to staged-copy destination writing when unavailable.
+`MX8_VIDEO_DIRECT_WRITE_OP_LIBRARY` can point to a shared library that registers `torch.ops.mx8_video.direct_write_u8` (loaded through `torch.ops.load_library(...)` on first use).
+Build helper: `python crates/mx8-py/python/m8_build_video_direct_write_op.py --out-dir /tmp/mx8-direct-write-op`.
 `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT_ENFORCE_STREAM` (default `true`) enforces current-stream stability during this experimental write path and fails open to CPU tensor output on runtime stream/write errors.
 
 Build-time flags:
@@ -469,7 +471,7 @@ Each fallback emits a `video_decode_backend_fallback` proof event.
 
 `loader.stats()` for the video loader includes decode contract fields (`video_layout`, `video_dtype`, `video_colorspace`, `video_frames_per_clip`, `video_frame_height`, `video_frame_width`, `video_channels`, `video_clip_bytes`), backend selection (`video_decode_backend`), fallback counters (`video_decode_backend_fallback_total`), decode counters (`video_decode_attempted_clips_total`, `video_decode_succeeded_clips_total`, `video_decode_failed_total`, `video_decode_ms_total`), device-output counters (`video_experimental_device_output_requested`, `video_experimental_device_output_active`, `video_experimental_device_output_fallback_total`), direct-write counters (`video_experimental_device_direct_write_requested`, `video_experimental_device_direct_write_active`, `video_experimental_device_direct_write_fallback_total`, `video_experimental_device_direct_write_batches_total`), GPU pressure counters (`video_gpu_pressure`, `video_gpu_pressure_unavailable_total`), and autotune counters (`video_runtime_autotune_enabled`, `video_runtime_autotune_pressure`, `video_runtime_autotune_adjustments_total`, `video_runtime_autotune_gpu_clamps_total`).
 
-Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, `./scripts/video_nvdec_fallback_gate.sh`, `./scripts/video_nvdec_compiled_fallback_gate.sh`, `./scripts/video_nvdec_pressure_gate.sh`, `./scripts/video_nvdec_throughput_gate.sh`, `./scripts/video_device_output_gate.sh`, and `./scripts/video_ga_gate.sh`. For strict hardware throughput enforcement, set `MX8_VIDEO_NVDEC_THROUGHPUT_REQUIRE_HW=1`.
+Gate commands for the video loader: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, `./scripts/video_nvdec_fallback_gate.sh`, `./scripts/video_nvdec_compiled_fallback_gate.sh`, `./scripts/video_nvdec_pressure_gate.sh`, `./scripts/video_nvdec_throughput_gate.sh`, `./scripts/video_device_output_gate.sh`, `./scripts/video_direct_write_native_op_gate.sh`, and `./scripts/video_ga_gate.sh`. For strict hardware throughput enforcement, set `MX8_VIDEO_NVDEC_THROUGHPUT_REQUIRE_HW=1`.
 
 
 ## Distributed loader

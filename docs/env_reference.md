@@ -13,7 +13,7 @@ Generation command:
 rg -o --no-filename "MX8_[A-Z0-9_]+" crates scripts | sort -u
 ```
 
-Current inventory size: `274` variables.
+Current inventory size: `275` variables.
 
 ## Stability Classes
 
@@ -101,6 +101,7 @@ Current inventory size: `274` variables.
 | `MX8_VIDEO_STAGE1_DISABLE_FFPROBE` | `false` | snapshot video indexing | bool (`1/true/yes/on`) | experimental |
 | `MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE` | `51200` | snapshot video indexing | integer >= 1 | experimental |
 | `MX8_VIDEO_DECODE_BACKEND` | `cli` | Python video loader | `cli|auto|ffi|nvdec|nvidia` | experimental |
+| `MX8_VIDEO_DIRECT_WRITE_OP_LIBRARY` | unset | Python video loader direct-write native-op hook | shared library path | experimental |
 | `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT` | `false` | Python video loader (`batch.to_torch`) | bool (`1/true/yes/on`) | experimental |
 | `MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE` | `false` | Python video loader (`batch.to_torch`) | bool (`1/true/yes/on`) | experimental |
 | `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT_ENFORCE_STREAM` | `true` | Python video loader (`batch.to_torch`) | bool (`1/true/yes/on`) | experimental |
@@ -356,6 +357,7 @@ MX8_TUI_STALE_HEARTBEAT_MS
 MX8_VIDEO_AUTOTUNE_PERIOD_BATCHES
 MX8_VIDEO_DECODE_BACKEND
 MX8_VIDEO_DEVICE_OUTPUT_TMP_ROOT
+MX8_VIDEO_DIRECT_WRITE_OP_LIBRARY
 MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE
 MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT
 MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT_ENFORCE_STREAM

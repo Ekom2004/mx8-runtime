@@ -59,6 +59,21 @@ def main() -> None:
     )
     os.environ["MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT"] = "1"
     os.environ["MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE"] = "1"
+    op_library = os.environ.get("MX8_VIDEO_DIRECT_WRITE_OP_LIBRARY", "").strip()
+    if op_library:
+        torch.ops.load_library(op_library)
+        if not hasattr(torch.ops, "mx8_video") or not hasattr(
+            torch.ops.mx8_video, "direct_write_u8"
+        ):
+            raise RuntimeError(
+                "expected torch.ops.mx8_video.direct_write_u8 to be registered after load_library"
+            )
+        if torch.cuda.is_available():
+            src = torch.arange(24, dtype=torch.uint8, device="cpu").view(1, 2, 2, 2, 3)
+            dst = torch.empty_like(src, device="cuda")
+            torch.ops.mx8_video.direct_write_u8(dst, src, 0)
+            if not torch.equal(dst.cpu(), src):
+                raise RuntimeError("direct_write_u8 sanity check failed: dst bytes differ from src")
 
     loader = mx8.video(
         str(data_root),
@@ -91,6 +106,25 @@ def main() -> None:
             "expected offsets tail to match payload numel "
             f"(offsets_tail={offsets_i64[-1].item()}, payload_numel={payload_u8.numel()})"
         )
+    if int(payload_u8.data_ptr()) == 0:
+        raise RuntimeError("expected non-zero payload data_ptr")
+
+    shape = [int(v) for v in payload_u8.shape]
+    expected_strides = (
+        shape[1] * shape[2] * shape[3] * shape[4],
+        shape[2] * shape[3] * shape[4],
+        shape[3] * shape[4],
+        shape[4],
+        1,
+    )
+    actual_strides = tuple(int(v) for v in payload_u8.stride())
+    if actual_strides != expected_strides:
+        raise RuntimeError(
+            "expected contiguous THWC stride contract "
+            f"(actual={actual_strides}, expected={expected_strides})"
+        )
+    if not bool(payload_u8.is_contiguous()):
+        raise RuntimeError("expected contiguous payload tensor")
 
     expected_active = bool(torch.cuda.is_available())
     requested = bool(stats.get("video_experimental_device_output_requested", False))

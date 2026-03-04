@@ -103,6 +103,193 @@ pub(crate) struct VideoDecodeError {
     detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VideoDeviceDestinationContract {
+    shape: [i64; 5],
+    strides: [i64; 5],
+    data_ptr: u64,
+    stream_id: u64,
+}
+
+impl VideoDeviceDestinationContract {
+    fn from_cuda_tensor<'py>(cuda_payload: &Bound<'py, PyAny>, stream_id: u64) -> PyResult<Self> {
+        let shape = py_i64_sequence_5(&cuda_payload.getattr("shape")?, "shape")?;
+        let strides = py_i64_sequence_5(&cuda_payload.call_method0("stride")?, "stride")?;
+        let data_ptr = cuda_payload.call_method0("data_ptr")?.extract::<u64>()?;
+        Ok(Self {
+            shape,
+            strides,
+            data_ptr,
+            stream_id,
+        })
+    }
+
+    fn validate_for_shape(&self, expected_shape: [i64; 5]) -> Result<(), String> {
+        if self.data_ptr == 0 {
+            return Err("data_ptr is zero".to_string());
+        }
+        if self.shape != expected_shape {
+            return Err(format!(
+                "shape mismatch: actual={:?} expected={:?}",
+                self.shape, expected_shape
+            ));
+        }
+        let expected_strides = Self::contiguous_strides_for_shape(expected_shape)?;
+        if self.strides != expected_strides {
+            return Err(format!(
+                "stride mismatch: actual={:?} expected={:?}",
+                self.strides, expected_strides
+            ));
+        }
+        Ok(())
+    }
+
+    fn contiguous_strides_for_shape(shape: [i64; 5]) -> Result<[i64; 5], String> {
+        if shape.iter().any(|dim| *dim <= 0) {
+            return Err(format!("shape must be positive for all dims: {shape:?}"));
+        }
+        let c = shape[4];
+        let w = shape[3];
+        let h = shape[2];
+        let t = shape[1];
+        let stride_c = 1_i64;
+        let stride_w = checked_mul_i64(c, stride_c)?;
+        let stride_h = checked_mul_i64(w, stride_w)?;
+        let stride_t = checked_mul_i64(h, stride_h)?;
+        let stride_b = checked_mul_i64(t, stride_t)?;
+        Ok([stride_b, stride_t, stride_h, stride_w, stride_c])
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoDeviceWritePath {
+    TorchCopyScaffold,
+    DirectWriteNativeV1,
+    DirectWriteStagedCopyFallback,
+}
+
+impl VideoDeviceWritePath {
+    fn mode_name(self) -> &'static str {
+        match self {
+            Self::TorchCopyScaffold => "torch_copy_scaffold",
+            Self::DirectWriteNativeV1 => "direct_write_native_v1",
+            Self::DirectWriteStagedCopyFallback => "direct_write_staged_copy_fallback_v1",
+        }
+    }
+}
+
+fn checked_mul_i64(lhs: i64, rhs: i64) -> Result<i64, String> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| format!("i64 multiply overflow: lhs={lhs} rhs={rhs}"))
+}
+
+fn py_i64_sequence_5(value: &Bound<'_, PyAny>, field_name: &str) -> PyResult<[i64; 5]> {
+    let raw: Vec<i64> = value.extract().map_err(|e| {
+        PyValueError::new_err(format!(
+            "video device destination {field_name} is not an integer sequence: {e}"
+        ))
+    })?;
+    if raw.len() != 5 {
+        return Err(PyValueError::new_err(format!(
+            "video device destination {field_name} must have len=5, got len={}",
+            raw.len()
+        )));
+    }
+    Ok([raw[0], raw[1], raw[2], raw[3], raw[4]])
+}
+
+fn maybe_load_direct_write_op_library(torch: &Bound<'_, PyAny>) -> Result<(), String> {
+    let Some(path) = env_string("MX8_VIDEO_DIRECT_WRITE_OP_LIBRARY") else {
+        return Ok(());
+    };
+    static DIRECT_WRITE_OP_LIBRARY_LOAD: std::sync::OnceLock<Result<(), String>> =
+        std::sync::OnceLock::new();
+    let result = DIRECT_WRITE_OP_LIBRARY_LOAD.get_or_init(|| {
+        let ops = torch
+            .getattr("ops")
+            .map_err(|err| format!("torch.ops unavailable for direct-write op load: {err}"))?;
+        ops.call_method1("load_library", (path.clone(),))
+            .map_err(|err| format!("failed loading direct-write op library {path}: {err}"))?;
+        Ok(())
+    });
+    result.clone()
+}
+
+impl VideoBatch {
+    fn write_payload_into_cuda_destination<'py>(
+        &self,
+        cuda_payload: &Bound<'py, PyAny>,
+        payload_view: &Bound<'py, PyAny>,
+        stream: &Bound<'py, PyAny>,
+        destination: &VideoDeviceDestinationContract,
+        write_path: VideoDeviceWritePath,
+    ) -> PyResult<()> {
+        // Phase 1 boundary: all destination writes flow through one internal contract-checked path.
+        let copy_kwargs = PyDict::new_bound(payload_view.py());
+        copy_kwargs.set_item("non_blocking", true)?;
+        cuda_payload.call_method("copy_", (payload_view.clone(),), Some(&copy_kwargs))?;
+        if let Err(err) = cuda_payload.call_method1("record_stream", (stream.clone(),)) {
+            tracing::warn!(
+                target: "mx8_proof",
+                event = "video_experimental_device_output_record_stream_failed",
+                detail = %err,
+                "record_stream failed for video experimental device output"
+            );
+        }
+        tracing::info!(
+            target: "mx8_proof",
+            event = "video_experimental_device_destination_writer",
+            mode = write_path.mode_name(),
+            stream_id = destination.stream_id,
+            data_ptr = destination.data_ptr,
+            bytes = self.payload.len() as u64,
+            "video destination writer boundary completed payload write"
+        );
+        Ok(())
+    }
+
+    fn try_native_direct_write<'py>(
+        &self,
+        cuda_payload: &Bound<'py, PyAny>,
+        payload_view: &Bound<'py, PyAny>,
+        stream: &Bound<'py, PyAny>,
+        destination: &VideoDeviceDestinationContract,
+    ) -> Result<VideoDeviceWritePath, String> {
+        // Native direct-write integration point:
+        // if a custom torch op is available, route writes through it.
+        let py = payload_view.py();
+        let torch = py
+            .import_bound("torch")
+            .map_err(|err| format!("failed to import torch: {err}"))?;
+        maybe_load_direct_write_op_library(&torch)?;
+        let ops = torch
+            .getattr("ops")
+            .map_err(|err| format!("torch.ops unavailable: {err}"))?;
+        let ns = ops
+            .getattr("mx8_video")
+            .map_err(|err| format!("torch.ops.mx8_video unavailable: {err}"))?;
+        let direct_write_op = ns
+            .getattr("direct_write_u8")
+            .map_err(|err| format!("torch.ops.mx8_video.direct_write_u8 unavailable: {err}"))?;
+        direct_write_op
+            .call1((
+                cuda_payload.clone(),
+                payload_view.clone(),
+                destination.stream_id,
+            ))
+            .map_err(|err| format!("torch.ops.mx8_video.direct_write_u8 failed: {err}"))?;
+        if let Err(err) = cuda_payload.call_method1("record_stream", (stream.clone(),)) {
+            tracing::warn!(
+                target: "mx8_proof",
+                event = "video_experimental_device_output_record_stream_failed",
+                detail = %err,
+                "record_stream failed for native direct-write path"
+            );
+        }
+        Ok(VideoDeviceWritePath::DirectWriteNativeV1)
+    }
+}
+
 #[pymethods]
 impl VideoBatch {
     #[getter]
@@ -198,6 +385,7 @@ impl VideoBatch {
         let height = i64::from(self.frame_height);
         let width = i64::from(self.frame_width);
         let channels = i64::from(self.channels);
+        let expected_shape = [rows, frames, height, width, channels];
         let payload_view =
             payload_u8.call_method1("view", (rows, frames, height, width, channels))?;
 
@@ -215,47 +403,74 @@ impl VideoBatch {
                     ((rows, frames, height, width, channels),),
                     Some(&kwargs),
                 )?;
-
-                let shape = cuda_payload.getattr("shape")?;
-                let strides = cuda_payload.getattr("stride")?;
-                let data_ptr = cuda_payload.call_method0("data_ptr")?.extract::<u64>()?;
+                let destination =
+                    VideoDeviceDestinationContract::from_cuda_tensor(&cuda_payload, stream_id)?;
+                destination
+                    .validate_for_shape(expected_shape)
+                    .map_err(|detail| {
+                        PyRuntimeError::new_err(format!(
+                            "video device destination contract validation failed: {detail}"
+                        ))
+                    })?;
                 tracing::info!(
                     target: "mx8_proof",
                     event = "video_experimental_device_destination_contract",
                     mode = if self.experimental_device_direct_write_active {
-                        "direct_write_scaffold"
+                        "direct_write_destination_contract_v1"
                     } else {
                         "device_output"
                     },
-                    stream_id = stream_id,
-                    data_ptr = data_ptr,
-                    shape = %shape.str()?,
-                    strides = %strides.str()?,
+                    stream_id = destination.stream_id,
+                    data_ptr = destination.data_ptr,
+                    shape = ?destination.shape,
+                    strides = ?destination.strides,
                     bytes = self.payload.len() as u64,
                     "prepared torch-owned cuda destination tensor contract for video payload"
                 );
 
-                if self.experimental_device_direct_write_active {
+                let write_path = if self.experimental_device_direct_write_active {
                     tracing::info!(
                         target: "mx8_proof",
                         event = "video_experimental_device_direct_write_attempt",
-                        mode = "staged_copy_scaffold",
-                        stream_id = stream_id,
+                        mode = "native_direct_write_v1",
+                        stream_id = destination.stream_id,
                         bytes = self.payload.len() as u64,
-                        "attempting experimental direct-write scaffold into cuda destination tensor"
+                        "attempting experimental native direct-write into destination tensor"
                     );
-                }
+                    match self.try_native_direct_write(
+                        &cuda_payload,
+                        &payload_view,
+                        &stream,
+                        &destination,
+                    ) {
+                        Ok(VideoDeviceWritePath::DirectWriteNativeV1) => {
+                            VideoDeviceWritePath::DirectWriteNativeV1
+                        }
+                        Ok(other) => other,
+                        Err(detail) => {
+                            tracing::warn!(
+                                target: "mx8_proof",
+                                event = "video_experimental_device_direct_write_native_fallback",
+                                stream_id = destination.stream_id,
+                                data_ptr = destination.data_ptr,
+                                detail = %detail,
+                                "native direct-write unavailable; falling back to staged-copy destination writer"
+                            );
+                            VideoDeviceWritePath::DirectWriteStagedCopyFallback
+                        }
+                    }
+                } else {
+                    VideoDeviceWritePath::TorchCopyScaffold
+                };
 
-                let copy_kwargs = PyDict::new_bound(py);
-                copy_kwargs.set_item("non_blocking", true)?;
-                cuda_payload.call_method("copy_", (payload_view.clone(),), Some(&copy_kwargs))?;
-                if let Err(err) = cuda_payload.call_method1("record_stream", (stream.clone(),)) {
-                    tracing::warn!(
-                        target: "mx8_proof",
-                        event = "video_experimental_device_output_record_stream_failed",
-                        detail = %err,
-                        "record_stream failed for video experimental device output"
-                    );
+                if write_path != VideoDeviceWritePath::DirectWriteNativeV1 {
+                    self.write_payload_into_cuda_destination(
+                        &cuda_payload,
+                        &payload_view,
+                        &stream,
+                        &destination,
+                        write_path,
+                    )?;
                 }
 
                 if env_bool("MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT_ENFORCE_STREAM", true) {
@@ -273,13 +488,9 @@ impl VideoBatch {
                 tracing::info!(
                     target: "mx8_proof",
                     event = "video_experimental_device_output_write",
-                    mode = if self.experimental_device_direct_write_active {
-                        "direct_write_staged_copy_scaffold"
-                    } else {
-                        "torch_copy_scaffold"
-                    },
-                    stream_id = stream_id,
-                    data_ptr = data_ptr,
+                    mode = write_path.mode_name(),
+                    stream_id = destination.stream_id,
+                    data_ptr = destination.data_ptr,
                     bytes = self.payload.len() as u64,
                     "video experimental device output wrote payload into torch-owned cuda tensor"
                 );

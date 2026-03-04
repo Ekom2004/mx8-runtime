@@ -72,7 +72,8 @@ Current implementation path:
 - GPU pressure is sampled from `nvidia-smi` (override path via `MX8_NVIDIA_SMI_BIN`), with deterministic gate override via `MX8_VIDEO_GPU_PRESSURE_RATIO`.
 - Sampling is rate-limited to at most one `nvidia-smi` query every 2 seconds; autotune ticks between samples reuse the cached value.
 - Experimental v2 scaffolding: `MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT=1` makes `VideoBatch.to_torch()` allocate Torch-owned CUDA output and use explicit stream plumbing (`current_stream`, non-blocking copy, `record_stream`) with fail-open CPU fallback on runtime write/stream errors.
-- `MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE=1` enables a direct-write staged-copy scaffold mode that emits destination-contract observability and stream-bound write attempts while native decode-to-destination integration is being wired.
+- `MX8_VIDEO_EXPERIMENTAL_DEVICE_DIRECT_WRITE=1` enables a direct-write scaffold mode that first attempts a native destination-writer hook via `torch.ops.mx8_video.direct_write_u8(...)`, then fails open to staged-copy destination writing (with explicit proof fallback events) while native decode-to-destination integration is being wired.
+- `MX8_VIDEO_DIRECT_WRITE_OP_LIBRARY` may point to a shared library that registers `torch.ops.mx8_video.direct_write_u8` through `torch.ops.load_library(...)`.
 
 ## Autotune Design (Dual Pressure)
 
