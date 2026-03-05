@@ -4,7 +4,7 @@
 
 # MX8
 
-**The data runtime for serious ML workloads.**
+**The Autonomous Data Plane for ML—Invisible, Reliable, and Scalable. Your GPU runs at 99%**
 
 Point to your data. Set a RAM limit. Train.
 
