@@ -1,14 +1,18 @@
 use super::*;
 
 #[pyfunction]
-#[pyo3(signature = (dataset_link, *, manifest_store=None, manifest_path=None, recursive=true, node_id=None))]
+#[pyo3(signature = (data, *, store=None, manifest=None, recursive=true, node=None))]
 pub(crate) fn resolve_manifest_hash(
-    dataset_link: String,
-    manifest_store: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
+    data: String,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     recursive: bool,
-    node_id: Option<String>,
+    node: Option<String>,
 ) -> PyResult<String> {
+    let dataset_link = data;
+    let manifest_store = store;
+    let manifest_path = manifest;
+    let node_id = node;
     let root = manifest_store
         .or(env_path("MX8_MANIFEST_STORE_ROOT"))
         .unwrap_or_else(default_manifest_store);
@@ -35,6 +39,18 @@ pub(crate) fn resolve_manifest_hash(
         .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
     Ok(snapshot.manifest_hash.0)
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, *, store=None, manifest=None, recursive=true, node=None))]
+pub(crate) fn resolve(
+    data: String,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
+    recursive: bool,
+    node: Option<String>,
+) -> PyResult<String> {
+    resolve_manifest_hash(data, store, manifest, recursive, node)
 }
 
 #[pyfunction]
@@ -346,58 +362,76 @@ pub(crate) fn maybe_autopack(py: Python<'_>, s3_url: &str, shard_mb: u64) -> PyR
 
 #[pyfunction]
 #[pyo3(signature = (
-    dataset_link,
+    data,
     *,
-    manifest_store=None,
-    manifest_path=None,
+    store=None,
+    manifest=None,
     recursive=true,
-    batch_size_samples=512,
-    max_inflight_bytes=128*1024*1024,
-    max_queue_batches=64,
-    prefetch_batches=1,
-    target_batch_bytes=None,
-    max_batch_bytes=None,
-    start_id=None,
-    end_id=None,
-    resume_from=None,
-    job_id=None,
-    cluster_url=None,
-    node_id=None,
-    max_ram_gb=None,
+    batch=512,
+    inflight=128*1024*1024,
+    queue=64,
+    prefetch=1,
+    target_bytes=None,
+    batch_bytes=None,
+    start=None,
+    end=None,
+    resume=None,
+    job=None,
+    coord=None,
+    node=None,
+    ram_gb=None,
     profile=None,
-    autotune=None,
+    tune=None,
     constraints=None,
     runtime=None,
     autopack=false,
-    autopack_shard_mb=512,
+    shard_mb=512,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load<'py>(
     py: Python<'py>,
-    dataset_link: String,
-    manifest_store: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
+    data: String,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     recursive: bool,
-    batch_size_samples: usize,
-    max_inflight_bytes: u64,
-    max_queue_batches: usize,
-    prefetch_batches: usize,
-    target_batch_bytes: Option<u64>,
-    max_batch_bytes: Option<u64>,
-    start_id: Option<u64>,
-    end_id: Option<u64>,
-    resume_from: Option<Vec<u8>>,
-    job_id: Option<String>,
-    cluster_url: Option<String>,
-    node_id: Option<String>,
-    max_ram_gb: Option<f64>,
+    batch: usize,
+    inflight: u64,
+    queue: usize,
+    prefetch: usize,
+    target_bytes: Option<u64>,
+    batch_bytes: Option<u64>,
+    start: Option<u64>,
+    end: Option<u64>,
+    resume: Option<Vec<u8>>,
+    job: Option<String>,
+    coord: Option<String>,
+    node: Option<String>,
+    ram_gb: Option<f64>,
     profile: Option<String>,
-    autotune: Option<bool>,
+    tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
     autopack: bool,
-    autopack_shard_mb: u64,
+    shard_mb: u64,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let dataset_link = data;
+    let manifest_store = store;
+    let manifest_path = manifest;
+    let batch_size_samples = batch;
+    let max_inflight_bytes = inflight;
+    let max_queue_batches = queue;
+    let prefetch_batches = prefetch;
+    let target_batch_bytes = target_bytes;
+    let max_batch_bytes = batch_bytes;
+    let start_id = start;
+    let end_id = end;
+    let resume_from = resume;
+    let job_id = job;
+    let cluster_url = coord;
+    let node_id = node;
+    let max_ram_gb = ram_gb;
+    let autotune = tune;
+    let autopack_shard_mb = shard_mb;
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
     let runtime_cfg = runtime.as_ref().map(|r| r.bind(py).borrow().clone());
@@ -437,7 +471,7 @@ pub(crate) fn load<'py>(
                 .is_some()
             {
                 return Err(PyValueError::new_err(
-                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                    "pass only one of ram_gb or constraints.max_ram_bytes",
                 ));
             }
             effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
@@ -503,7 +537,7 @@ pub(crate) fn load<'py>(
     if distributed_requested(cluster_url.as_deref()) {
         if start_id.is_some() || end_id.is_some() {
             return Err(PyValueError::new_err(
-                "start_id/end_id are unsupported in distributed mode",
+                "start/end are unsupported in distributed mode",
             ));
         }
         if autopack {
@@ -513,16 +547,16 @@ pub(crate) fn load<'py>(
         }
         if manifest_store.is_some() || manifest_path.is_some() {
             return Err(PyValueError::new_err(
-                "manifest_store/manifest_path are unsupported in distributed mode; coordinator owns snapshot resolution",
+                "store/manifest are unsupported in distributed mode; coordinator owns snapshot resolution",
             ));
         }
         let coord_url = effective_cluster_url(cluster_url).ok_or_else(|| {
             PyValueError::new_err(
-                "distributed mode requires cluster_url (or MX8_CLUSTER_URL / MX8_COORD_URL)",
+                "distributed mode requires coord (or MX8_CLUSTER_URL / MX8_COORD_URL)",
             )
         })?;
         let job_id = job_id.or_else(|| env_string("MX8_JOB_ID")).ok_or_else(|| {
-            PyValueError::new_err("distributed mode requires job_id (or MX8_JOB_ID)")
+            PyValueError::new_err("distributed mode requires job (or MX8_JOB_ID)")
         })?;
         let rank = rank_from_env();
         let node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
@@ -580,19 +614,19 @@ pub(crate) fn load<'py>(
 
 #[pyfunction]
 #[pyo3(signature = (
-    dataset,
+    data,
     *,
-    batch_size=512,
-    memory_gb=8.0,
+    batch=512,
+    ram_gb=8.0,
     profile="balanced".to_string(),
-    job_id=None,
-    resume_from=None,
-    coordinator=None,
-    node_id=None,
+    job=None,
+    resume=None,
+    coord=None,
+    node=None,
     recursive=true,
-    manifest_store=None,
-    manifest_path=None,
-    autotune=None,
+    store=None,
+    manifest=None,
+    tune=None,
     constraints=None,
     runtime=None,
 ))]
@@ -601,24 +635,34 @@ pub(crate) fn load<'py>(
 ///
 /// - Single-node (`WORLD_SIZE` unset/1): delegates to `mx8.load(...)`.
 /// - Distributed (`WORLD_SIZE > 1`): delegates to `mx8.DistributedDataLoader(...)`
-///   and requires `job_id` + coordinator URL (`coordinator=` or `MX8_COORD_URL`).
+///   and requires `job` + coord URL (`coord=` or `MX8_COORD_URL`).
 pub(crate) fn run<'py>(
     py: Python<'py>,
-    dataset: String,
-    batch_size: usize,
-    memory_gb: f64,
+    data: String,
+    batch: usize,
+    ram_gb: f64,
     profile: String,
-    job_id: Option<String>,
-    resume_from: Option<Vec<u8>>,
-    coordinator: Option<String>,
-    node_id: Option<String>,
+    job: Option<String>,
+    resume: Option<Vec<u8>>,
+    coord: Option<String>,
+    node: Option<String>,
     recursive: bool,
-    manifest_store: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
-    autotune: Option<bool>,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
+    tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let dataset = data;
+    let batch_size = batch;
+    let memory_gb = ram_gb;
+    let job_id = job;
+    let resume_from = resume;
+    let coordinator = coord;
+    let node_id = node;
+    let manifest_store = store;
+    let manifest_path = manifest;
+    let autotune = tune;
     let world_size = std::env::var("WORLD_SIZE")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
@@ -629,14 +673,14 @@ pub(crate) fn run<'py>(
             .or_else(|| std::env::var("MX8_COORD_URL").ok())
             .ok_or_else(|| {
                 PyValueError::new_err(
-                    "mx8.run distributed mode requires coordinator URL (pass coordinator=... or set MX8_COORD_URL)",
+                    "mx8.run distributed mode requires coord URL (pass coord=... or set MX8_COORD_URL)",
                 )
             })?;
         let effective_job_id = job_id
             .or_else(|| std::env::var("MX8_JOB_ID").ok())
             .ok_or_else(|| {
                 PyValueError::new_err(
-                    "mx8.run distributed mode requires job_id (pass job_id=... or set MX8_JOB_ID)",
+                    "mx8.run distributed mode requires job (pass job=... or set MX8_JOB_ID)",
                 )
             })?;
         let rank = std::env::var("RANK")
@@ -703,74 +747,95 @@ pub(crate) fn run<'py>(
 #[pyfunction]
 #[pyo3(name = "text")]
 #[pyo3(signature = (
-    dataset_link,
+    data,
     *,
-    manifest_store=None,
-    manifest_path=None,
+    store=None,
+    manifest=None,
     recursive=true,
-    batch_size_samples=32,
-    max_inflight_bytes=128*1024*1024,
-    max_queue_batches=64,
-    prefetch_batches=1,
-    target_batch_bytes=None,
-    max_batch_bytes=None,
-    start_id=None,
-    end_id=None,
-    resume_from=None,
-    job_id=None,
-    cluster_url=None,
-    node_id=None,
-    max_ram_gb=None,
+    batch=32,
+    inflight=128*1024*1024,
+    queue=64,
+    prefetch=1,
+    target_bytes=None,
+    batch_bytes=None,
+    start=None,
+    end=None,
+    resume=None,
+    job=None,
+    coord=None,
+    node=None,
+    ram_gb=None,
     profile=None,
-    autotune=None,
+    tune=None,
     constraints=None,
     runtime=None,
     tokenizer="gpt2".to_string(),
-    sequence_length=2048,
+    seq_len=2048,
     stride=2048,
     add_bos=false,
     add_eos=true,
     truncate="right".to_string(),
-    return_attention_mask=true,
-    decode_error_policy="error".to_string(),
+    return_mask=true,
+    on_decode_error="error".to_string(),
     autopack=false,
-    autopack_shard_mb=512,
+    shard_mb=512,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn py_text(
     py: Python<'_>,
-    dataset_link: String,
-    manifest_store: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
+    data: String,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     recursive: bool,
-    batch_size_samples: usize,
-    max_inflight_bytes: u64,
-    max_queue_batches: usize,
-    prefetch_batches: usize,
-    target_batch_bytes: Option<u64>,
-    max_batch_bytes: Option<u64>,
-    start_id: Option<u64>,
-    end_id: Option<u64>,
-    resume_from: Option<Vec<u8>>,
-    job_id: Option<String>,
-    cluster_url: Option<String>,
-    node_id: Option<String>,
-    max_ram_gb: Option<f64>,
+    batch: usize,
+    inflight: u64,
+    queue: usize,
+    prefetch: usize,
+    target_bytes: Option<u64>,
+    batch_bytes: Option<u64>,
+    start: Option<u64>,
+    end: Option<u64>,
+    resume: Option<Vec<u8>>,
+    job: Option<String>,
+    coord: Option<String>,
+    node: Option<String>,
+    ram_gb: Option<f64>,
     profile: Option<String>,
-    autotune: Option<bool>,
+    tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
     tokenizer: String,
-    sequence_length: usize,
+    seq_len: usize,
     stride: usize,
     add_bos: bool,
     add_eos: bool,
     truncate: String,
-    return_attention_mask: bool,
-    decode_error_policy: String,
+    return_mask: bool,
+    on_decode_error: String,
     autopack: bool,
-    autopack_shard_mb: u64,
+    shard_mb: u64,
 ) -> PyResult<Py<TextLoader>> {
+    let dataset_link = data;
+    let manifest_store = store;
+    let manifest_path = manifest;
+    let batch_size_samples = batch;
+    let max_inflight_bytes = inflight;
+    let max_queue_batches = queue;
+    let prefetch_batches = prefetch;
+    let target_batch_bytes = target_bytes;
+    let max_batch_bytes = batch_bytes;
+    let start_id = start;
+    let end_id = end;
+    let resume_from = resume;
+    let job_id = job;
+    let cluster_url = coord;
+    let node_id = node;
+    let max_ram_gb = ram_gb;
+    let autotune = tune;
+    let sequence_length = seq_len;
+    let return_attention_mask = return_mask;
+    let decode_error_policy = on_decode_error;
+    let autopack_shard_mb = shard_mb;
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
     if sequence_length == 0 {
         return Err(PyValueError::new_err("sequence_length must be > 0"));
@@ -853,7 +918,7 @@ pub(crate) fn py_text(
                 .is_some()
             {
                 return Err(PyValueError::new_err(
-                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                    "pass only one of ram_gb or constraints.max_ram_bytes",
                 ));
             }
             effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
@@ -887,7 +952,7 @@ pub(crate) fn py_text(
     if distributed_requested(cluster_url.as_deref()) {
         if start_id.is_some() || end_id.is_some() {
             return Err(PyValueError::new_err(
-                "start_id/end_id are unsupported in distributed mode",
+                "start/end are unsupported in distributed mode",
             ));
         }
         if autopack {
@@ -897,16 +962,16 @@ pub(crate) fn py_text(
         }
         if manifest_store.is_some() || manifest_path.is_some() {
             return Err(PyValueError::new_err(
-                "manifest_store/manifest_path are unsupported in distributed mode; coordinator owns snapshot resolution",
+                "store/manifest are unsupported in distributed mode; coordinator owns snapshot resolution",
             ));
         }
         let coord_url = effective_cluster_url(cluster_url).ok_or_else(|| {
             PyValueError::new_err(
-                "distributed mode requires cluster_url (or MX8_CLUSTER_URL / MX8_COORD_URL)",
+                "distributed mode requires coord (or MX8_CLUSTER_URL / MX8_COORD_URL)",
             )
         })?;
         let job_id = job_id.or_else(|| env_string("MX8_JOB_ID")).ok_or_else(|| {
-            PyValueError::new_err("distributed mode requires job_id (or MX8_JOB_ID)")
+            PyValueError::new_err("distributed mode requires job (or MX8_JOB_ID)")
         })?;
         let rank = rank_from_env();
         let node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
@@ -987,66 +1052,87 @@ pub(crate) fn py_text(
 #[pyfunction]
 #[pyo3(name = "audio")]
 #[pyo3(signature = (
-    dataset_link,
+    data,
     *,
-    manifest_store=None,
-    manifest_path=None,
+    store=None,
+    manifest=None,
     recursive=true,
-    batch_size_samples=32,
-    max_inflight_bytes=128*1024*1024,
-    max_queue_batches=64,
-    prefetch_batches=1,
-    target_batch_bytes=None,
-    max_batch_bytes=None,
-    start_id=None,
-    end_id=None,
-    resume_from=None,
-    job_id=None,
-    cluster_url=None,
-    node_id=None,
-    max_ram_gb=None,
+    batch=32,
+    inflight=128*1024*1024,
+    queue=64,
+    prefetch=1,
+    target_bytes=None,
+    batch_bytes=None,
+    start=None,
+    end=None,
+    resume=None,
+    job=None,
+    coord=None,
+    node=None,
+    ram_gb=None,
     profile=None,
-    autotune=None,
+    tune=None,
     constraints=None,
     runtime=None,
-    sample_count=16000,
+    samples=16000,
     channels=1,
-    sample_rate_hz=None,
-    decode_error_policy="error".to_string(),
+    rate_hz=None,
+    on_decode_error="error".to_string(),
     autopack=false,
-    autopack_shard_mb=512,
+    shard_mb=512,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn py_audio(
     py: Python<'_>,
-    dataset_link: String,
-    manifest_store: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
+    data: String,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     recursive: bool,
-    batch_size_samples: usize,
-    max_inflight_bytes: u64,
-    max_queue_batches: usize,
-    prefetch_batches: usize,
-    target_batch_bytes: Option<u64>,
-    max_batch_bytes: Option<u64>,
-    start_id: Option<u64>,
-    end_id: Option<u64>,
-    resume_from: Option<Vec<u8>>,
-    job_id: Option<String>,
-    cluster_url: Option<String>,
-    node_id: Option<String>,
-    max_ram_gb: Option<f64>,
+    batch: usize,
+    inflight: u64,
+    queue: usize,
+    prefetch: usize,
+    target_bytes: Option<u64>,
+    batch_bytes: Option<u64>,
+    start: Option<u64>,
+    end: Option<u64>,
+    resume: Option<Vec<u8>>,
+    job: Option<String>,
+    coord: Option<String>,
+    node: Option<String>,
+    ram_gb: Option<f64>,
     profile: Option<String>,
-    autotune: Option<bool>,
+    tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
-    sample_count: usize,
+    samples: usize,
     channels: usize,
-    sample_rate_hz: Option<u32>,
-    decode_error_policy: String,
+    rate_hz: Option<u32>,
+    on_decode_error: String,
     autopack: bool,
-    autopack_shard_mb: u64,
+    shard_mb: u64,
 ) -> PyResult<Py<AudioLoader>> {
+    let dataset_link = data;
+    let manifest_store = store;
+    let manifest_path = manifest;
+    let batch_size_samples = batch;
+    let max_inflight_bytes = inflight;
+    let max_queue_batches = queue;
+    let prefetch_batches = prefetch;
+    let target_batch_bytes = target_bytes;
+    let max_batch_bytes = batch_bytes;
+    let start_id = start;
+    let end_id = end;
+    let resume_from = resume;
+    let job_id = job;
+    let cluster_url = coord;
+    let node_id = node;
+    let max_ram_gb = ram_gb;
+    let autotune = tune;
+    let sample_count = samples;
+    let sample_rate_hz = rate_hz;
+    let decode_error_policy = on_decode_error;
+    let autopack_shard_mb = shard_mb;
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
     if sample_count == 0 {
         return Err(PyValueError::new_err("sample_count must be > 0"));
@@ -1106,7 +1192,7 @@ pub(crate) fn py_audio(
                 .is_some()
             {
                 return Err(PyValueError::new_err(
-                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                    "pass only one of ram_gb or constraints.max_ram_bytes",
                 ));
             }
             effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
@@ -1144,7 +1230,7 @@ pub(crate) fn py_audio(
     if distributed_requested(cluster_url.as_deref()) {
         if start_id.is_some() || end_id.is_some() {
             return Err(PyValueError::new_err(
-                "start_id/end_id are unsupported in distributed mode",
+                "start/end are unsupported in distributed mode",
             ));
         }
         if autopack {
@@ -1154,16 +1240,16 @@ pub(crate) fn py_audio(
         }
         if manifest_store.is_some() || manifest_path.is_some() {
             return Err(PyValueError::new_err(
-                "manifest_store/manifest_path are unsupported in distributed mode; coordinator owns snapshot resolution",
+                "store/manifest are unsupported in distributed mode; coordinator owns snapshot resolution",
             ));
         }
         let coord_url = effective_cluster_url(cluster_url).ok_or_else(|| {
             PyValueError::new_err(
-                "distributed mode requires cluster_url (or MX8_CLUSTER_URL / MX8_COORD_URL)",
+                "distributed mode requires coord (or MX8_CLUSTER_URL / MX8_COORD_URL)",
             )
         })?;
         let job_id = job_id.or_else(|| env_string("MX8_JOB_ID")).ok_or_else(|| {
-            PyValueError::new_err("distributed mode requires job_id (or MX8_JOB_ID)")
+            PyValueError::new_err("distributed mode requires job (or MX8_JOB_ID)")
         })?;
         let rank = rank_from_env();
         let node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
@@ -1236,84 +1322,112 @@ pub(crate) fn py_audio(
 #[pyfunction]
 #[pyo3(name = "image")]
 #[pyo3(signature = (
-    dataset_link,
+    data,
     *,
-    manifest_store=None,
-    manifest_path=None,
+    store=None,
+    manifest=None,
     recursive=true,
-    batch_size_samples=32,
-    max_inflight_bytes=128*1024*1024,
-    max_queue_batches=64,
-    prefetch_batches=1,
-    target_batch_bytes=None,
-    max_batch_bytes=None,
-    start_id=None,
-    end_id=None,
-    resume_from=None,
-    job_id=None,
-    cluster_url=None,
-    node_id=None,
-    max_ram_gb=None,
+    batch=32,
+    inflight=128*1024*1024,
+    queue=64,
+    prefetch=1,
+    target_bytes=None,
+    batch_bytes=None,
+    start=None,
+    end=None,
+    resume=None,
+    job=None,
+    coord=None,
+    node=None,
+    ram_gb=None,
     profile=None,
-    autotune=None,
+    tune=None,
     constraints=None,
     runtime=None,
     augment=None,
-    resize_hw=None,
-    crop_hw=None,
-    horizontal_flip_p=None,
-    color_jitter_brightness=None,
-    color_jitter_contrast=None,
-    color_jitter_saturation=None,
-    color_jitter_hue=None,
-    normalize_mean=None,
-    normalize_std=None,
+    resize=None,
+    crop=None,
+    flip_p=None,
+    jitter_brightness=None,
+    jitter_contrast=None,
+    jitter_saturation=None,
+    jitter_hue=None,
+    mean=None,
+    std=None,
     seed=0,
     epoch=0,
-    to_float=true,
+    float_out=true,
     autopack=false,
-    autopack_shard_mb=512,
+    shard_mb=512,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn py_image(
     py: Python<'_>,
-    dataset_link: String,
-    manifest_store: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
+    data: String,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     recursive: bool,
-    batch_size_samples: usize,
-    max_inflight_bytes: u64,
-    max_queue_batches: usize,
-    prefetch_batches: usize,
-    target_batch_bytes: Option<u64>,
-    max_batch_bytes: Option<u64>,
-    start_id: Option<u64>,
-    end_id: Option<u64>,
-    resume_from: Option<Vec<u8>>,
-    job_id: Option<String>,
-    cluster_url: Option<String>,
-    node_id: Option<String>,
-    max_ram_gb: Option<f64>,
+    batch: usize,
+    inflight: u64,
+    queue: usize,
+    prefetch: usize,
+    target_bytes: Option<u64>,
+    batch_bytes: Option<u64>,
+    start: Option<u64>,
+    end: Option<u64>,
+    resume: Option<Vec<u8>>,
+    job: Option<String>,
+    coord: Option<String>,
+    node: Option<String>,
+    ram_gb: Option<f64>,
     profile: Option<String>,
-    autotune: Option<bool>,
+    tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
     augment: Option<String>,
-    resize_hw: Option<(u32, u32)>,
-    crop_hw: Option<(u32, u32)>,
-    horizontal_flip_p: Option<f32>,
-    color_jitter_brightness: Option<f32>,
-    color_jitter_contrast: Option<f32>,
-    color_jitter_saturation: Option<f32>,
-    color_jitter_hue: Option<f32>,
-    normalize_mean: Option<(f32, f32, f32)>,
-    normalize_std: Option<(f32, f32, f32)>,
+    resize: Option<(u32, u32)>,
+    crop: Option<(u32, u32)>,
+    flip_p: Option<f32>,
+    jitter_brightness: Option<f32>,
+    jitter_contrast: Option<f32>,
+    jitter_saturation: Option<f32>,
+    jitter_hue: Option<f32>,
+    mean: Option<(f32, f32, f32)>,
+    std: Option<(f32, f32, f32)>,
     seed: u64,
     epoch: u64,
-    to_float: bool,
+    float_out: bool,
     autopack: bool,
-    autopack_shard_mb: u64,
+    shard_mb: u64,
 ) -> PyResult<Py<ImageLoader>> {
+    let dataset_link = data;
+    let manifest_store = store;
+    let manifest_path = manifest;
+    let batch_size_samples = batch;
+    let max_inflight_bytes = inflight;
+    let max_queue_batches = queue;
+    let prefetch_batches = prefetch;
+    let target_batch_bytes = target_bytes;
+    let max_batch_bytes = batch_bytes;
+    let start_id = start;
+    let end_id = end;
+    let resume_from = resume;
+    let job_id = job;
+    let cluster_url = coord;
+    let node_id = node;
+    let max_ram_gb = ram_gb;
+    let autotune = tune;
+    let resize_hw = resize;
+    let crop_hw = crop;
+    let horizontal_flip_p = flip_p;
+    let color_jitter_brightness = jitter_brightness;
+    let color_jitter_contrast = jitter_contrast;
+    let color_jitter_saturation = jitter_saturation;
+    let color_jitter_hue = jitter_hue;
+    let normalize_mean = mean;
+    let normalize_std = std;
+    let to_float = float_out;
+    let autopack_shard_mb = shard_mb;
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
 
     if autopack && dataset_link.starts_with("s3://") && !dataset_link.contains('@') {
@@ -1472,7 +1586,7 @@ pub(crate) fn py_image(
                 .is_some()
             {
                 return Err(PyValueError::new_err(
-                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                    "pass only one of ram_gb or constraints.max_ram_bytes",
                 ));
             }
             effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
@@ -1506,7 +1620,7 @@ pub(crate) fn py_image(
     if distributed_requested(cluster_url.as_deref()) {
         if start_id.is_some() || end_id.is_some() {
             return Err(PyValueError::new_err(
-                "start_id/end_id are unsupported in distributed mode",
+                "start/end are unsupported in distributed mode",
             ));
         }
         if autopack {
@@ -1516,16 +1630,16 @@ pub(crate) fn py_image(
         }
         if manifest_store.is_some() || manifest_path.is_some() {
             return Err(PyValueError::new_err(
-                "manifest_store/manifest_path are unsupported in distributed mode; coordinator owns snapshot resolution",
+                "store/manifest are unsupported in distributed mode; coordinator owns snapshot resolution",
             ));
         }
         let coord_url = effective_cluster_url(cluster_url).ok_or_else(|| {
             PyValueError::new_err(
-                "distributed mode requires cluster_url (or MX8_CLUSTER_URL / MX8_COORD_URL)",
+                "distributed mode requires coord (or MX8_CLUSTER_URL / MX8_COORD_URL)",
             )
         })?;
         let job_id = job_id.or_else(|| env_string("MX8_JOB_ID")).ok_or_else(|| {
-            PyValueError::new_err("distributed mode requires job_id (or MX8_JOB_ID)")
+            PyValueError::new_err("distributed mode requires job (or MX8_JOB_ID)")
         })?;
         let rank = rank_from_env();
         let node_id = node_id.unwrap_or_else(|| format!("rank{rank}"));
@@ -1697,50 +1811,61 @@ fn detect_video_experimental_device_direct_write(
 
 #[pyfunction]
 #[pyo3(signature = (
-    dataset_link,
+    data,
     *,
-    manifest_store=None,
-    manifest_path=None,
+    store=None,
+    manifest=None,
     recursive=true,
-    clip_len=16,
+    clip=16,
     stride=8,
     fps=8,
-    batch_size_samples=32,
+    batch=32,
     seed=0,
     epoch=0,
-    resume_from=None,
-    job_id=None,
-    cluster_url=None,
-    max_ram_gb=None,
+    resume=None,
+    job=None,
+    coord=None,
+    ram_gb=None,
     profile=None,
-    autotune=None,
+    tune=None,
     constraints=None,
     runtime=None,
-    node_id=None
+    node=None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn video(
     py: Python<'_>,
-    dataset_link: String,
-    manifest_store: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
+    data: String,
+    store: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     recursive: bool,
-    clip_len: u32,
+    clip: u32,
     stride: u32,
     fps: u32,
-    batch_size_samples: usize,
+    batch: usize,
     seed: u64,
     epoch: u64,
-    resume_from: Option<Vec<u8>>,
-    job_id: Option<String>,
-    cluster_url: Option<String>,
-    max_ram_gb: Option<f64>,
+    resume: Option<Vec<u8>>,
+    job: Option<String>,
+    coord: Option<String>,
+    ram_gb: Option<f64>,
     profile: Option<String>,
-    autotune: Option<bool>,
+    tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
-    node_id: Option<String>,
+    node: Option<String>,
 ) -> PyResult<Py<VideoDataLoader>> {
+    let dataset_link = data;
+    let manifest_store = store;
+    let manifest_path = manifest;
+    let clip_len = clip;
+    let batch_size_samples = batch;
+    let resume_from = resume;
+    let job_id = job;
+    let cluster_url = coord;
+    let max_ram_gb = ram_gb;
+    let autotune = tune;
+    let node_id = node;
     if fps == 0 {
         return Err(PyValueError::new_err("video fps must be > 0"));
     }
@@ -1851,7 +1976,7 @@ pub(crate) fn video(
             .is_some()
         {
             return Err(PyValueError::new_err(
-                "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                "pass only one of ram_gb or constraints.max_ram_bytes",
             ));
         }
         effective_max_process_rss_bytes = Some(max_ram_bytes.max(1));
@@ -1951,13 +2076,11 @@ pub(crate) fn video(
     let bytes_per_clip = env_usize("MX8_VIDEO_STAGE2_BYTES_PER_CLIP", 4096).max(1);
     let decode_contract = VideoDataLoader::derive_decode_contract(clip_len, bytes_per_clip)?;
     if batch_size_samples == 0 {
-        return Err(PyValueError::new_err(
-            "video batch_size_samples must be > 0",
-        ));
+        return Err(PyValueError::new_err("video batch must be > 0"));
     }
     if (batch_size_samples as u64).saturating_mul(bytes_per_clip as u64) > max_inflight_bytes {
         return Err(PyValueError::new_err(format!(
-            "video batch_size_samples ({batch_size_samples}) * bytes_per_clip ({bytes_per_clip}) exceeds max_inflight_bytes ({max_inflight_bytes}); lower batch size or raise cap"
+            "video batch ({batch_size_samples}) * bytes_per_clip ({bytes_per_clip}) exceeds inflight ({max_inflight_bytes}); lower batch or raise inflight"
         )));
     }
     let video_runtime_autotune_period_batches = env_u64("MX8_VIDEO_AUTOTUNE_PERIOD_BATCHES")
@@ -1969,43 +2092,43 @@ pub(crate) fn video(
     if let Some(token) = &resume_token {
         if token.manifest_hash != snapshot.manifest_hash.0 {
             return Err(PyValueError::new_err(format!(
-                "resume_from manifest_hash mismatch: token={} current={}",
+                "resume manifest_hash mismatch: token={} current={}",
                 token.manifest_hash, snapshot.manifest_hash.0
             )));
         }
         if token.seed != seed {
             return Err(PyValueError::new_err(format!(
-                "resume_from seed mismatch: token={} current={}",
+                "resume seed mismatch: token={} current={}",
                 token.seed, seed
             )));
         }
         if token.epoch != epoch {
             return Err(PyValueError::new_err(format!(
-                "resume_from epoch mismatch: token={} current={}",
+                "resume epoch mismatch: token={} current={}",
                 token.epoch, epoch
             )));
         }
         if token.clip_len != clip_len || token.stride != stride || token.fps != fps {
             return Err(PyValueError::new_err(
-                "resume_from video clip configuration mismatch",
+                "resume video clip configuration mismatch",
             ));
         }
         if token.assigned_rank != assigned_rank || token.world_size != world_size {
             return Err(PyValueError::new_err(format!(
-                "resume_from distributed shape mismatch: token rank/world={}/{} current={}/{}",
+                "resume distributed shape mismatch: token rank/world={}/{} current={}/{}",
                 token.assigned_rank, token.world_size, assigned_rank, world_size
             )));
         }
         if token.clips_total != clips_total {
             return Err(PyValueError::new_err(format!(
-                "resume_from clips_total mismatch: token={} current={}",
+                "resume clips_total mismatch: token={} current={}",
                 token.clips_total, clips_total
             )));
         }
         next_idx = usize::try_from(token.next_idx)
-            .map_err(|_| PyValueError::new_err("resume_from next_idx overflow"))?;
+            .map_err(|_| PyValueError::new_err("resume next_idx overflow"))?;
         if next_idx > clips.len() {
-            return Err(PyValueError::new_err("resume_from next_idx out of range"));
+            return Err(PyValueError::new_err("resume next_idx out of range"));
         }
     }
 
@@ -2114,40 +2237,48 @@ pub(crate) fn video(
 
 #[pyfunction]
 #[pyo3(signature = (
-    loaders,
+    sources,
     *,
     weights,
     seed=0,
     epoch=0,
-    starvation_window=10_000,
-    source_exhausted="error",
-    resume_from=None,
-    job_id=None,
-    cluster_url=None,
-    max_ram_gb=None,
+    starvation=10_000,
+    on_source_exhausted="error",
+    resume=None,
+    job=None,
+    coord=None,
+    ram_gb=None,
     profile=None,
-    autotune=None,
+    tune=None,
     constraints=None,
     runtime=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mix(
     py: Python<'_>,
-    loaders: Vec<Py<PyAny>>,
+    sources: Vec<Py<PyAny>>,
     weights: Vec<f64>,
     seed: u64,
     epoch: u64,
-    starvation_window: u64,
-    source_exhausted: &str,
-    resume_from: Option<Vec<u8>>,
-    job_id: Option<String>,
-    cluster_url: Option<String>,
-    max_ram_gb: Option<f64>,
+    starvation: u64,
+    on_source_exhausted: &str,
+    resume: Option<Vec<u8>>,
+    job: Option<String>,
+    coord: Option<String>,
+    ram_gb: Option<f64>,
     profile: Option<String>,
-    autotune: Option<bool>,
+    tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
 ) -> PyResult<Py<MixedDataLoader>> {
+    let loaders = sources;
+    let starvation_window = starvation;
+    let source_exhausted = on_source_exhausted;
+    let resume_from = resume;
+    let job_id = job;
+    let cluster_url = coord;
+    let max_ram_gb = ram_gb;
+    let autotune = tune;
     let _ = (job_id, cluster_url);
     if loaders.is_empty() {
         return Err(PyValueError::new_err(
@@ -2284,7 +2415,7 @@ pub(crate) fn mix(
                 .is_some()
             {
                 return Err(PyValueError::new_err(
-                    "pass only one of max_ram_gb or constraints.max_ram_bytes",
+                    "pass only one of ram_gb or constraints.max_ram_bytes",
                 ));
             }
             mix_max_process_rss_bytes = Some(max_ram_bytes.max(1));
@@ -2589,18 +2720,19 @@ pub(crate) fn pick_free_port() -> Option<u16> {
 ///     loader = mx8.DistributedDataLoader(coord_url=coord.url, ...)
 /// ```
 #[pyfunction]
-#[pyo3(signature = (*, rank=None, world_size=1, dataset_link=None, port=None, bind_host="127.0.0.1".to_string(), master_addr=None, timeout_secs=30, log=false))]
+#[pyo3(signature = (*, rank=None, world_size=1, data=None, port=None, bind_host="127.0.0.1".to_string(), master_addr=None, timeout_secs=30, log=false))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn coordinator(
     rank: Option<u32>,
     world_size: u32,
-    dataset_link: Option<String>,
+    data: Option<String>,
     port: Option<u16>,
     bind_host: String,
     master_addr: Option<String>,
     timeout_secs: u64,
     log: bool,
 ) -> PyResult<CoordinatorHandle> {
+    let dataset_link = data;
     let is_rank_zero = rank.is_none_or(|r| r == 0);
 
     // Port selection:

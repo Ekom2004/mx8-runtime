@@ -13,15 +13,15 @@ def ensure(cond: bool, msg: str) -> None:
 def read_first_batch(dataset_link: str, manifest_store: str, policy: str):
     loader = mx8.audio(
         dataset_link,
-        manifest_store=manifest_store,
-        batch_size_samples=16,
-        sample_count=4096,
+        store=manifest_store,
+        batch=16,
+        samples=4096,
         channels=1,
-        sample_rate_hz=16000,
-        decode_error_policy=policy,
-        prefetch_batches=2,
-        max_queue_batches=8,
-        max_inflight_bytes=64 * 1024 * 1024,
+        rate_hz=16000,
+        on_decode_error=policy,
+        prefetch=2,
+        queue=8,
+        inflight=64 * 1024 * 1024,
     )
     try:
         batch = next(iter(loader))
@@ -52,15 +52,15 @@ def main() -> None:
 
     loader_err = mx8.audio(
         dataset_link,
-        manifest_store=manifest_store,
-        batch_size_samples=16,
-        sample_count=4096,
+        store=manifest_store,
+        batch=16,
+        samples=4096,
         channels=1,
-        sample_rate_hz=16000,
-        decode_error_policy="error",
-        prefetch_batches=2,
-        max_queue_batches=8,
-        max_inflight_bytes=64 * 1024 * 1024,
+        rate_hz=16000,
+        on_decode_error="error",
+        prefetch=2,
+        queue=8,
+        inflight=64 * 1024 * 1024,
     )
     try:
         got_error = False

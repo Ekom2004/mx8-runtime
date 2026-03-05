@@ -20,12 +20,12 @@ def main() -> None:
 
     loader = mx8.image(
         link,
-        manifest_store=root,
-        batch_size_samples=batch_size,
-        max_ram_gb=4,
+        store=root,
+        batch=batch_size,
+        ram_gb=4,
         profile="balanced",
-        node_id=os.environ.get("MX8_NODE_ID", "py_train"),
-        to_float=True,
+        node=os.environ.get("MX8_NODE_ID", "py_train"),
+        float_out=True,
     )
 
     model = None

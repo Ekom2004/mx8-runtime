@@ -65,16 +65,16 @@ def main() -> None:
     batch_size = 4
     loader = mx8.video(
         str(data_root),
-        manifest_store=str(store_root),
+        store=str(store_root),
         recursive=True,
-        clip_len=4,
+        clip=4,
         stride=2,
         fps=8,
-        batch_size_samples=batch_size,
+        batch=batch_size,
         constraints=mx8.Constraints(max_inflight_bytes=32 * 1024 * 1024),
-        max_ram_gb=4,
+        ram_gb=4,
         profile="balanced",
-        autotune=True,
+        tune=True,
     )
 
     initial = dict(loader.stats())

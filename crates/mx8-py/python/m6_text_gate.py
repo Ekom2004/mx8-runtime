@@ -19,19 +19,19 @@ def read_first_batch(
 ):
     loader = mx8.text(
         dataset_link,
-        manifest_store=manifest_store,
-        manifest_path=manifest_path,
+        store=manifest_store,
+        manifest=manifest_path,
         tokenizer=tokenizer_json,
-        sequence_length=8,
+        seq_len=8,
         stride=8,
-        batch_size_samples=16,
-        return_attention_mask=True,
-        decode_error_policy=policy,
+        batch=16,
+        return_mask=True,
+        on_decode_error=policy,
         add_bos=False,
         add_eos=False,
-        prefetch_batches=2,
-        max_queue_batches=8,
-        max_inflight_bytes=64 * 1024 * 1024,
+        prefetch=2,
+        queue=8,
+        inflight=64 * 1024 * 1024,
     )
     try:
         batch = next(iter(loader))
@@ -68,19 +68,19 @@ def main() -> None:
     # error-policy run must fail on invalid UTF-8 sample.
     loader_err = mx8.text(
         dataset_link,
-        manifest_store=manifest_store,
-        manifest_path=manifest_path,
+        store=manifest_store,
+        manifest=manifest_path,
         tokenizer=tokenizer_json,
-        sequence_length=8,
+        seq_len=8,
         stride=8,
-        batch_size_samples=16,
-        return_attention_mask=True,
-        decode_error_policy="error",
+        batch=16,
+        return_mask=True,
+        on_decode_error="error",
         add_bos=False,
         add_eos=False,
-        prefetch_batches=2,
-        max_queue_batches=8,
-        max_inflight_bytes=64 * 1024 * 1024,
+        prefetch=2,
+        queue=8,
+        inflight=64 * 1024 * 1024,
     )
     try:
         got_error = False

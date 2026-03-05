@@ -40,11 +40,11 @@ def _run_once(
 ):
     loader_a = mx8.load(
         link_a,
-        manifest_store=store_root,
-        manifest_path=manifest_a,
-        batch_size_samples=1,
-        max_queue_batches=8,
-        prefetch_batches=1,
+        store=store_root,
+        manifest=manifest_a,
+        batch=1,
+        queue=8,
+        prefetch=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -52,11 +52,11 @@ def _run_once(
     )
     loader_b = mx8.load(
         link_b,
-        manifest_store=store_root,
-        manifest_path=manifest_b,
-        batch_size_samples=1,
-        max_queue_batches=8,
-        prefetch_batches=1,
+        store=store_root,
+        manifest=manifest_b,
+        batch=1,
+        queue=8,
+        prefetch=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -68,10 +68,10 @@ def _run_once(
         weights=weights,
         seed=seed,
         epoch=epoch,
-        starvation_window=10_000,
-        source_exhausted=source_exhausted,
+        starvation=10_000,
+        on_source_exhausted=source_exhausted,
         profile=mix_profile,
-        autotune=mix_autotune,
+        tune=mix_autotune,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -127,9 +127,9 @@ def _run_source_exhaustion_policy_checks(
 ) -> None:
     loader_a = mx8.load(
         link_a,
-        manifest_store=store_root,
-        manifest_path=manifest_a,
-        batch_size_samples=1,
+        store=store_root,
+        manifest=manifest_a,
+        batch=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -137,9 +137,9 @@ def _run_source_exhaustion_policy_checks(
     )
     loader_b = mx8.load(
         link_b,
-        manifest_store=store_root,
-        manifest_path=manifest_b,
-        batch_size_samples=1,
+        store=store_root,
+        manifest=manifest_b,
+        batch=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -150,9 +150,9 @@ def _run_source_exhaustion_policy_checks(
         weights=[1.0, 1.0],
         seed=19,
         epoch=5,
-        source_exhausted="error",
+        on_source_exhausted="error",
         profile="balanced",
-        autotune=True,
+        tune=True,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -177,9 +177,9 @@ def _run_source_exhaustion_policy_checks(
 
     loader_a_allow = mx8.load(
         link_a,
-        manifest_store=store_root,
-        manifest_path=manifest_a,
-        batch_size_samples=1,
+        store=store_root,
+        manifest=manifest_a,
+        batch=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -187,9 +187,9 @@ def _run_source_exhaustion_policy_checks(
     )
     loader_b_allow = mx8.load(
         link_b,
-        manifest_store=store_root,
-        manifest_path=manifest_b,
-        batch_size_samples=1,
+        store=store_root,
+        manifest=manifest_b,
+        batch=1,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,
@@ -200,9 +200,9 @@ def _run_source_exhaustion_policy_checks(
         weights=[1.0, 1.0],
         seed=19,
         epoch=5,
-        source_exhausted="allow",
+        on_source_exhausted="allow",
         profile="balanced",
-        autotune=True,
+        tune=True,
         constraints=mx8.Constraints(
             max_inflight_bytes=max_inflight_bytes,
             max_ram_bytes=max_process_rss_bytes,

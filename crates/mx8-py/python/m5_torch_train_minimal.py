@@ -22,10 +22,10 @@ def main() -> None:
 
     loader = mx8.load(
         link,
-        manifest_store=root,
-        manifest_path=dev_manifest,
-        batch_size_samples=32,
-        max_ram_gb=4,
+        store=root,
+        manifest=dev_manifest,
+        batch=32,
+        ram_gb=4,
         profile="balanced",
     )
 

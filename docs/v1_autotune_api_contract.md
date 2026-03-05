@@ -19,9 +19,9 @@ The simple path lets MX8 do the work:
 ```python
 loader = mx8.load(
     "s3://bucket/train@refresh",
-    max_ram_gb=24,
+    ram_gb=24,
     profile="balanced",
-    autotune=True,
+    tune=True,
 )
 ```
 
@@ -30,9 +30,9 @@ The constrained path keeps autotune active but pins specific caps:
 ```python
 loader = mx8.load(
     "s3://bucket/train@refresh",
-    max_ram_gb=24,
+    ram_gb=24,
     profile="throughput",
-    autotune=True,
+    tune=True,
     constraints=mx8.Constraints(
         max_inflight_bytes=512 * 1024 * 1024,
         max_ram_bytes=24 * 1024 * 1024 * 1024,
@@ -45,8 +45,8 @@ The manual path disables adaptation entirely:
 ```python
 loader = mx8.load(
     "s3://bucket/train@refresh",
-    max_ram_gb=24,
-    autotune=False,
+    ram_gb=24,
+    tune=False,
     runtime=mx8.RuntimeConfig(
         prefetch_batches=8,
         max_queue_batches=32,
@@ -58,7 +58,7 @@ loader = mx8.load(
 
 ## Contract rules
 
-`profile` sets the safety defaults including minimum headroom requirements. `constraints` overrides specific profile safety defaults. `autotune=True` adjusts only runtime knobs — `prefetch_batches`, `max_queue_batches`, and `want` — within the safety constraints. Autotune never increases hard caps. When both `runtime` and `autotune=True` are provided, the runtime values are treated as starting points and clamped to constraints.
+`profile` sets the safety defaults including minimum headroom requirements. `constraints` overrides specific profile safety defaults. `tune=True` adjusts only runtime knobs — `prefetch_batches`, `max_queue_batches`, and `want` — within the safety constraints. Autotune never increases hard caps. When both `runtime` and `tune=True` are provided, the runtime values are treated as starting points and clamped to constraints.
 
 
 ## Startup flow
@@ -107,4 +107,4 @@ Proof events emitted to the `mx8_proof` log target: `autotune_startup_caps_selec
 
 ## Failure semantics
 
-If RSS exceeds `max_ram_bytes`, MX8 fails fast with an explicit error. If autotune cannot find valid settings within the constraints, it fails with an actionable configuration error. Manual mode (`autotune=False`) never mutates runtime knobs after startup.
+If RSS exceeds `max_ram_bytes`, MX8 fails fast with an explicit error. If autotune cannot find valid settings within the constraints, it fails with an actionable configuration error. Manual mode (`tune=False`) never mutates runtime knobs after startup.

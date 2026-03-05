@@ -95,9 +95,9 @@ import mx8
 
 loader = mx8.image(
     os.environ["MX8_DATASET_LINK"],
-    manifest_store=os.environ["MX8_MANIFEST_STORE_ROOT"],
-    batch_size_samples=2,
-    prefetch_batches=2,
+    store=os.environ["MX8_MANIFEST_STORE_ROOT"],
+    batch=2,
+    prefetch=2,
 )
 classes = loader.classes
 if classes is None:

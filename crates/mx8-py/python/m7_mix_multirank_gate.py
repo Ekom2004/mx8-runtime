@@ -80,11 +80,11 @@ def _worker(
 
         loader_a = mx8.load(
             link_a,
-            manifest_store=store_root,
-            manifest_path=manifest_a,
-            start_id=start_id,
-            end_id=end_id,
-            batch_size_samples=1,
+            store=store_root,
+            manifest=manifest_a,
+            start=start_id,
+            end=end_id,
+            batch=1,
             constraints=mx8.Constraints(
                 max_inflight_bytes=max_inflight_bytes,
                 max_ram_bytes=max_process_rss_bytes,
@@ -92,11 +92,11 @@ def _worker(
         )
         loader_b = mx8.load(
             link_b,
-            manifest_store=store_root,
-            manifest_path=manifest_b,
-            start_id=start_id,
-            end_id=end_id,
-            batch_size_samples=1,
+            store=store_root,
+            manifest=manifest_b,
+            start=start_id,
+            end=end_id,
+            batch=1,
             constraints=mx8.Constraints(
                 max_inflight_bytes=max_inflight_bytes,
                 max_ram_bytes=max_process_rss_bytes,
@@ -108,9 +108,9 @@ def _worker(
             weights=weights,
             seed=seed,
             epoch=epoch,
-            source_exhausted="allow",
+            on_source_exhausted="allow",
             profile="balanced",
-            autotune=True,
+            tune=True,
             constraints=mx8.Constraints(
                 max_inflight_bytes=max_inflight_bytes,
                 max_ram_bytes=max_process_rss_bytes,

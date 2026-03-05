@@ -38,7 +38,7 @@ Once correctness is confirmed, raise `max_inflight_bytes` and `prefetch_batches`
 
 Increase `want` only if nodes are showing idle gaps between leases. More concurrent leases help when fetch latency is the bottleneck, but they add memory pressure.
 
-If you prefer not to tune manually, use `profile="balanced"` or `profile="throughput"` with `autotune=True` and let MX8 derive and adapt the values for you.
+If you prefer not to tune manually, use `profile="balanced"` or `profile="throughput"` with `tune=True` and let MX8 derive and adapt the values for you.
 
 
 ## S3 throttling

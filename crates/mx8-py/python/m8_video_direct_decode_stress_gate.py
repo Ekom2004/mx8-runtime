@@ -62,15 +62,15 @@ def _collect_batches(data_root: Path, store_root: Path, *, direct_decode: bool):
 
     loader = mx8.video(
         str(data_root),
-        manifest_store=str(store_root),
+        store=str(store_root),
         recursive=True,
-        clip_len=4,
+        clip=4,
         stride=2,
         fps=8,
-        batch_size_samples=2,
-        max_ram_gb=4,
+        batch=2,
+        ram_gb=4,
         profile="balanced",
-        autotune=True,
+        tune=True,
     )
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     digests = []

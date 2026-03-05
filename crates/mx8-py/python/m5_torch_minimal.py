@@ -17,10 +17,10 @@ def main() -> None:
     link = os.environ.get("MX8_DATASET_LINK", "/tmp/dev@refresh")
     loader = mx8.load(
         link,
-        manifest_store=root,
-        manifest_path=dev_manifest,
-        batch_size_samples=8,
-        max_ram_gb=1,
+        store=root,
+        manifest=dev_manifest,
+        batch=8,
+        ram_gb=1,
         profile="safe",
     )
 

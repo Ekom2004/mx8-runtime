@@ -64,6 +64,7 @@ fn mx8(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(video, m)?)?;
     m.add_function(wrap_pyfunction!(mix, m)?)?;
     m.add_function(wrap_pyfunction!(api::stats, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_manifest_hash, m)?)?;
     m.add_class::<CoordinatorHandle>()?;
     m.add_function(wrap_pyfunction!(coordinator, m)?)?;

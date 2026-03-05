@@ -64,12 +64,12 @@ mx8.pack_dir(raw_dir, out=out_dir, shard_mb=1, label_mode="imagefolder", require
 
 loader = mx8.image(
     f"{out_dir}@refresh",
-    manifest_store=store_root,
-    batch_size_samples=2,
+    store=store_root,
+    batch=2,
     constraints=mx8.Constraints(max_inflight_bytes=64 * 1024),
     runtime=mx8.RuntimeConfig(prefetch_batches=4, max_queue_batches=4),
-    autotune=False,
-    to_float=True,
+    tune=False,
+    float_out=True,
 )
 
 classes = loader.classes

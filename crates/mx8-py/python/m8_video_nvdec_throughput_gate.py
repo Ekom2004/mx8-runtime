@@ -50,15 +50,15 @@ def _run_backend(backend: str, data_root: Path, store_root: Path) -> dict:
     os.environ["MX8_VIDEO_DECODE_BACKEND"] = backend
     loader = mx8.video(
         str(data_root),
-        manifest_store=str(store_root),
+        store=str(store_root),
         recursive=True,
-        clip_len=4,
+        clip=4,
         stride=2,
         fps=8,
-        batch_size_samples=2,
-        max_ram_gb=8,
+        batch=2,
+        ram_gb=8,
         profile="throughput",
-        autotune=False,
+        tune=False,
     )
     started = time.perf_counter()
     batches = 0

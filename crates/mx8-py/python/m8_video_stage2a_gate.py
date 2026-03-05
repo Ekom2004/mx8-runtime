@@ -89,12 +89,12 @@ def main() -> None:
 
     loader1 = mx8.video(
         str(ds_root),
-        manifest_store=str(store_root),
+        store=str(store_root),
         recursive=True,
-        clip_len=clip_len,
+        clip=clip_len,
         stride=stride,
         fps=fps,
-        batch_size_samples=batch_size,
+        batch=batch_size,
         seed=seed,
         epoch=epoch,
         constraints=constraints,
@@ -104,12 +104,12 @@ def main() -> None:
 
     loader2 = mx8.video(
         str(ds_root),
-        manifest_store=str(store_root),
+        store=str(store_root),
         recursive=True,
-        clip_len=clip_len,
+        clip=clip_len,
         stride=stride,
         fps=fps,
-        batch_size_samples=batch_size,
+        batch=batch_size,
         seed=seed,
         epoch=epoch,
         constraints=constraints,
@@ -129,12 +129,12 @@ def main() -> None:
     try:
         mx8.video(
             str(ds_root),
-            manifest_store=str(store_root),
+            store=str(store_root),
             recursive=True,
-            clip_len=clip_len,
+            clip=clip_len,
             stride=stride,
             fps=fps,
-            batch_size_samples=batch_size,
+            batch=batch_size,
             seed=seed,
             epoch=epoch,
             constraints=mx8.Constraints(max_inflight_bytes=2 * 1024, max_ram_bytes=None),

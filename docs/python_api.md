@@ -11,7 +11,9 @@ Before you can load from a dataset at production scale, you typically pack it on
 
 `mx8.pack_dir(in_dir, *, out, shard_mb=512, label_mode="auto", require_labels=False)` does the same for a local directory.
 
-`mx8.resolve_manifest_hash(dataset_link, *, manifest_store=None, manifest_path=None, recursive=True, node_id=None)` resolves a dataset link to its pinned manifest hash without starting a loader.
+`mx8.resolve_manifest_hash(data, *, store=None, manifest=None, recursive=True, node=None)` resolves a dataset link to its pinned manifest hash without starting a loader.
+
+`mx8.resolve(...)` is a short alias of `mx8.resolve_manifest_hash(...)` with the same signature and behavior.
 
 `label_mode` accepts `auto`, `none`, or `imagefolder`.
 
@@ -25,8 +27,8 @@ import mx8
 
 loader = mx8.load(
     "s3://bucket/prefix/",
-    batch_size_samples=64,
-    max_ram_gb=12,
+    batch=64,
+    ram_gb=12,
     profile="balanced",
 )
 
@@ -38,14 +40,14 @@ for batch in loader:
 
 Distributed attach is built into loader APIs. Shared optional args:
 
-- `job_id` (required for distributed mode)
-- `cluster_url` (explicit coordinator URL; falls back to `MX8_CLUSTER_URL` / `MX8_COORD_URL`)
-- `resume_from` (checkpoint token)
+- `job` (required for distributed mode)
+- `coord` (explicit coordinator URL; falls back to `MX8_CLUSTER_URL` / `MX8_COORD_URL`)
+- `resume` (checkpoint token)
 
 Single node:
 
 ```python
-loader = mx8.load("s3://bucket/prefix/", batch_size_samples=64, max_ram_gb=12)
+loader = mx8.load("s3://bucket/prefix/", batch=64, ram_gb=12)
 ```
 
 Distributed (explicit attach):
@@ -53,10 +55,10 @@ Distributed (explicit attach):
 ```python
 loader = mx8.load(
     "s3://bucket/prefix/",
-    batch_size_samples=512,
-    max_ram_gb=24,
-    job_id="train-job-001",
-    cluster_url="http://coordinator-host:50051",
+    batch=512,
+    ram_gb=24,
+    job="train-job-001",
+    coord="http://coordinator-host:50051",
 )
 ```
 
@@ -64,53 +66,79 @@ Distributed (env attach):
 
 ```python
 # WORLD_SIZE>1, MX8_JOB_ID, MX8_CLUSTER_URL set by launcher
-loader = mx8.load("s3://bucket/prefix/", batch_size_samples=512, max_ram_gb=24)
+loader = mx8.load("s3://bucket/prefix/", batch=512, ram_gb=24)
 ```
 
 Arguments:
 
-`dataset_link` is a plain path or prefix, optionally followed by `@refresh` to force a fresh snapshot at job start, or `@sha256:<hash>` to pin an exact snapshot.
+`data` is a plain path or prefix, optionally followed by `@refresh` to force a fresh snapshot at job start, or `@sha256:<hash>` to pin an exact snapshot.
 
-`manifest_store` sets the manifest store root (default `~/.mx8/manifests`). Pass a filesystem path.
+`store` sets the manifest store root (default `~/.mx8/manifests`). Pass a filesystem path.
 
-`manifest_path` optionally points to a local manifest TSV for development/override flows.
+`manifest` optionally points to a local manifest TSV for development/override flows.
 
 `recursive` controls whether subdirectories are indexed (default `True`).
 
-`batch_size_samples` sets how many samples per delivered batch.
+`batch` sets how many samples per delivered batch.
 
-`max_ram_gb` is the recommended way to set the memory budget. MX8 derives `max_inflight_bytes` and the process RSS cap from this value based on your profile.
+`ram_gb` is the recommended way to set the memory budget. MX8 derives `max_inflight_bytes` and the process RSS cap from this value based on your profile.
 
-`max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches` are accepted in the function signature for compatibility, but current top-level loader entrypoints derive effective values from `profile`, `constraints`, and `runtime` instead.
+`inflight`, `queue`, and `prefetch` are accepted in the function signature, but current top-level loader entrypoints derive effective values from `profile`, `constraints`, and `runtime` instead.
 
-`target_batch_bytes` and `max_batch_bytes` override the byte-aware batching defaults. MX8 derives these automatically from your inflight cap in most cases.
+`target_bytes` and `batch_bytes` override the byte-aware batching defaults. MX8 derives these automatically from your inflight cap in most cases.
 
-`start_id` and `end_id` must be set together if you want to load a specific sample ID range.
+`start` and `end` must be set together if you want to load a specific sample ID range.
 
-`resume_from` (default `None`) accepts an opaque checkpoint token from `loader.checkpoint()`. When set, MX8 resumes from the token cursor within the requested range. Validation is strict: `manifest_hash`, `schema_version`, `epoch`, and `end_id` must match the current run.
+`resume` (default `None`) accepts an opaque checkpoint token from `loader.checkpoint()`. When set, MX8 resumes from the token cursor within the requested range. Validation is strict: `manifest_hash`, `schema_version`, `epoch`, and `end` must match the current run.
 
-`job_id` (default `None`) is required for distributed mode.
+`job` (default `None`) is required for distributed mode.
 
-`cluster_url` (default `None`) sets the coordinator URL directly for distributed mode.
+`coord` (default `None`) sets the coordinator URL directly for distributed mode.
 
-`node_id` sets node identity used in proof logs and coordinator ownership hints. In distributed attach mode, default is `rank{RANK}` when unset.
+`node` sets node identity used in proof logs and coordinator ownership hints. In distributed attach mode, default is `rank{RANK}` when unset.
 
-`autopack` (default `False`) — if `True` and `dataset_link` is a bare S3 prefix with no manifest, MX8 runs a full pack in-place before starting the loader. The packed shards and manifest are written to the same prefix. Subsequent runs skip the pack step automatically. Use `autopack_shard_mb` (default `512`) to control shard size.
+`autopack` (default `False`) — if `True` and `data` is a bare S3 prefix with no manifest, MX8 runs a full pack in-place before starting the loader. The packed shards and manifest are written to the same prefix. Subsequent runs skip the pack step automatically. Use `shard_mb` (default `512`) to control shard size.
 
 `profile` selects a preset safety/throughput balance: `safe`, `balanced`, or `throughput`.
 
-`autotune` enables the runtime adaptation loop (default `True`). Set to `False` for fully manual control.
+`tune` enables the runtime adaptation loop (default `True`). Set to `False` for fully manual control.
 
 `constraints` accepts an `mx8.Constraints` instance to override specific cap values while keeping autotune active.
 
-`runtime` accepts an `mx8.RuntimeConfig` instance for explicit startup values when `autotune=False`.
+`runtime` accepts an `mx8.RuntimeConfig` instance for explicit startup values when `tune=False`.
 
 Compatibility note:
 - For `mx8.load`, prefer `constraints` and `runtime` for runtime shaping.
 - `constraints.max_inflight_bytes` and `constraints.max_ram_bytes` are the active hard-cap knobs.
 - `runtime.prefetch_batches` and `runtime.max_queue_batches` are the active startup queue knobs.
 
+Determinism note:
+- `mx8.load` does not expose `seed`/`epoch` today.
+- Use pinned snapshots (`@sha256:...`) plus checkpoint/resume for reproducible replay.
+- Seeded schedule controls are currently exposed on `mx8.image`, `mx8.video`, and `mx8.mix`.
+
 Each batch exposes `sample_ids`, `offsets`, `payload`, and `label_ids`. Call `batch.to_torch()` to get `(payload_u8, offsets_i64, sample_ids_i64)` as tensors, or `batch.to_torch_with_labels()` to include labels.
+
+
+## Run helper (`mx8.run`)
+
+`mx8.run` is a convenience wrapper around the same loader primitives:
+
+- Single-process mode (`WORLD_SIZE` unset or `1`): behaves like `mx8.load(...)`.
+- Distributed mode (`WORLD_SIZE > 1`): attaches distributed loader flow and requires `job` + `coord` (or their env equivalents).
+
+```python
+import mx8
+
+loader = mx8.run(
+    data="s3://bucket/train@refresh",
+    batch=512,
+    ram_gb=24,
+    profile="balanced",
+)
+```
+
+Use `mx8.load(...)` when you want the base primitive directly. Use `mx8.run(...)` when you want environment-driven local/distributed selection.
 
 
 ## Multi-epoch training
@@ -125,7 +153,7 @@ import mx8
 dataset = "s3://bucket/train@refresh"
 
 for epoch in range(10):
-    loader = mx8.load(dataset, batch_size_samples=64, max_ram_gb=8, profile="balanced")
+    loader = mx8.load(dataset, batch=64, ram_gb=8, profile="balanced")
     for batch in loader:
         train_step(batch)
 ```
@@ -136,11 +164,11 @@ To ensure every epoch sees the **exact same snapshot** (i.e. the dataset doesn't
 import mx8
 
 # Resolve once — captures the dataset state at job start.
-manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+manifest_hash = mx8.resolve("s3://bucket/train@refresh")
 pinned = f"s3://bucket/train@sha256:{manifest_hash}"
 
 for epoch in range(10):
-    loader = mx8.load(pinned, batch_size_samples=64, max_ram_gb=8, profile="balanced")
+    loader = mx8.load(pinned, batch=64, ram_gb=8, profile="balanced")
     for batch in loader:
         train_step(batch)
 ```
@@ -170,7 +198,7 @@ MX8 applies a tighter internal byte band around the target batch size to reduce 
 ```python
 import mx8
 
-loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+loader = mx8.load("s3://bucket/dataset/", ram_gb=12, profile="balanced")
 print(mx8.stats(loader))           # human-readable snapshot
 raw = mx8.stats(loader, raw=True)  # same dict as loader.stats()
 ```
@@ -188,7 +216,7 @@ rss       = Gauge("mx8_process_rss_bytes",    "MX8 process RSS bytes")
 hwm       = Gauge("mx8_ram_high_water_bytes", "MX8 RAM high-water mark")
 delivered = Gauge("mx8_delivered_samples",    "MX8 delivered samples total")
 
-loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+loader = mx8.load("s3://bucket/dataset/", ram_gb=12, profile="balanced")
 
 for batch in loader:
     train_step(batch)
@@ -207,7 +235,7 @@ import mx8
 
 initialize()
 
-loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+loader = mx8.load("s3://bucket/dataset/", ram_gb=12, profile="balanced")
 
 for step, batch in enumerate(loader):
     train_step(batch)
@@ -232,12 +260,12 @@ import mx8
 loader = mx8.text(
     "s3://bucket/corpus@refresh",
     tokenizer="gpt2",
-    sequence_length=2048,
+    seq_len=2048,
     stride=2048,
     add_bos=False,
     add_eos=True,
-    batch_size_samples=32,
-    max_ram_gb=12,
+    batch=32,
+    ram_gb=12,
     profile="balanced",
 )
 
@@ -251,25 +279,25 @@ Text loader arguments:
 
 `tokenizer` — tokenizer reference. Supports `"gpt2"` or a local `tokenizer.json` path.
 
-`sequence_length` — fixed output token length for each emitted row.
+`seq_len` — fixed output token length for each emitted row.
 
-`stride` — step size for chunking long tokenized sequences (use `stride < sequence_length` for overlap).
+`stride` — step size for chunking long tokenized sequences (use `stride < seq_len` for overlap).
 
 `add_bos`, `add_eos` — prepend/append BOS/EOS token IDs when available in tokenizer config.
 
 `truncate` — long-sequence handling (`"right"` or `"error"`).
 
-`return_attention_mask` — emit `batch.attention_mask` when `True`.
+`return_mask` — emit `batch.attention_mask` when `True`.
 
-`decode_error_policy` — UTF-8 decode handling (`"error"` default, `"skip"` optional).
+`on_decode_error` — UTF-8 decode handling (`"error"` default, `"skip"` optional).
 
-`manifest_store`, `manifest_path`, `recursive`, `start_id`, `end_id`, `autopack`, and `autopack_shard_mb` — same semantics as `mx8.load`.
+`store`, `manifest`, `recursive`, `start`, `end`, `autopack`, and `shard_mb` — same semantics as `mx8.load`.
 
-`max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches` are accepted for compatibility, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
+`inflight`, `queue`, and `prefetch` are accepted in the signature, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
 
-`job_id`, `cluster_url`, `resume_from` — same distributed/restore contract as `mx8.load`.
+`job`, `coord`, `resume` — same distributed/restore contract as `mx8.load`.
 
-`loader.checkpoint()` returns an opaque token compatible with `mx8.text(..., resume_from=token)`.
+`loader.checkpoint()` returns an opaque token compatible with `mx8.text(..., resume=token)`.
 
 `loader.stats()` for the text loader includes shared pipeline counters plus text fields: `text_sequence_length`, `text_stride`, and `text_return_attention_mask`.
 
@@ -285,9 +313,9 @@ import mx8
 
 loader = mx8.image(
     "s3://bucket/mx8/train/@refresh",
-    batch_size_samples=64,
-    max_ram_gb=12,
-    resize_hw=(224, 224),
+    batch=64,
+    ram_gb=12,
+    resize=(224, 224),
     profile="balanced",
 )
 
@@ -303,8 +331,8 @@ With the augmentation preset:
 loader = mx8.image(
     "s3://bucket/mx8/train/@refresh",
     augment="imagenet",
-    batch_size_samples=64,
-    max_ram_gb=12,
+    batch=64,
+    ram_gb=12,
     seed=42,
 )
 
@@ -314,33 +342,33 @@ for images, labels in loader:
 
 Image loader arguments:
 
-`resize_hw` — `(height, width)` tuple to resize all images before batching (e.g. `resize_hw=(224, 224)`). If not set, images are returned at their original size. All images in a batch must have the same decoded dimensions; mixed-size batches are an error.
+`resize` — `(height, width)` tuple to resize all images before batching (e.g. `resize=(224, 224)`). If not set, images are returned at their original size. All images in a batch must have the same decoded dimensions; mixed-size batches are an error.
 
-`augment` — optional preset alias. `augment="imagenet"` (or `"standard"`) expands defaults for common classification training: `resize_hw=(256,256)` when unset, `crop_hw=(224,224)`, `horizontal_flip_p=0.5`, `color_jitter_{brightness,contrast,saturation}=0.4`, and ImageNet normalization (`mean=(0.485,0.456,0.406)`, `std=(0.229,0.224,0.225)`).
+`augment` — optional preset alias. `augment="imagenet"` (or `"standard"`) expands defaults for common classification training: `resize=(256,256)` when unset, `crop=(224,224)`, `flip_p=0.5`, `jitter_{brightness,contrast,saturation}=0.4`, and ImageNet normalization (`mean=(0.485,0.456,0.406)`, `std=(0.229,0.224,0.225)`).
 
-`crop_hw` — optional random crop size `(height, width)` applied after decode/resize.
+`crop` — optional random crop size `(height, width)` applied after decode/resize.
 
-`horizontal_flip_p` — per-sample horizontal flip probability in `[0, 1]`.
+`flip_p` — per-sample horizontal flip probability in `[0, 1]`.
 
-`color_jitter_brightness`, `color_jitter_contrast`, `color_jitter_saturation` — non-negative jitter magnitudes. `color_jitter_hue` is currently accepted only as `0.0` (hue jitter is not yet implemented).
+`jitter_brightness`, `jitter_contrast`, `jitter_saturation` — non-negative jitter magnitudes. `jitter_hue` is currently accepted only as `0.0` (hue jitter is not yet implemented).
 
-`normalize_mean`, `normalize_std` — optional per-channel normalization tuples. Pass both together. `std` values must be `> 0`.
+`mean`, `std` — optional per-channel normalization tuples. Pass both together. `std` values must be `> 0`.
 
 `seed`, `epoch` — deterministic augmentation controls. For a fixed snapshot (`manifest_hash`), `seed`, `epoch`, and `sample_id`, augment choices are reproducible.
 
-`to_float` (default `True`) — normalize pixel values to `float32` in `[0, 1]`. Set `to_float=False` to get raw `uint8` tensors.
+`float_out` (default `True`) — normalize pixel values to `float32` in `[0, 1]`. Set `float_out=False` to get raw `uint8` tensors.
 
-`node_id` — same as the core loader. In distributed attach mode, default is `rank{RANK}` when unset.
+`node` — same as the core loader. In distributed attach mode, default is `rank{RANK}` when unset.
 
-`manifest_store`, `manifest_path`, `recursive`, `start_id`, `end_id`, `autopack`, and `autopack_shard_mb` — same semantics as `mx8.load`.
+`store`, `manifest`, `recursive`, `start`, `end`, `autopack`, and `shard_mb` — same semantics as `mx8.load`.
 
-`max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches` are accepted for compatibility, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
+`inflight`, `queue`, and `prefetch` are accepted in the signature, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
 
-`job_id`, `cluster_url`, `resume_from` — same distributed/restore contract as `mx8.load`.
+`job`, `coord`, `resume` — same distributed/restore contract as `mx8.load`.
 
-`loader.checkpoint()` returns an opaque token compatible with `mx8.image(..., resume_from=token)`.
+`loader.checkpoint()` returns an opaque token compatible with `mx8.image(..., resume=token)`.
 
-`autopack` and `autopack_shard_mb` — same as the core loader.
+`autopack` and `shard_mb` — same as the core loader.
 
 The default decode backend in `mx8==1.0.5` is Python/Pillow. To use the experimental Rust decode path, set `MX8_DECODE_BACKEND=rust`. The Rust path supports additional options: `MX8_DECODE_THREADS` for worker count, `MX8_RUST_JPEG_CODEC` for JPEG codec selection (`zune`, `image`, or `turbo`), and `MX8_RUST_RESIZE_BACKEND` for resize algorithm (`fast` or `image`).
 
@@ -358,12 +386,12 @@ import mx8
 
 loader = mx8.audio(
     "s3://bucket/audio@refresh",
-    batch_size_samples=32,
-    sample_count=16000,
+    batch=32,
+    samples=16000,
     channels=1,
-    sample_rate_hz=16000,
-    decode_error_policy="error",
-    max_ram_gb=12,
+    rate_hz=16000,
+    on_decode_error="error",
+    ram_gb=12,
     profile="balanced",
 )
 
@@ -375,21 +403,21 @@ for batch in loader:
 
 Audio loader arguments:
 
-`sample_count` — fixed output frame count per emitted row. Short clips are zero-padded; long clips are truncated.
+`samples` — fixed output frame count per emitted row. Short clips are zero-padded; long clips are truncated.
 
 `channels` — output channels. `mx8==1.0.5` supports `channels=1` only (mono output).
 
-`sample_rate_hz` — optional strict sample-rate check. When set, samples with mismatched decoded rates follow `decode_error_policy`.
+`rate_hz` — optional strict sample-rate check. When set, samples with mismatched decoded rates follow `on_decode_error`.
 
-`decode_error_policy` — decode failure handling (`"error"` default, `"skip"` optional).
+`on_decode_error` — decode failure handling (`"error"` default, `"skip"` optional).
 
-`manifest_store`, `manifest_path`, `recursive`, `start_id`, `end_id`, `autopack`, and `autopack_shard_mb` — same semantics as `mx8.load`.
+`store`, `manifest`, `recursive`, `start`, `end`, `autopack`, and `shard_mb` — same semantics as `mx8.load`.
 
-`max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches` are accepted for compatibility, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
+`inflight`, `queue`, and `prefetch` are accepted in the signature, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
 
-`job_id`, `cluster_url`, `resume_from` — same distributed/restore contract as `mx8.load`.
+`job`, `coord`, `resume` — same distributed/restore contract as `mx8.load`.
 
-`loader.checkpoint()` returns an opaque token compatible with `mx8.audio(..., resume_from=token)`.
+`loader.checkpoint()` returns an opaque token compatible with `mx8.audio(..., resume=token)`.
 
 Supported formats in `mx8==1.0.5`: WAV and FLAC.
 
@@ -407,11 +435,11 @@ import mx8
 
 loader = mx8.video(
     "s3://bucket/video_prefix/",
-    clip_len=16,
+    clip=16,
     stride=8,
     fps=8,
-    batch_size_samples=32,
-    max_ram_gb=12,
+    batch=32,
+    ram_gb=12,
     profile="balanced",
 )
 
@@ -421,27 +449,27 @@ for batch in loader:
     offsets  = batch.offsets
 ```
 
-`mx8.video` supports `job_id`, `cluster_url`, and `resume_from`. In distributed attach mode it applies deterministic rank/world clip sharding from the launcher environment.
+`mx8.video` supports `job`, `coord`, and `resume`. In distributed attach mode it applies deterministic rank/world clip sharding from the launcher environment.
 
-`manifest_store`, `manifest_path`, and `recursive` are accepted and used for snapshot resolution.
+`store`, `manifest`, and `recursive` are accepted and used for snapshot resolution.
 
 `constraints` is supported for runtime caps (`max_inflight_bytes`, `max_ram_bytes`).
 
 `runtime` is accepted in the signature, but queue/want runtime overrides are currently rejected for `mx8.video`.
 
-`node_id` is accepted and used as lock-owner identity during snapshot resolution.
+`node` is accepted and used as lock-owner identity during snapshot resolution.
 
 `loader.checkpoint()` returns an opaque video token. Resume with:
 
 ```python
 token = loader.checkpoint()
-loader = mx8.video("s3://bucket/video_prefix/", clip_len=16, stride=8, fps=8, resume_from=token)
+loader = mx8.video("s3://bucket/video_prefix/", clip=16, stride=8, fps=8, resume=token)
 ```
 
 Each batch includes `clip_ids`, `sample_ids`, `media_uris`, `clip_starts`, `offsets`, and `payload`. Batch metadata fields include `frames_per_clip`, `frame_height`, `frame_width`, `channels`, `layout`, `dtype`, `colorspace`, and `strides`. Offsets are monotonic and `offsets[-1] == len(payload)`.
 `batch.to_torch()` returns `(payload_u8, offsets_i64, sample_ids_i64)` where `payload_u8` has shape `B x T x H x W x C` and dtype `torch.uint8`.
 
-The loader rejects invalid cap combinations at init — specifically when `batch_size_samples * bytes_per_clip > max_inflight_bytes`. Runtime autotune is enabled by default and adapts `max_inflight_bytes` within safe bounds. Pass `autotune=False` to disable.
+The loader rejects invalid cap combinations at init — specifically when `batch * bytes_per_clip > inflight`. Runtime tune is enabled by default and adapts `max_inflight_bytes` within safe bounds. Pass `tune=False` to disable.
 
 The default decode backend uses a local `ffmpeg` CLI. Override the binary path with `MX8_FFMPEG_BIN`.
 
@@ -484,11 +512,11 @@ import mx8
 
 loader = mx8.load(
     "s3://bucket/prefix/",
-    batch_size_samples=512,
-    max_ram_gb=24,
+    batch=512,
+    ram_gb=24,
     profile="balanced",
-    job_id="train",
-    cluster_url="http://coordinator-host:50051",
+    job="train",
+    coord="http://coordinator-host:50051",
 )
 ```
 
@@ -500,7 +528,7 @@ Equivalent env-based attach:
 Then:
 
 ```python
-loader = mx8.load("s3://bucket/prefix/", batch_size_samples=512, max_ram_gb=24)
+loader = mx8.load("s3://bucket/prefix/", batch=512, ram_gb=24)
 ```
 
 `mx8.DistributedDataLoader` remains available as the low-level explicit API.
@@ -509,7 +537,7 @@ loader = mx8.load("s3://bucket/prefix/", batch_size_samples=512, max_ram_gb=24)
 
 Use `mx8.coordinator()` to start a local coordinator subprocess without any manual setup. It finds the `mx8d-coordinator` binary in your PATH, starts it, waits for it to be ready, and tears it down when the context exits.
 
-In distributed mode, the coordinator owns snapshot resolution for the job. Start the coordinator with the same `dataset_link` intent you expect workers to consume.
+In distributed mode, the coordinator owns snapshot resolution for the job. Start the coordinator with the same `data` intent you expect workers to consume.
 
 **Single-machine multi-GPU (`torchrun`)**
 
@@ -567,7 +595,7 @@ with mx8.coordinator(world_size=1) as coord:
 
 `world_size` — number of ranks expected in this job (default 1).
 
-`dataset_link` — optional dataset link passed to the coordinator for snapshot resolution.
+`data` — optional dataset link passed to the coordinator for snapshot resolution.
 
 `port` — port to bind on. Defaults to 50051 when `rank` is set (all ranks must agree); auto-picked when `rank` is omitted.
 
@@ -610,7 +638,7 @@ All ranks must pass the same token content. Conflicting tokens are rejected.
 
 The token is intentionally opaque and versioned by MX8. Treat it as a byte blob and store it alongside the model checkpoint.
 
-Distributed autotune adjusts `want`, `prefetch_batches`, and `max_queue_batches` within the chosen profile rails. Pass `profile` and `autotune=True|False` to control it.
+Distributed autotune adjusts `want`, `prefetch_batches`, and `max_queue_batches` within the chosen profile rails. Pass `profile` and `tune=True|False` to control it.
 
 Training note: `mx8==1.0.5` training supports epoch-boundary elasticity only. Mid-epoch rank loss is still non-elastic (the DDP process group fails and the job restarts). Add/remove nodes between epochs by launching the next epoch with a new world size.
 
@@ -643,27 +671,27 @@ Gate commands:
 ```python
 import mx8
 
-loader_a = mx8.load("s3://bucket/a@refresh", batch_size_samples=32, max_ram_gb=6)
-loader_b = mx8.load("s3://bucket/b@refresh", batch_size_samples=32, max_ram_gb=6)
+loader_a = mx8.load("s3://bucket/a@refresh", batch=32, ram_gb=6)
+loader_b = mx8.load("s3://bucket/b@refresh", batch=32, ram_gb=6)
 
 mixed = mx8.mix(
     [loader_a, loader_b],
     weights=[0.7, 0.3],
     seed=17,
     epoch=3,
-    source_exhausted="error",
-    max_ram_gb=12,
+    on_source_exhausted="error",
+    ram_gb=12,
     profile="balanced",
 )
 ```
 
-`weights` is a list of positive floats, normalized internally. `seed` and `epoch` are the deterministic scheduling inputs. `source_exhausted` controls what happens when a source runs out: `error` fails fast (the default), `allow` drains remaining sources. `starvation_window` controls the scheduler starvation accounting window.
+`weights` is a list of positive floats, normalized internally. `seed` and `epoch` are the deterministic scheduling inputs. `on_source_exhausted` controls what happens when a source runs out: `error` fails fast (the default), `allow` drains remaining sources. `starvation` controls the scheduler starvation accounting window.
 
-`job_id` and `cluster_url` are accepted in the `mx8.mix` signature for API consistency, but are currently ignored by the implementation.
+`job` and `coord` are accepted in the `mx8.mix` signature for API consistency, but are currently ignored by the implementation.
 
 `mx8.mix` accepts loaders created by `mx8.load(...)` and `mx8.DistributedDataLoader(...)`.
 
-`mixed.checkpoint()` returns an opaque token compatible with `mx8.mix(..., resume_from=token)`.
+`mixed.checkpoint()` returns an opaque token compatible with `mx8.mix(..., resume=token)`.
 
 Resume contract for mix:
 

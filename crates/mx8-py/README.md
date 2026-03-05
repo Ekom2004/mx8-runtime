@@ -41,9 +41,9 @@ mx8.pack_dir(
 
 loader = mx8.image(
     "/path/to/mx8-dataset@refresh",
-    batch_size_samples=64,
-    max_inflight_bytes=256 * 1024 * 1024,
-    resize_hw=(224, 224),  # (H,W); optional
+    batch=64,
+    inflight=256 * 1024 * 1024,
+    resize=(224, 224),  # (H,W); optional
 )
 
 print(loader.classes)  # ["cat", "dog", ...] if labels.tsv exists
@@ -75,8 +75,8 @@ for batch in loader:
 ```python
 import mx8
 
-loader_a = mx8.load("s3://bucket/dataset_a/@refresh", profile="balanced", autotune=True)
-loader_b = mx8.load("s3://bucket/dataset_b/@refresh", profile="balanced", autotune=True)
+loader_a = mx8.load("s3://bucket/dataset_a/@refresh", profile="balanced", tune=True)
+loader_b = mx8.load("s3://bucket/dataset_b/@refresh", profile="balanced", tune=True)
 
 mixed = mx8.mix(
     [loader_a, loader_b],
@@ -102,7 +102,7 @@ mixed = mx8.mix([loader_a, loader_b], weights=[7, 3], seed=0, epoch=0)
 - same `seed` + `epoch` => same source-pick sequence
 - same `seed`, different `epoch` => controlled schedule variation
 
-`starvation_window` is an optional watchdog threshold in scheduler ticks used for starvation counters in `mixed.stats()`.
+`starvation` is an optional watchdog threshold in scheduler ticks used for starvation counters in `mixed.stats()`.
 Set `MX8_MIX_SNAPSHOT=1` (and optional `MX8_MIX_SNAPSHOT_PERIOD_TICKS=64`) to emit periodic `mix_snapshot` proof events.
 
 ## Bounded memory (v0)
@@ -114,10 +114,10 @@ import mx8
 
 loader = mx8.image(
     "/path/to/mx8-dataset@refresh",
-    batch_size_samples=64,
-    max_inflight_bytes=256 * 1024 * 1024,
-    max_queue_batches=8,
-    prefetch_batches=4,
+    batch=64,
+    inflight=256 * 1024 * 1024,
+    queue=8,
+    prefetch=4,
 )
 
 for step, (images, labels) in enumerate(loader):

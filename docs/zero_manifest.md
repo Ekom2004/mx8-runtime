@@ -34,8 +34,8 @@ import mx8
 
 loader = mx8.load(
     "s3://your-bucket/raw-dataset/",
-    batch_size_samples=64,
-    max_ram_gb=12,
+    batch=64,
+    ram_gb=12,
     profile="balanced",
 )
 

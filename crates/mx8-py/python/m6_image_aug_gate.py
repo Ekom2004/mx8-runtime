@@ -8,11 +8,11 @@ import torch
 def next_batch(dataset_link: str, manifest_store: str, **kwargs):
     loader = mx8.image(
         dataset_link,
-        manifest_store=manifest_store,
-        batch_size_samples=2,
-        prefetch_batches=2,
-        max_queue_batches=8,
-        max_inflight_bytes=64 * 1024 * 1024,
+        store=manifest_store,
+        batch=2,
+        prefetch=2,
+        queue=8,
+        inflight=64 * 1024 * 1024,
         **kwargs,
     )
     try:

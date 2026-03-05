@@ -67,12 +67,12 @@ def run_once(
     def run_phase(target_steps: int) -> tuple[int, int]:
         loader = mx8.image(
             dataset_link,
-            manifest_store=store_root,
-            batch_size_samples=batch_size,
-            max_ram_gb=8,
+            store=store_root,
+            batch=batch_size,
+            ram_gb=8,
             profile="throughput",
-            node_id=f"py_decode_bench_{backend}",
-            to_float=True,
+            node=f"py_decode_bench_{backend}",
+            float_out=True,
         )
 
         model = None

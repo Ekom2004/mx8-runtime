@@ -122,12 +122,12 @@ def _run_loader(
     started = time.perf_counter()
     loader = mx8.video(
         str(dataset_root),
-        manifest_store=str(store_root),
+        store=str(store_root),
         recursive=True,
-        clip_len=clip_len,
+        clip=clip_len,
         stride=stride,
         fps=fps,
-        batch_size_samples=batch_size,
+        batch=batch_size,
         seed=seed,
         epoch=epoch,
         constraints=mx8.Constraints(

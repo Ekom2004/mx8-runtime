@@ -16,13 +16,13 @@ Training on multiple datasets with different sizes and importance weights is a c
 import mx8
 
 mixed = mx8.mix(
-    loaders=[loader_a, loader_b],
+    sources=[loader_a, loader_b],
     weights=[0.7, 0.3],
     seed=1234,
     epoch=0,
-    source_exhausted="error",
+    on_source_exhausted="error",
     profile="balanced",
-    autotune=True,
+    tune=True,
     constraints=mx8.Constraints(max_inflight_bytes=256 * 1024 * 1024),
     runtime=mx8.RuntimeConfig(prefetch_batches=1, max_queue_batches=8),
 )
