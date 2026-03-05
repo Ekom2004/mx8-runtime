@@ -93,10 +93,27 @@ loader = mx8.load(
     coord="http://coordinator-host:50051",
 )
 
+# run helper (auto local/distributed by WORLD_SIZE)
+loader = mx8.run(
+    data="s3://bucket/data/",
+    batch=512,
+    ram_gb=24,
+    profile="balanced",
+)
+
+# resolve pinned snapshot hash
+manifest_hash = mx8.resolve("s3://bucket/data@refresh")
+
 # stats + checkpoint
 print(mx8.stats(loader))
 token = loader.checkpoint()
 ```
+
+Top-level minimal APIs (`load`, `run`, `image`, `video`, `text`, `audio`, `mix`, `resolve`) use short kwargs (`batch`, `ram_gb`, `coord`, `resume`, ...).
+Advanced classes keep explicit legacy names:
+- `mx8.Constraints(max_inflight_bytes=..., max_ram_bytes=...)`
+- `mx8.RuntimeConfig(prefetch_batches=..., max_queue_batches=..., want=...)`
+- `mx8.DistributedDataLoader(..., autotune=..., resume_from=...)`
 
 ## Install
 

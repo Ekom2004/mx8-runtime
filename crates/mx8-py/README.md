@@ -67,6 +67,9 @@ for batch in loader:
     pass
 ```
 
+`mx8.run(...)` is the convenience wrapper that chooses local vs distributed mode from environment (`WORLD_SIZE`).
+`mx8.resolve(...)` is a short alias for `mx8.resolve_manifest_hash(...)`.
+
 ## Mix multiple loaders
 
 `mx8.mix(...)` composes existing loaders into one deterministic stream.
@@ -104,6 +107,13 @@ mixed = mx8.mix([loader_a, loader_b], weights=[7, 3], seed=0, epoch=0)
 
 `starvation` is an optional watchdog threshold in scheduler ticks used for starvation counters in `mixed.stats()`.
 Set `MX8_MIX_SNAPSHOT=1` (and optional `MX8_MIX_SNAPSHOT_PERIOD_TICKS=64`) to emit periodic `mix_snapshot` proof events.
+
+Minimal API naming note:
+- Top-level APIs use short kwargs (`batch`, `ram_gb`, `coord`, `resume`, ...).
+- Advanced objects keep explicit names:
+  - `mx8.Constraints(max_inflight_bytes=..., max_ram_bytes=...)`
+  - `mx8.RuntimeConfig(prefetch_batches=..., max_queue_batches=..., want=...)`
+  - `mx8.DistributedDataLoader(..., autotune=..., resume_from=...)`
 
 ## Bounded memory (v0)
 

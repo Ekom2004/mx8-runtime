@@ -638,7 +638,7 @@ All ranks must pass the same token content. Conflicting tokens are rejected.
 
 The token is intentionally opaque and versioned by MX8. Treat it as a byte blob and store it alongside the model checkpoint.
 
-Distributed autotune adjusts `want`, `prefetch_batches`, and `max_queue_batches` within the chosen profile rails. Pass `profile` and `tune=True|False` to control it.
+Distributed autotune adjusts `want`, `prefetch_batches`, and `max_queue_batches` within the chosen profile rails. Pass `profile` and `autotune=True|False` on `DistributedDataLoader` to control it.
 
 Training note: `mx8==1.0.5` training supports epoch-boundary elasticity only. Mid-epoch rank loss is still non-elastic (the DDP process group fails and the job restarts). Add/remove nodes between epochs by launching the next epoch with a new world size.
 

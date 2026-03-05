@@ -28,16 +28,16 @@ mixed = mx8.mix(
 )
 ```
 
-`loaders` is a list of existing `mx8.load` loaders. `weights` is a list of positive floats of the same length, normalized internally. `seed` and `epoch` are the deterministic scheduling inputs. `source_exhausted` controls what happens when a source runs out: `error` fails fast (the default, to avoid silent source drop), `allow` lets the mixer drain the remaining sources. `starvation_window` controls the starvation accounting window for the scheduler.
+`sources` is a list of existing `mx8.load` loaders. `weights` is a list of positive floats of the same length, normalized internally. `seed` and `epoch` are the deterministic scheduling inputs. `on_source_exhausted` controls what happens when a source runs out: `error` fails fast (the default, to avoid silent source drop), `allow` lets the mixer drain the remaining sources. `starvation` controls the starvation accounting window for the scheduler.
 
-`profile` and `autotune` apply mix-level startup rails. `constraints` overrides the shared cap — specifically `max_inflight_bytes` and `max_ram_bytes`. `runtime` sets startup overrides for `prefetch_batches` and `max_queue_batches`. Note that `runtime.want` is not supported for `mx8.mix` — lease parallelism belongs to the distributed loader flow.
+`profile` and `tune` apply mix-level startup rails. `constraints` overrides the shared cap — specifically `max_inflight_bytes` and `max_ram_bytes`. `runtime` sets startup overrides for `prefetch_batches` and `max_queue_batches`. Note that `runtime.want` is not supported for `mx8.mix` — lease parallelism belongs to the distributed loader flow.
 
 
 ## Determinism contract
 
 For a fixed set of source manifests, weights, seed, epoch, world size, and frozen membership, the mixed stream order is deterministic and replayable. Reproduce any run by pinning the same inputs.
 
-On `resume_from`, mix restores scheduler/counter state from the token. If source checkpoints differ from token snapshots, mix continues in best-effort mode and reports this via `mix_resume_source_checkpoint_mismatch_total` in `mixed.stats()`.
+On `resume`, mix restores scheduler/counter state from the token. If source checkpoints differ from token snapshots, mix continues in best-effort mode and reports this via `mix_resume_source_checkpoint_mismatch_total` in `mixed.stats()`.
 
 
 ## Memory contract

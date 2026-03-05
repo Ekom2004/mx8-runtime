@@ -5,18 +5,18 @@ This page covers practical tuning for throughput, memory caps, and S3 behavior. 
 
 ## What MX8 already handles for you
 
-MX8 enforces hard memory and backpressure caps through `max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches`. Transient S3 errors — throttling, 429s, and 5xx responses — are handled automatically with retry and exponential backoff in the fetch path. You do not need to build retry logic on top of MX8.
+MX8 enforces hard memory and backpressure caps through `inflight`, `queue`, and `prefetch` on the minimal API surface (internally: `max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches`). Transient S3 errors — throttling, 429s, and 5xx responses — are handled automatically with retry and exponential backoff in the fetch path. You do not need to build retry logic on top of MX8.
 
 
 ## The main knobs
 
-`batch_size_samples` controls how many samples are delivered per batch.
+`batch` controls how many samples are delivered per batch.
 
-`prefetch_batches` controls how many batches the pipeline reads ahead of the consumer. More prefetch means better throughput but higher peak memory.
+`prefetch` controls how many batches the pipeline reads ahead of the consumer. More prefetch means better throughput but higher peak memory.
 
-`max_inflight_bytes` is the hard cap on bytes currently moving through the pipeline. This is the primary memory safety control.
+`inflight` is the hard cap on bytes currently moving through the pipeline. This is the primary memory safety control.
 
-`max_queue_batches` caps how many delivered batches can wait in the queue before the pipeline applies backpressure.
+`queue` caps how many delivered batches can wait in the queue before the pipeline applies backpressure.
 
 `want` on `DistributedDataLoader` sets how many concurrent leases a node holds. More leases means more parallel S3 fetch, which increases inflight pressure.
 
@@ -25,7 +25,7 @@ MX8 enforces hard memory and backpressure caps through `max_inflight_bytes`, `ma
 
 ## Starting values
 
-For single-node training or inference, start with `batch_size_samples` between 64 and 512, `prefetch_batches` between 2 and 4, `max_inflight_bytes` between 256MB and 1GB, and `max_queue_batches` between 8 and 64.
+For single-node training or inference, start with `batch` between 64 and 512, `prefetch` between 2 and 4, `inflight` between 256MB and 1GB, and `queue` between 8 and 64.
 
 For distributed workloads, start with `want=1`. Increase to 2 or 4 only after verifying correctness and node stability. Keep `progress_interval_ms` between 250 and 1000.
 
@@ -34,7 +34,7 @@ For distributed workloads, start with `want=1`. Increase to 2 or 4 only after ve
 
 Fix correctness first. Verify no-overlap, that the job drains fully, and that the manifest hash is deterministic before touching throughput knobs.
 
-Once correctness is confirmed, raise `max_inflight_bytes` and `prefetch_batches` gradually, watching `ram_high_water_bytes` and throughput in `loader.stats()` after each change.
+Once correctness is confirmed, raise `inflight` and `prefetch` gradually, watching `ram_high_water_bytes` and throughput in `loader.stats()` after each change.
 
 Increase `want` only if nodes are showing idle gaps between leases. More concurrent leases help when fetch latency is the bottleneck, but they add memory pressure.
 
