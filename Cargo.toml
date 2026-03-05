@@ -22,6 +22,9 @@ anyhow = "1"
 futures = "0.3"
 aws-config = "1"
 aws-sdk-s3 = "1"
+azure_core = "0.21"
+azure_storage = "0.21"
+azure_storage_blobs = "0.21"
 google-cloud-storage = { version = "0.22", default-features = false, features = ["auth", "rustls-tls"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
