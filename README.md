@@ -135,6 +135,7 @@ pip install mx8 pillow numpy torch
 | [Python API](docs/python_api.md) | Full API reference |
 | [Deployment Guide](docs/deployment_guide.md) | Coordinator/agent deployment |
 | [Zero-Manifest Loading](docs/zero_manifest.md) | Raw S3 loading path |
+| [Source Resolver Protocol](docs/source_resolver_protocol.md) | Attach external source adapters behind a single resolver endpoint |
 | [Memory Contract](docs/memory_contract.md) | Memory and RSS guarantees |
 | [Autotune](docs/v1_autotune_api_contract.md) | Startup/runtime autotune contract |
 | [Mix API](docs/mix_v17_contract.md) | Multi-dataset blending |

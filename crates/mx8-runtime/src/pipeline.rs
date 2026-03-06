@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::{io::BufRead, io::BufReader};
 
 use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use mx8_observe::metrics::{Counter, Gauge};
@@ -56,6 +57,10 @@ const BYTE_BAND_MIN_SPREAD_PCT: u64 = 10;
 const BATCH_JITTER_SLO_MAX_MILLI: u64 = 1250;
 const BATCH_JITTER_RELAX_MILLI: u64 = 1100;
 const BATCH_JITTER_ADJUST_COOLDOWN_BATCHES: u64 = 16;
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 2;
+const HTTP_REQUEST_TIMEOUT_SECS: u64 = 15;
+const HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeCaps {
@@ -363,12 +368,7 @@ impl Pipeline {
         };
 
         let http_client: Option<HttpClient> = if has_http {
-            Some(
-                reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(2))
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()?,
-            )
+            Some(build_http_client()?)
         } else {
             None
         };
@@ -454,12 +454,7 @@ impl Pipeline {
         };
 
         let http_client: Option<HttpClient> = if has_http {
-            Some(
-                reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(2))
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()?,
-            )
+            Some(build_http_client()?)
         } else {
             None
         };
@@ -781,12 +776,7 @@ impl Pipeline {
         };
 
         let http_client: Option<HttpClient> = if has_http {
-            Some(
-                reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(2))
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()?,
-            )
+            Some(build_http_client()?)
         } else {
             None
         };
@@ -2607,15 +2597,84 @@ async fn scan_emit_record(
     Ok(())
 }
 
+fn build_http_client() -> Result<HttpClient> {
+    let default_headers = parse_http_default_headers_from_env()?;
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
+        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
+        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST);
+    if !default_headers.is_empty() {
+        builder = builder.default_headers(default_headers);
+    }
+    builder.build().map_err(Into::into)
+}
+
+fn parse_http_default_headers_from_env() -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if let Ok(raw) = std::env::var("MX8_HTTP_AUTH_BEARER") {
+        let token = raw.trim();
+        if !token.is_empty() {
+            let value = format!("Bearer {token}");
+            let auth_value = HeaderValue::from_str(&value)
+                .map_err(|_| anyhow::anyhow!("invalid MX8_HTTP_AUTH_BEARER value"))?;
+            headers.insert(AUTHORIZATION, auth_value);
+        }
+    }
+
+    if let Ok(raw) = std::env::var("MX8_HTTP_HEADERS") {
+        let normalized = raw.replace("\\n", "\n");
+        for line in normalized.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name_raw, value_raw)) = line.split_once(':') else {
+                anyhow::bail!(
+                    "invalid MX8_HTTP_HEADERS line; expected 'Header-Name: value' format"
+                );
+            };
+            let name = name_raw.trim();
+            if name.is_empty() {
+                anyhow::bail!("invalid MX8_HTTP_HEADERS line; header name is empty");
+            }
+            let value = value_raw.trim();
+            if value.is_empty() {
+                anyhow::bail!(
+                    "invalid MX8_HTTP_HEADERS line for header '{name}'; header value is empty"
+                );
+            }
+            let header_name: HeaderName = name
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid MX8_HTTP_HEADERS header name '{name}'"))?;
+            let header_value = HeaderValue::from_str(value).map_err(|_| {
+                let detail = if is_sensitive_header_name(&header_name) {
+                    "sensitive value redacted"
+                } else {
+                    "value rejected by HTTP header parser"
+                };
+                anyhow::anyhow!("invalid MX8_HTTP_HEADERS value for header '{name}' ({detail})")
+            })?;
+            headers.insert(header_name, header_value);
+        }
+    }
+    Ok(headers)
+}
+
+fn is_sensitive_header_name(name: &HeaderName) -> bool {
+    let raw = name.as_str();
+    raw.eq_ignore_ascii_case("authorization")
+        || raw.eq_ignore_ascii_case("proxy-authorization")
+        || raw.eq_ignore_ascii_case("x-api-key")
+        || raw.eq_ignore_ascii_case("api-key")
+        || raw.eq_ignore_ascii_case("x-auth-token")
+        || raw.eq_ignore_ascii_case("x-access-token")
+        || raw.eq_ignore_ascii_case("cookie")
+        || raw.eq_ignore_ascii_case("set-cookie")
+}
+
 async fn http_head_len(client: &HttpClient, url: &str, sample_id: u64) -> Result<u64> {
-    let resp = http_with_retry(sample_id, || async move {
-        client
-            .head(url)
-            .header(reqwest::header::CONNECTION, "close")
-            .send()
-            .await
-    })
-    .await?;
+    let resp = http_with_retry(sample_id, || async move { client.head(url).send().await }).await?;
 
     if !resp.status().is_success() {
         anyhow::bail!("http HEAD failed: status={} url={}", resp.status(), url);
@@ -2649,7 +2708,6 @@ async fn http_range_get(
         async move {
             client
                 .get(url)
-                .header(reqwest::header::CONNECTION, "close")
                 .header(reqwest::header::RANGE, range)
                 .send()
                 .await
@@ -3328,6 +3386,98 @@ mod azure_parse_tests {
             }
             other => anyhow::bail!("expected azure location, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod http_config_tests {
+    use super::*;
+
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
+
+    #[test]
+    fn parse_http_headers_supports_bearer_and_custom_lines() -> Result<()> {
+        let _guard = env_guard();
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::remove_var("MX8_HTTP_HEADERS");
+
+        std::env::set_var("MX8_HTTP_AUTH_BEARER", "hf_secret");
+        std::env::set_var("MX8_HTTP_HEADERS", "X-Test-Header: value\\nX-Api-Key: k123");
+
+        let headers = parse_http_default_headers_from_env()?;
+        let auth = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer hf_secret");
+        assert_eq!(
+            headers
+                .get("x-test-header")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "value"
+        );
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "k123"
+        );
+
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::remove_var("MX8_HTTP_HEADERS");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_headers_rejects_invalid_line_format() {
+        let _guard = env_guard();
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::set_var("MX8_HTTP_HEADERS", "Authorization Bearer missing_colon");
+        let err =
+            parse_http_default_headers_from_env().expect_err("invalid header format should fail");
+        let text = err.to_string();
+        assert!(text.contains("expected 'Header-Name: value' format"));
+        std::env::remove_var("MX8_HTTP_HEADERS");
+    }
+
+    #[test]
+    fn parse_http_headers_custom_authorization_overrides_bearer_env() -> Result<()> {
+        let _guard = env_guard();
+        std::env::set_var("MX8_HTTP_AUTH_BEARER", "hf_secret");
+        std::env::set_var("MX8_HTTP_HEADERS", "Authorization: Bearer from_custom");
+
+        let headers = parse_http_default_headers_from_env()?;
+        let auth = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer from_custom");
+
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::remove_var("MX8_HTTP_HEADERS");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_headers_redacts_sensitive_value_errors() {
+        let _guard = env_guard();
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::set_var("MX8_HTTP_HEADERS", "Authorization: bad\rvalue");
+        let err = parse_http_default_headers_from_env()
+            .expect_err("invalid sensitive header value should fail");
+        let text = err.to_string();
+        assert!(text.contains("sensitive value redacted"));
+        assert!(!text.contains("bad"));
+        std::env::remove_var("MX8_HTTP_HEADERS");
     }
 }
 

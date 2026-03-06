@@ -2960,12 +2960,15 @@ dependencies = [
  "aws-sdk-s3",
  "clap",
  "futures",
+ "hf-hub",
  "mx8-core",
  "mx8-manifest-store",
  "mx8-observe",
+ "serde",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

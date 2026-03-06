@@ -71,7 +71,7 @@ loader = mx8.load("s3://bucket/prefix/", batch=512, ram_gb=24)
 
 Arguments:
 
-`data` is a plain path or prefix, optionally followed by `@refresh` to force a fresh snapshot at job start, or `@sha256:<hash>` to pin an exact snapshot.
+`data` is a dataset link. Native schemes include local paths, `s3://`, and `hf://`. For external custom schemes, set `MX8_SOURCE_RESOLVER_URL` so MX8 can resolve links through a remote source adapter. Any link can be followed by `@refresh` to force a fresh snapshot at job start, or `@sha256:<hash>` to pin an exact snapshot.
 
 `store` sets the manifest store root (default `~/.mx8/manifests`). Pass a filesystem path.
 

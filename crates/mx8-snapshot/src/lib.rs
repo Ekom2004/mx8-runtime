@@ -4,10 +4,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, path::Path};
 
+use hf_hub::{Repo, RepoType};
 use mx8_core::dataset_link::DatasetLink;
 use mx8_core::types::{ManifestHash, ManifestRecord, MANIFEST_SCHEMA_VERSION};
 use mx8_manifest_store::{intent_key_for_base, LockOwner, ManifestStore, ManifestStoreError};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -43,6 +46,12 @@ pub enum SnapshotError {
     S3FeatureRequired(String),
     #[error("s3 indexing failed: {0}")]
     S3Index(String),
+    #[error("hf link parse error: {0}")]
+    HfLinkParse(String),
+    #[error("hf indexing failed: {0}")]
+    HfIndex(String),
+    #[error("remote source resolver failed: {0}")]
+    RemoteResolver(String),
     #[error("snapshot wait timed out after {0:?}")]
     WaitTimeout(Duration),
 }
@@ -57,11 +66,11 @@ pub struct ResolvedSnapshot {
 }
 
 #[derive(Debug)]
-struct IndexedManifest {
-    manifest_hash: ManifestHash,
-    manifest_bytes: u64,
-    canonical_bytes: Vec<u8>,
-    canonical_path: Option<PathBuf>,
+pub struct IndexedManifest {
+    pub manifest_hash: ManifestHash,
+    pub manifest_bytes: u64,
+    pub canonical_bytes: Vec<u8>,
+    pub canonical_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,15 +96,318 @@ impl Default for SnapshotResolverConfig {
     }
 }
 
+pub trait SourceResolver: Send + Sync {
+    fn scheme(&self) -> &'static str;
+
+    fn index_manifest(
+        &self,
+        base: &str,
+        recursive: bool,
+        materialize_manifest_bytes: bool,
+    ) -> Result<IndexedManifest, SnapshotError>;
+}
+
+const REMOTE_RESOLVER_DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const REMOTE_RESOLVER_DEFAULT_MAX_ATTEMPTS: usize = 3;
+const REMOTE_RESOLVER_MAX_BACKOFF_MS: u64 = 1_000;
+
+#[derive(Clone)]
+pub struct SourceResolverRegistry {
+    resolvers: BTreeMap<String, Arc<dyn SourceResolver>>,
+    remote_fallback: Option<Arc<RemoteHttpSourceResolver>>,
+}
+
+impl Default for SourceResolverRegistry {
+    fn default() -> Self {
+        Self {
+            resolvers: BTreeMap::new(),
+            remote_fallback: None,
+        }
+    }
+}
+
+impl SourceResolverRegistry {
+    pub fn with_defaults() -> Self {
+        let mut out = Self::default();
+        out.register(Arc::new(S3PrefixSourceResolver));
+        out.register(Arc::new(LocalDirectorySourceResolver));
+        out.register(Arc::new(HfSourceResolver));
+        out
+    }
+
+    pub fn with_env_remote_fallback(mut self) -> Self {
+        if let Some(remote) = RemoteHttpSourceResolver::from_env() {
+            self.remote_fallback = Some(Arc::new(remote));
+        }
+        self
+    }
+
+    pub fn with_remote_fallback(mut self, remote: Arc<RemoteHttpSourceResolver>) -> Self {
+        self.remote_fallback = Some(remote);
+        self
+    }
+
+    pub fn register(
+        &mut self,
+        resolver: Arc<dyn SourceResolver>,
+    ) -> Option<Arc<dyn SourceResolver>> {
+        self.resolvers
+            .insert(resolver.scheme().to_ascii_lowercase(), resolver)
+    }
+
+    pub fn schemes(&self) -> Vec<String> {
+        self.resolvers.keys().cloned().collect()
+    }
+
+    pub fn index_manifest_for_base(
+        &self,
+        base: &str,
+        recursive: bool,
+        materialize_manifest_bytes: bool,
+        refresh: bool,
+    ) -> Result<IndexedManifest, SnapshotError> {
+        let trimmed = base.trim();
+        let scheme = dataset_base_scheme(trimmed);
+        if let Some(resolver) = self.resolvers.get(scheme.as_str()) {
+            return resolver.index_manifest(trimmed, recursive, materialize_manifest_bytes);
+        }
+        if let Some(remote) = self.remote_fallback.as_ref() {
+            return remote.index_manifest(trimmed, recursive, materialize_manifest_bytes, refresh);
+        }
+        Err(SnapshotError::IndexUnsupported(format!(
+            "{trimmed} (scheme={scheme}; configure MX8_SOURCE_RESOLVER_URL for remote source adapters)"
+        )))
+    }
+}
+
+fn dataset_base_scheme(base: &str) -> String {
+    if let Some((scheme, _)) = base.split_once("://") {
+        return scheme.trim().to_ascii_lowercase();
+    }
+    "file".to_string()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemoteResolveRequest<'a> {
+    link: &'a str,
+    refresh: bool,
+    recursive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteResolveResponse {
+    manifest_hash: Option<String>,
+    manifest_tsv: Option<String>,
+    records: Option<Vec<RemoteResolveRecord>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteResolveRecord {
+    sample_id: u64,
+    location: String,
+    byte_offset: Option<u64>,
+    byte_length: Option<u64>,
+    decode_hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteHttpSourceResolver {
+    endpoint: String,
+    auth_bearer: Option<String>,
+    timeout: Duration,
+    max_attempts: usize,
+}
+
+impl RemoteHttpSourceResolver {
+    pub fn new(
+        endpoint: String,
+        auth_bearer: Option<String>,
+        timeout: Duration,
+        max_attempts: usize,
+    ) -> Self {
+        Self {
+            endpoint,
+            auth_bearer,
+            timeout,
+            max_attempts: max_attempts.max(1),
+        }
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let endpoint = std::env::var("MX8_SOURCE_RESOLVER_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        let auth_bearer = std::env::var("MX8_SOURCE_RESOLVER_AUTH_BEARER")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let timeout_ms = std::env::var("MX8_SOURCE_RESOLVER_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(REMOTE_RESOLVER_DEFAULT_TIMEOUT_MS);
+        let max_attempts = std::env::var("MX8_SOURCE_RESOLVER_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(REMOTE_RESOLVER_DEFAULT_MAX_ATTEMPTS);
+        Some(Self::new(
+            endpoint,
+            auth_bearer,
+            Duration::from_millis(timeout_ms.max(1)),
+            max_attempts,
+        ))
+    }
+
+    fn resolve_url(&self) -> String {
+        format!("{}/resolve", self.endpoint.trim_end_matches('/'))
+    }
+
+    fn index_manifest(
+        &self,
+        link: &str,
+        recursive: bool,
+        materialize_manifest_bytes: bool,
+        refresh: bool,
+    ) -> Result<IndexedManifest, SnapshotError> {
+        let url = self.resolve_url();
+        let request = RemoteResolveRequest {
+            link,
+            refresh,
+            recursive,
+        };
+        let mut backoff_ms = 50u64;
+
+        for attempt in 1..=self.max_attempts {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(self.timeout)
+                .timeout_read(self.timeout)
+                .timeout_write(self.timeout)
+                .build();
+            let mut req = agent
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json");
+            if let Some(token) = self.auth_bearer.as_deref() {
+                req = req.set("Authorization", &format!("Bearer {token}"));
+            }
+
+            match req.send_json(&request) {
+                Ok(resp) => {
+                    let response: RemoteResolveResponse = resp.into_json().map_err(|e| {
+                        SnapshotError::RemoteResolver(format!(
+                            "invalid remote resolver JSON response: {e}"
+                        ))
+                    })?;
+                    return indexed_manifest_from_remote_response(
+                        response,
+                        materialize_manifest_bytes,
+                    );
+                }
+                Err(ureq::Error::Status(status, _resp)) => {
+                    let transient = status == 408 || status == 429 || status >= 500;
+                    if transient && attempt < self.max_attempts {
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
+                        backoff_ms =
+                            (backoff_ms.saturating_mul(2)).min(REMOTE_RESOLVER_MAX_BACKOFF_MS);
+                        continue;
+                    }
+                    return Err(SnapshotError::RemoteResolver(format!(
+                        "resolver endpoint returned status {status}"
+                    )));
+                }
+                Err(ureq::Error::Transport(err)) => {
+                    if attempt < self.max_attempts {
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
+                        backoff_ms =
+                            (backoff_ms.saturating_mul(2)).min(REMOTE_RESOLVER_MAX_BACKOFF_MS);
+                        continue;
+                    }
+                    return Err(SnapshotError::RemoteResolver(format!(
+                        "resolver transport error: {err}"
+                    )));
+                }
+            }
+        }
+        Err(SnapshotError::RemoteResolver(
+            "resolver request exhausted retries".to_string(),
+        ))
+    }
+}
+
+fn indexed_manifest_from_remote_response(
+    response: RemoteResolveResponse,
+    materialize_manifest_bytes: bool,
+) -> Result<IndexedManifest, SnapshotError> {
+    let indexed = if let Some(tsv) = response.manifest_tsv.as_deref() {
+        let (records, canonical_bytes) = parse_canonical_manifest_tsv_bytes(tsv.as_bytes())
+            .map_err(|e| SnapshotError::RemoteResolver(format!("invalid manifest_tsv: {e}")))?;
+        indexed_manifest_from_bytes(records, canonical_bytes, materialize_manifest_bytes)?
+    } else if let Some(raw_records) = response.records {
+        let mut records = Vec::with_capacity(raw_records.len());
+        for raw in raw_records {
+            let record = ManifestRecord {
+                sample_id: raw.sample_id,
+                location: raw.location,
+                byte_offset: raw.byte_offset,
+                byte_length: raw.byte_length,
+                decode_hint: raw.decode_hint,
+            };
+            record
+                .validate()
+                .map_err(|e| SnapshotError::RemoteResolver(e.to_string()))?;
+            records.push(record);
+        }
+        ensure_sequential_sample_ids(&records)
+            .map_err(|e| SnapshotError::RemoteResolver(format!("invalid record sequence: {e}")))?;
+        let canonical_bytes = canonicalize_manifest_bytes(&records);
+        indexed_manifest_from_bytes(records, canonical_bytes, materialize_manifest_bytes)?
+    } else {
+        return Err(SnapshotError::RemoteResolver(
+            "resolver response missing both manifest_tsv and records".to_string(),
+        ));
+    };
+
+    if let Some(raw_hash) = response.manifest_hash.as_deref() {
+        let normalized = raw_hash
+            .trim()
+            .strip_prefix("sha256:")
+            .unwrap_or(raw_hash.trim());
+        if !normalized.is_empty() && normalized != indexed.manifest_hash.0 {
+            return Err(SnapshotError::RemoteResolver(format!(
+                "manifest_hash mismatch (remote={normalized}, local={})",
+                indexed.manifest_hash.0
+            )));
+        }
+    }
+    Ok(indexed)
+}
+
 #[derive(Clone)]
 pub struct SnapshotResolver {
     store: Arc<dyn ManifestStore>,
     cfg: SnapshotResolverConfig,
+    source_registry: Arc<SourceResolverRegistry>,
 }
 
 impl SnapshotResolver {
     pub fn new(store: Arc<dyn ManifestStore>, cfg: SnapshotResolverConfig) -> Self {
-        Self { store, cfg }
+        Self::with_source_registry(
+            store,
+            cfg,
+            Arc::new(SourceResolverRegistry::with_defaults().with_env_remote_fallback()),
+        )
+    }
+
+    pub fn with_source_registry(
+        store: Arc<dyn ManifestStore>,
+        cfg: SnapshotResolverConfig,
+        source_registry: Arc<SourceResolverRegistry>,
+    ) -> Self {
+        Self {
+            store,
+            cfg,
+            source_registry,
+        }
     }
 
     pub fn resolve(&self, link: &str, owner: LockOwner) -> Result<ResolvedSnapshot, SnapshotError> {
@@ -192,10 +504,11 @@ impl SnapshotResolver {
                         self.cfg.materialize_manifest_bytes,
                     )?
                 }
-                None => index_manifest_for_base(
+                None => self.source_registry.index_manifest_for_base(
                     base,
                     self.cfg.recursive,
                     self.cfg.materialize_manifest_bytes,
+                    refresh,
                 )?,
             };
             let manifest_hash = indexed.manifest_hash.clone();
@@ -276,30 +589,240 @@ impl SnapshotResolver {
     }
 }
 
-fn index_manifest_for_base(
-    base: &str,
-    recursive: bool,
-    materialize_manifest_bytes: bool,
-) -> Result<IndexedManifest, SnapshotError> {
-    let trimmed = base.trim();
-    if trimmed.starts_with("s3://") {
+struct S3PrefixSourceResolver;
+
+impl SourceResolver for S3PrefixSourceResolver {
+    fn scheme(&self) -> &'static str {
+        "s3"
+    }
+
+    fn index_manifest(
+        &self,
+        base: &str,
+        recursive: bool,
+        materialize_manifest_bytes: bool,
+    ) -> Result<IndexedManifest, SnapshotError> {
         #[cfg(feature = "s3")]
         {
-            return index_s3_prefix(trimmed, recursive, materialize_manifest_bytes);
+            index_s3_prefix(base, recursive, materialize_manifest_bytes)
         }
         #[cfg(not(feature = "s3"))]
         {
-            return Err(SnapshotError::S3FeatureRequired(trimmed.to_string()));
+            let _ = recursive;
+            let _ = materialize_manifest_bytes;
+            Err(SnapshotError::S3FeatureRequired(base.to_string()))
+        }
+    }
+}
+
+struct LocalDirectorySourceResolver;
+
+impl SourceResolver for LocalDirectorySourceResolver {
+    fn scheme(&self) -> &'static str {
+        "file"
+    }
+
+    fn index_manifest(
+        &self,
+        base: &str,
+        recursive: bool,
+        materialize_manifest_bytes: bool,
+    ) -> Result<IndexedManifest, SnapshotError> {
+        let local_base = base.strip_prefix("file://").unwrap_or(base);
+        if Path::new(local_base).is_dir() {
+            let (records, canonical_bytes) = index_local_prefix(local_base, recursive)?;
+            return indexed_manifest_from_bytes(
+                records,
+                canonical_bytes,
+                materialize_manifest_bytes,
+            );
+        }
+        Err(SnapshotError::IndexUnsupported(base.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HfRepoKind {
+    Model,
+    Dataset,
+    Space,
+}
+
+impl HfRepoKind {
+    fn to_repo_type(self) -> RepoType {
+        match self {
+            Self::Model => RepoType::Model,
+            Self::Dataset => RepoType::Dataset,
+            Self::Space => RepoType::Space,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HfLinkSpec {
+    repo_kind: HfRepoKind,
+    repo_id: String,
+    revision: String,
+    path_prefix: Option<String>,
+}
+
+struct HfSourceResolver;
+
+impl SourceResolver for HfSourceResolver {
+    fn scheme(&self) -> &'static str {
+        "hf"
+    }
+
+    fn index_manifest(
+        &self,
+        base: &str,
+        _recursive: bool,
+        materialize_manifest_bytes: bool,
+    ) -> Result<IndexedManifest, SnapshotError> {
+        let spec = parse_hf_link_base(base)?;
+
+        let mut builder = hf_hub::api::sync::ApiBuilder::new().with_progress(false);
+        if let Some(token) = hf_token_from_env() {
+            builder = builder.with_token(Some(token));
+        }
+        let api = builder
+            .build()
+            .map_err(|e| SnapshotError::HfIndex(format!("hf api init failed: {e}")))?;
+        let repo = Repo::with_revision(
+            spec.repo_id.clone(),
+            spec.repo_kind.to_repo_type(),
+            spec.revision.clone(),
+        );
+        let api_repo = api.repo(repo);
+        let info = api_repo
+            .info()
+            .map_err(|e| SnapshotError::HfIndex(format!("hf repo info failed: {e}")))?;
+
+        let mut files: Vec<String> = info
+            .siblings
+            .into_iter()
+            .map(|s| s.rfilename)
+            .filter(|name| !name.trim().is_empty() && !name.ends_with('/'))
+            .collect();
+        files.sort();
+        files.dedup();
+
+        if let Some(prefix) = spec.path_prefix.as_deref() {
+            let normalized = prefix.trim_matches('/');
+            let prefix_dir = format!("{normalized}/");
+            files.retain(|name| name == normalized || name.starts_with(&prefix_dir));
+        }
+
+        if files.is_empty() {
+            return Err(SnapshotError::HfIndex(format!(
+                "no files matched hf link {base:?}"
+            )));
+        }
+
+        let mut records = Vec::with_capacity(files.len());
+        for (idx, filename) in files.iter().enumerate() {
+            let sample_id = u64::try_from(idx)
+                .map_err(|_| SnapshotError::HfIndex("sample_id overflow".to_string()))?;
+            let record = ManifestRecord {
+                sample_id,
+                location: api_repo.url(filename),
+                byte_offset: None,
+                byte_length: None,
+                decode_hint: None,
+            };
+            record
+                .validate()
+                .map_err(|e| SnapshotError::HfIndex(e.to_string()))?;
+            records.push(record);
+        }
+
+        let canonical_bytes = canonicalize_manifest_bytes(&records);
+        indexed_manifest_from_bytes(records, canonical_bytes, materialize_manifest_bytes)
+    }
+}
+
+fn parse_hf_link_base(base: &str) -> Result<HfLinkSpec, SnapshotError> {
+    let Some(rest) = base.trim().strip_prefix("hf://") else {
+        return Err(SnapshotError::HfLinkParse(format!(
+            "expected hf:// prefix (got {base:?})"
+        )));
+    };
+    let (path_part, query_part) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let path_tokens: Vec<&str> = path_part
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if path_tokens.is_empty() {
+        return Err(SnapshotError::HfLinkParse(
+            "missing repo path (expected hf://<owner>/<repo>)".to_string(),
+        ));
+    }
+
+    let (repo_kind, idx_offset) = match path_tokens.first().copied() {
+        Some("datasets") | Some("dataset") => (HfRepoKind::Dataset, 1usize),
+        Some("models") | Some("model") => (HfRepoKind::Model, 1usize),
+        Some("spaces") | Some("space") => (HfRepoKind::Space, 1usize),
+        _ => (HfRepoKind::Dataset, 0usize),
+    };
+
+    if path_tokens.len() < idx_offset + 2 {
+        return Err(SnapshotError::HfLinkParse(
+            "missing repo id (expected hf://<owner>/<repo>)".to_string(),
+        ));
+    }
+
+    let owner = path_tokens[idx_offset];
+    let repo = path_tokens[idx_offset + 1];
+    let repo_id = format!("{owner}/{repo}");
+    let path_prefix = if path_tokens.len() > idx_offset + 2 {
+        Some(path_tokens[idx_offset + 2..].join("/"))
+    } else {
+        None
+    };
+
+    let mut revision = "main".to_string();
+    if let Some(query) = query_part {
+        for pair in query.split('&') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = k.trim().to_ascii_lowercase();
+            let value = v.trim();
+            if key == "rev" || key == "revision" {
+                if value.is_empty() {
+                    return Err(SnapshotError::HfLinkParse(
+                        "hf revision query value cannot be empty".to_string(),
+                    ));
+                }
+                revision = value.to_string();
+            }
         }
     }
 
-    // Local FS prefix indexing (directory path).
-    if std::path::Path::new(trimmed).is_dir() {
-        let (records, canonical_bytes) = index_local_prefix(trimmed, recursive)?;
-        return indexed_manifest_from_bytes(records, canonical_bytes, materialize_manifest_bytes);
-    }
+    Ok(HfLinkSpec {
+        repo_kind,
+        repo_id,
+        revision,
+        path_prefix,
+    })
+}
 
-    Err(SnapshotError::IndexUnsupported(trimmed.to_string()))
+fn hf_token_from_env() -> Option<String> {
+    for name in ["MX8_HF_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+        if let Ok(raw) = std::env::var(name) {
+            let token = raw.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn indexed_manifest_from_bytes(
@@ -2112,5 +2635,144 @@ mod tests {
         assert!(records.iter().any(|r| r.location.ends_with("a.txt")));
         assert!(records.iter().any(|r| r.location.ends_with("b.txt")));
         Ok(())
+    }
+
+    #[test]
+    fn source_registry_defaults_include_s3_and_file() {
+        let registry = SourceResolverRegistry::with_defaults();
+        let schemes = registry.schemes();
+        assert!(schemes.iter().any(|s| s == "s3"));
+        assert!(schemes.iter().any(|s| s == "file"));
+        assert!(schemes.iter().any(|s| s == "hf"));
+    }
+
+    #[test]
+    fn source_registry_unknown_scheme_is_unsupported() {
+        let registry = SourceResolverRegistry::with_defaults();
+        let err = registry
+            .index_manifest_for_base("mx8test://org/repo@refresh", true, true, true)
+            .unwrap_err();
+        match err {
+            SnapshotError::IndexUnsupported(msg) => {
+                assert!(msg.contains("mx8test://org/repo@refresh"));
+            }
+            other => panic!("expected IndexUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_registry_unknown_scheme_uses_remote_fallback_when_configured() {
+        let registry = SourceResolverRegistry::with_defaults().with_remote_fallback(Arc::new(
+            RemoteHttpSourceResolver::new(
+                "http://127.0.0.1:1".to_string(),
+                None,
+                Duration::from_millis(5),
+                1,
+            ),
+        ));
+        let err = registry
+            .index_manifest_for_base("acme://team/dataset", true, true, false)
+            .unwrap_err();
+        match err {
+            SnapshotError::RemoteResolver(msg) => {
+                assert!(msg.contains("resolver"));
+            }
+            other => panic!("expected RemoteResolver, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_response_records_are_canonicalized_and_hashed_locally() -> anyhow::Result<()> {
+        let response = RemoteResolveResponse {
+            manifest_hash: None,
+            manifest_tsv: None,
+            records: Some(vec![
+                RemoteResolveRecord {
+                    sample_id: 0,
+                    location: "https://example.com/a.bin".to_string(),
+                    byte_offset: Some(0),
+                    byte_length: Some(4),
+                    decode_hint: None,
+                },
+                RemoteResolveRecord {
+                    sample_id: 1,
+                    location: "https://example.com/b.bin".to_string(),
+                    byte_offset: Some(4),
+                    byte_length: Some(4),
+                    decode_hint: None,
+                },
+            ]),
+        };
+        let indexed = indexed_manifest_from_remote_response(response, true)?;
+        let expected_records = vec![
+            ManifestRecord {
+                sample_id: 0,
+                location: "https://example.com/a.bin".to_string(),
+                byte_offset: Some(0),
+                byte_length: Some(4),
+                decode_hint: None,
+            },
+            ManifestRecord {
+                sample_id: 1,
+                location: "https://example.com/b.bin".to_string(),
+                byte_offset: Some(4),
+                byte_length: Some(4),
+                decode_hint: None,
+            },
+        ];
+        let expected_hash =
+            mx8_manifest_store::sha256_hex(&canonicalize_manifest_bytes(&expected_records));
+        assert_eq!(indexed.manifest_hash.0, expected_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_response_manifest_hash_mismatch_is_rejected() {
+        let response = RemoteResolveResponse {
+            manifest_hash: Some("sha256:deadbeef".to_string()),
+            manifest_tsv: None,
+            records: Some(vec![RemoteResolveRecord {
+                sample_id: 0,
+                location: "https://example.com/a.bin".to_string(),
+                byte_offset: None,
+                byte_length: None,
+                decode_hint: None,
+            }]),
+        };
+        let err = indexed_manifest_from_remote_response(response, true).unwrap_err();
+        match err {
+            SnapshotError::RemoteResolver(msg) => assert!(msg.contains("manifest_hash mismatch")),
+            other => panic!("expected RemoteResolver, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hf_link_defaults_to_dataset_main() -> anyhow::Result<()> {
+        let parsed = parse_hf_link_base("hf://openai/demo-corpus")?;
+        assert_eq!(parsed.repo_kind, HfRepoKind::Dataset);
+        assert_eq!(parsed.repo_id, "openai/demo-corpus");
+        assert_eq!(parsed.revision, "main");
+        assert_eq!(parsed.path_prefix, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_hf_link_supports_repo_kind_revision_and_prefix() -> anyhow::Result<()> {
+        let parsed =
+            parse_hf_link_base("hf://datasets/openai/demo-corpus/train?revision=refs/pr/2")?;
+        assert_eq!(parsed.repo_kind, HfRepoKind::Dataset);
+        assert_eq!(parsed.repo_id, "openai/demo-corpus");
+        assert_eq!(parsed.revision, "refs/pr/2");
+        assert_eq!(parsed.path_prefix.as_deref(), Some("train"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_hf_link_rejects_missing_repo_id() {
+        let err = parse_hf_link_base("hf://datasets/openai").unwrap_err();
+        match err {
+            SnapshotError::HfLinkParse(msg) => assert!(msg.contains("missing repo id")),
+            other => panic!("expected HfLinkParse, got {other:?}"),
+        }
     }
 }

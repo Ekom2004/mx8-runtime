@@ -19,12 +19,15 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 clap.workspace = true
 futures = { workspace = true, optional = true }
+hf-hub = "0.3.2"
 mx8-core = { path = "../mx8-core" }
 mx8-manifest-store = { path = "../mx8-manifest-store" }
 mx8-observe = { path = "../mx8-observe" }
+serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 tracing.workspace = true
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [dev-dependencies]
 anyhow.workspace = true

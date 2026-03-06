@@ -13,7 +13,7 @@ Generation command:
 rg -o --no-filename "MX8_[A-Z0-9_]+" crates scripts | sort -u
 ```
 
-Current inventory size: `276` variables.
+Current inventory size: `283` variables.
 
 ## Stability Classes
 
@@ -83,6 +83,13 @@ Current inventory size: `276` variables.
 | `MX8_AZURE_ANONYMOUS` | `false` | all Azure Blob clients | bool (`true/false/1/0`) | stable |
 | `MX8_GCS_ENDPOINT_URL` | unset | all GCS clients | URL (emulator or custom endpoint) | stable |
 | `MX8_GCS_ANONYMOUS` | `false` | all GCS clients | bool (`true/false/1/0`) | stable |
+| `MX8_HF_TOKEN` | unset | snapshot resolver (`hf://`) | bearer token string (fallback precedence before `HF_TOKEN`) | stable |
+| `MX8_SOURCE_RESOLVER_URL` | unset | snapshot resolver | HTTP endpoint for external source adapters (MX8 calls `<url>/resolve`) | stable |
+| `MX8_SOURCE_RESOLVER_AUTH_BEARER` | unset | snapshot resolver | bearer token for resolver API auth | stable |
+| `MX8_SOURCE_RESOLVER_TIMEOUT_MS` | `5000` | snapshot resolver | integer >= 1 | stable |
+| `MX8_SOURCE_RESOLVER_MAX_ATTEMPTS` | `3` | snapshot resolver | integer >= 1 | stable |
+| `MX8_HTTP_AUTH_BEARER` | unset | runtime HTTP backend | bearer token string (sent as `Authorization: Bearer <token>`) | stable |
+| `MX8_HTTP_HEADERS` | unset | runtime HTTP backend | newline-delimited `Header-Name: value` pairs (`\\n` accepted) | stable |
 | `MX8_LOG` | fallback: `RUST_LOG`, then `info` | all Rust binaries | tracing filter string | stable |
 
 ## Feature/Performance Knobs (`experimental`)
@@ -195,8 +202,11 @@ MX8_GCS_ENDPOINT_URL
 MX8_GCS_SCAN_SHUFFLE_SEED
 MX8_GRPC_MAX_MESSAGE_BYTES
 MX8_HEARTBEAT_INTERVAL_MS
+MX8_HF_TOKEN
+MX8_HTTP_AUTH_BEARER
 MX8_HTTP_BANDWIDTH_BPS
 MX8_HTTP_FAIL_EVERY_N
+MX8_HTTP_HEADERS
 MX8_HTTP_LATENCY_MS
 MX8_IMAGE_BENCH_BACKENDS
 MX8_IMAGE_BENCH_BATCH_SIZE
@@ -318,6 +328,10 @@ MX8_SNAPSHOT_RECURSIVE
 MX8_SNAPSHOT_S3_EXTERNAL_SORT
 MX8_SNAPSHOT_S3_SPILL_KEYS_PER_RUN
 MX8_SNAPSHOT_WAIT_TIMEOUT_MS
+MX8_SOURCE_RESOLVER_AUTH_BEARER
+MX8_SOURCE_RESOLVER_MAX_ATTEMPTS
+MX8_SOURCE_RESOLVER_TIMEOUT_MS
+MX8_SOURCE_RESOLVER_URL
 MX8_START_ID
 MX8_TARGET_BATCH_BYTES
 MX8_TORCH_AB_COMPUTE_MS
