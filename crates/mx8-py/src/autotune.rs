@@ -203,6 +203,9 @@ pub(crate) struct AutotuneController {
     integral_rss: f64,
     cooldown_ticks: u32,
     increase_ticks: u32,
+    startup_guard_ticks: u32,
+    pid_derivative_hold_ticks: u32,
+    probe: AutotuneProbeState,
 }
 
 impl AutotuneController {
@@ -214,7 +217,75 @@ impl AutotuneController {
             integral_rss: 0.0,
             cooldown_ticks: 0,
             increase_ticks: 0,
+            startup_guard_ticks: 0,
+            pid_derivative_hold_ticks: 0,
+            probe: AutotuneProbeState::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePhase {
+    Sampling,
+    Blending,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutotuneProbeState {
+    phase: ProbePhase,
+    samples: u32,
+    wait_sum: f64,
+    rss_sum: f64,
+    inflight_sum: f64,
+    inflight_min: f64,
+    inflight_max: f64,
+    blend_ticks_left: u32,
+    target: AutotuneUpdate,
+}
+
+impl AutotuneProbeState {
+    fn new() -> Self {
+        Self {
+            phase: ProbePhase::Sampling,
+            samples: 0,
+            wait_sum: 0.0,
+            rss_sum: 0.0,
+            inflight_sum: 0.0,
+            inflight_min: 1.0,
+            inflight_max: 0.0,
+            blend_ticks_left: 0,
+            target: AutotuneUpdate {
+                want: 1,
+                prefetch_batches: 1,
+                max_queue_batches: 1,
+            },
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.phase != ProbePhase::Done
+    }
+
+    fn record_sample(&mut self, wait_ratio: f64, rss_ratio: f64, inflight_ratio: f64) {
+        let wait = wait_ratio.clamp(0.0, 1.0);
+        let rss = rss_ratio.clamp(0.0, 1.5);
+        let inflight = inflight_ratio.clamp(0.0, 1.5);
+        self.samples = self.samples.saturating_add(1);
+        self.wait_sum += wait;
+        self.rss_sum += rss;
+        self.inflight_sum += inflight;
+        self.inflight_min = self.inflight_min.min(inflight);
+        self.inflight_max = self.inflight_max.max(inflight);
+    }
+
+    fn sample_means(&self) -> (f64, f64, f64) {
+        let denom = (self.samples.max(1)) as f64;
+        (
+            self.wait_sum / denom,
+            self.rss_sum / denom,
+            self.inflight_sum / denom,
+        )
     }
 }
 
@@ -248,13 +319,25 @@ pub(crate) fn autotune_tick(
     const KP: f64 = 1.5;
     const KI: f64 = 0.2;
     const KD: f64 = 0.1;
+    const PROBE_MIN_SAMPLES: u32 = 6;
+    const PROBE_TARGET_SAMPLES: u32 = 8;
+    const PROBE_BLEND_TICKS: u32 = 4;
+    const STARTUP_WANT_CAP_FRAC: f64 = 0.80;
+    const STARTUP_SAFETY_TICKS: u32 = 4;
+    const STARTUP_RSS_SAFETY: f64 = 0.92;
+    const STARTUP_INFLIGHT_SAFETY: f64 = 0.90;
 
     state.wait_ewma = ALPHA * wait_ratio + (1.0 - ALPHA) * state.wait_ewma;
     state.rss_ewma = ALPHA * rss_ratio + (1.0 - ALPHA) * state.rss_ewma;
 
     let error = state.rss_ewma - RSS_TARGET;
     state.integral_rss = (state.integral_rss + error * interval_secs).clamp(-0.5, 0.5);
-    let deriv = (state.rss_ewma - state.prev_rss_ewma) / interval_secs;
+    let deriv = if state.pid_derivative_hold_ticks > 0 {
+        state.pid_derivative_hold_ticks -= 1;
+        0.0
+    } else {
+        (state.rss_ewma - state.prev_rss_ewma) / interval_secs
+    };
     state.prev_rss_ewma = state.rss_ewma;
 
     let pressure = (KP * error + KI * state.integral_rss + KD * deriv).clamp(0.0, 1.0);
@@ -277,11 +360,149 @@ pub(crate) fn autotune_tick(
         next.want = ((next.want as f64) * 0.5).floor() as u32;
         reason = "hard_cut";
         state.cooldown_ticks = 2;
+        state.probe.phase = ProbePhase::Done;
+        state.startup_guard_ticks = 0;
+    } else if state.probe.is_active()
+        && (rss_ratio >= STARTUP_RSS_SAFETY || inflight_ratio >= STARTUP_INFLIGHT_SAFETY)
+    {
+        next.prefetch_batches = rails.min_prefetch_batches;
+        next.max_queue_batches = rails.min_max_queue_batches;
+        next.want = rails.min_want;
+        reason = "probe_safety_cut";
+        state.cooldown_ticks = 2;
+        state.probe.phase = ProbePhase::Done;
+        state.startup_guard_ticks = 0;
+        state.integral_rss = 0.0;
+        state.pid_derivative_hold_ticks = 1;
     } else if soft_cut {
         next.prefetch_batches = next.prefetch_batches.saturating_sub(1);
         next.max_queue_batches = next.max_queue_batches.saturating_sub(2);
         reason = "soft_cut";
         state.increase_ticks = 0;
+    } else if state.probe.phase == ProbePhase::Sampling {
+        state
+            .probe
+            .record_sample(wait_ratio, rss_ratio, inflight_ratio);
+        let should_finalize = state.probe.samples >= PROBE_TARGET_SAMPLES
+            || (state.probe.samples >= PROBE_MIN_SAMPLES
+                && state.wait_ewma > WAIT_TARGET
+                && state.rss_ewma < 0.85
+                && inflight_ratio < 0.85);
+        reason = "probe_sampling";
+        if should_finalize {
+            let (wait_mean, rss_mean, inflight_mean) = state.probe.sample_means();
+            let sample_conf =
+                (state.probe.samples as f64 / PROBE_TARGET_SAMPLES as f64).clamp(0.0, 1.0);
+            let spread = (state.probe.inflight_max - state.probe.inflight_min).max(0.0);
+            let stability_conf = (1.0 - (spread / 0.50)).clamp(0.0, 1.0);
+            let confidence = (0.7 * sample_conf + 0.3 * stability_conf).clamp(0.0, 1.0);
+
+            let safe_want_cap = ((rails.max_want as f64) * STARTUP_WANT_CAP_FRAC)
+                .floor()
+                .max(rails.min_want as f64) as u32;
+            let baseline = AutotuneUpdate {
+                want: current.want.min(safe_want_cap),
+                prefetch_batches: current.prefetch_batches,
+                max_queue_batches: current.max_queue_batches,
+            };
+
+            let pressure_mean = rss_mean.max(inflight_mean);
+            let starvation_score = (wait_mean / 0.12).clamp(0.0, 1.0);
+            let headroom_score = ((0.90 - pressure_mean) / 0.90).clamp(0.0, 1.0);
+            let warm_gain = (starvation_score * headroom_score).clamp(0.0, 1.0);
+
+            let up_prefetch = ((rails.max_prefetch_batches.saturating_sub(current.prefetch_batches))
+                as f64
+                * warm_gain)
+                .round() as usize;
+            let up_queue = ((rails.max_max_queue_batches.saturating_sub(current.max_queue_batches))
+                as f64
+                * warm_gain
+                * 0.25)
+                .round() as usize;
+            let up_want = ((safe_want_cap.saturating_sub(current.want)) as f64 * warm_gain).round()
+                as u32;
+
+            let mut raw_target = current;
+            raw_target.prefetch_batches = raw_target.prefetch_batches.saturating_add(up_prefetch);
+            raw_target.max_queue_batches = raw_target.max_queue_batches.saturating_add(up_queue);
+            raw_target.want = raw_target.want.saturating_add(up_want);
+
+            if pressure_mean > 0.85 {
+                raw_target.prefetch_batches = raw_target.prefetch_batches.saturating_sub(1);
+                raw_target.max_queue_batches = raw_target.max_queue_batches.saturating_sub(2);
+                raw_target.want = raw_target.want.saturating_sub(1);
+            }
+
+            raw_target.prefetch_batches = raw_target
+                .prefetch_batches
+                .clamp(rails.min_prefetch_batches, rails.max_prefetch_batches);
+            raw_target.max_queue_batches = raw_target
+                .max_queue_batches
+                .clamp(rails.min_max_queue_batches, rails.max_max_queue_batches);
+            raw_target.want = raw_target.want.clamp(rails.min_want, safe_want_cap);
+
+            let blend_knob = |raw: f64, base: f64| {
+                (confidence * raw + (1.0 - confidence) * base)
+                    .round()
+                    .max(0.0)
+            };
+            let final_target = AutotuneUpdate {
+                prefetch_batches: blend_knob(
+                    raw_target.prefetch_batches as f64,
+                    baseline.prefetch_batches as f64,
+                ) as usize,
+                max_queue_batches: blend_knob(
+                    raw_target.max_queue_batches as f64,
+                    baseline.max_queue_batches as f64,
+                ) as usize,
+                want: blend_knob(raw_target.want as f64, baseline.want as f64) as u32,
+            };
+
+            state.probe.target = AutotuneUpdate {
+                prefetch_batches: final_target
+                    .prefetch_batches
+                    .clamp(rails.min_prefetch_batches, rails.max_prefetch_batches),
+                max_queue_batches: final_target
+                    .max_queue_batches
+                    .clamp(rails.min_max_queue_batches, rails.max_max_queue_batches),
+                want: final_target.want.clamp(rails.min_want, safe_want_cap),
+            };
+            state.probe.phase = ProbePhase::Blending;
+            state.probe.blend_ticks_left = PROBE_BLEND_TICKS;
+            state.startup_guard_ticks = STARTUP_SAFETY_TICKS;
+            reason = "probe_ready";
+        }
+    } else if state.probe.phase == ProbePhase::Blending {
+        let target = state.probe.target;
+        if current.prefetch_batches < target.prefetch_batches {
+            next.prefetch_batches = current.prefetch_batches.saturating_add(1);
+        } else if current.prefetch_batches > target.prefetch_batches {
+            next.prefetch_batches = current.prefetch_batches.saturating_sub(1);
+        }
+        if current.max_queue_batches < target.max_queue_batches {
+            next.max_queue_batches = current.max_queue_batches.saturating_add(2);
+        } else if current.max_queue_batches > target.max_queue_batches {
+            next.max_queue_batches = current.max_queue_batches.saturating_sub(2);
+        }
+        if current.want < target.want {
+            next.want = current.want.saturating_add(1);
+        } else if current.want > target.want {
+            next.want = current.want.saturating_sub(1);
+        }
+        if state.probe.blend_ticks_left > 0 {
+            state.probe.blend_ticks_left -= 1;
+        }
+        reason = "probe_blend";
+        if state.probe.blend_ticks_left == 0
+            || (next.prefetch_batches == target.prefetch_batches
+                && next.max_queue_batches == target.max_queue_batches
+                && next.want == target.want)
+        {
+            state.probe.phase = ProbePhase::Done;
+            state.pid_derivative_hold_ticks = 1;
+            state.integral_rss = state.integral_rss.clamp(-0.25, 0.25);
+        }
     } else if can_increase {
         next.prefetch_batches = next.prefetch_batches.saturating_add(1);
         next.max_queue_batches = next.max_queue_batches.saturating_add(2);
@@ -295,6 +516,14 @@ pub(crate) fn autotune_tick(
         if state.cooldown_ticks > 0 {
             state.cooldown_ticks -= 1;
         }
+    }
+
+    if state.startup_guard_ticks > 0 {
+        let safe_want_cap = ((rails.max_want as f64) * STARTUP_WANT_CAP_FRAC)
+            .floor()
+            .max(rails.min_want as f64) as u32;
+        next.want = next.want.min(safe_want_cap);
+        state.startup_guard_ticks -= 1;
     }
 
     next.prefetch_batches = next
@@ -413,7 +642,14 @@ pub(crate) async fn autotune_loop(
 mod autotune_tests {
     use super::{
         autotune_tick, AutotuneController, AutotuneRails, AutotuneTickOutput, AutotuneUpdate,
+        ProbePhase,
     };
+
+    fn controller_without_probe() -> AutotuneController {
+        let mut state = AutotuneController::new();
+        state.probe.phase = ProbePhase::Done;
+        state
+    }
 
     fn tick(
         state: &mut AutotuneController,
@@ -436,7 +672,7 @@ mod autotune_tests {
 
     #[test]
     fn autotune_hard_cut_halves_knobs() {
-        let mut state = AutotuneController::new();
+        let mut state = controller_without_probe();
         let rails = AutotuneRails {
             min_prefetch_batches: 1,
             max_prefetch_batches: 16,
@@ -460,7 +696,7 @@ mod autotune_tests {
 
     #[test]
     fn autotune_increase_respects_rails() {
-        let mut state = AutotuneController::new();
+        let mut state = controller_without_probe();
         let rails = AutotuneRails {
             min_prefetch_batches: 1,
             max_prefetch_batches: 4,
@@ -484,6 +720,34 @@ mod autotune_tests {
 
     #[test]
     fn autotune_soft_cut_decrements() {
+        let mut state = controller_without_probe();
+        let rails = AutotuneRails {
+            min_prefetch_batches: 1,
+            max_prefetch_batches: 8,
+            min_max_queue_batches: 8,
+            max_max_queue_batches: 64,
+            min_want: 1,
+            max_want: 4,
+        };
+        // Seed state near the memory boundary so the next tick enters soft-cut.
+        state.rss_ewma = 1.35;
+        state.prev_rss_ewma = 1.35;
+        state.integral_rss = 0.50;
+        let current = AutotuneUpdate {
+            want: 3,
+            prefetch_batches: 4,
+            max_queue_batches: 32,
+        };
+        let out = tick(&mut state, current, rails, 0.0, 0.96, 0.5);
+        assert_eq!(out.reason, "soft_cut");
+        assert!(out.changed);
+        assert_eq!(out.next.prefetch_batches, 3);
+        assert_eq!(out.next.max_queue_batches, 30);
+        assert_eq!(out.next.want, 3);
+    }
+
+    #[test]
+    fn autotune_probe_safety_cut_is_conservative() {
         let mut state = AutotuneController::new();
         let rails = AutotuneRails {
             min_prefetch_batches: 1,
@@ -493,19 +757,63 @@ mod autotune_tests {
             min_want: 1,
             max_want: 4,
         };
-        // Prime state to build pressure.
         let current = AutotuneUpdate {
-            want: 3,
-            prefetch_batches: 4,
-            max_queue_batches: 32,
+            want: 4,
+            prefetch_batches: 6,
+            max_queue_batches: 40,
         };
-        let _ = tick(&mut state, current, rails, 0.0, 0.95, 0.5);
-        let out = tick(&mut state, current, rails, 0.0, 0.95, 0.5);
-        assert_eq!(out.reason, "soft_cut");
-        assert!(out.changed);
-        assert_eq!(out.next.prefetch_batches, 3);
-        assert_eq!(out.next.max_queue_batches, 30);
-        assert_eq!(out.next.want, 3);
+        let out = tick(&mut state, current, rails, 0.05, 0.93, 0.50);
+        assert_eq!(out.reason, "probe_safety_cut");
+        assert_eq!(out.next.prefetch_batches, rails.min_prefetch_batches);
+        assert_eq!(out.next.max_queue_batches, rails.min_max_queue_batches);
+        assert_eq!(out.next.want, rails.min_want);
+    }
+
+    #[test]
+    fn autotune_probe_warm_start_blends_without_large_jumps() {
+        let mut state = AutotuneController::new();
+        let rails = AutotuneRails {
+            min_prefetch_batches: 1,
+            max_prefetch_batches: 8,
+            min_max_queue_batches: 8,
+            max_max_queue_batches: 64,
+            min_want: 1,
+            max_want: 4,
+        };
+        let mut cur = AutotuneUpdate {
+            want: 1,
+            prefetch_batches: 1,
+            max_queue_batches: 16,
+        };
+
+        for _ in 0..6 {
+            let out = tick(&mut state, cur, rails, 0.20, 0.40, 0.30);
+            assert!(matches!(out.reason, "probe_sampling" | "probe_ready"));
+            if out.reason == "probe_sampling" {
+                assert!(!out.changed);
+            }
+            cur = out.next;
+        }
+
+        let out = tick(&mut state, cur, rails, 0.22, 0.38, 0.28);
+        assert!(matches!(out.reason, "probe_ready" | "probe_blend"));
+        assert!(out.next.prefetch_batches.saturating_sub(cur.prefetch_batches) <= 1);
+        assert!(out.next.max_queue_batches.saturating_sub(cur.max_queue_batches) <= 2);
+        assert!(out.next.want.saturating_sub(cur.want) <= 1);
+        cur = out.next;
+
+        let mut saw_blend = false;
+        for _ in 0..4 {
+            let out = tick(&mut state, cur, rails, 0.18, 0.42, 0.35);
+            if out.reason == "probe_blend" {
+                saw_blend = true;
+            }
+            assert!(out.next.prefetch_batches.saturating_sub(cur.prefetch_batches) <= 1);
+            assert!(out.next.max_queue_batches.saturating_sub(cur.max_queue_batches) <= 2);
+            assert!(out.next.want.saturating_sub(cur.want) <= 1);
+            cur = out.next;
+        }
+        assert!(saw_blend);
     }
 
     #[test]
@@ -549,8 +857,8 @@ mod autotune_tests {
             out
         };
 
-        let first = run(AutotuneController::new());
-        let second = run(AutotuneController::new());
+        let first = run(controller_without_probe());
+        let second = run(controller_without_probe());
         assert_eq!(first, second);
     }
 }
