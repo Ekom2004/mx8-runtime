@@ -454,6 +454,7 @@ impl MixedDataLoader {
             wait_ratio,
             rss_ratio,
             inflight_ratio,
+            0.0,
             2.0,
         );
         self.mix_runtime_autotune_pressure_milli = (tick.pressure * 1000.0).round() as u64;

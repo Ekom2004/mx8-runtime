@@ -162,6 +162,11 @@ pub(crate) struct AutotuneShared {
     pub(crate) rss_ewma_milli: AtomicU64,
     pub(crate) integral_rss_milli: AtomicI64,
     pub(crate) cooldown_ticks: AtomicU32,
+    pub(crate) net_pressure_ratio_milli: AtomicU64,
+    pub(crate) net_signal_age_ms: AtomicU64,
+    pub(crate) net_signal_stale_total: AtomicU64,
+    pub(crate) net_assisted_backoff_total: AtomicU64,
+    pub(crate) net_disabled_total: AtomicU64,
 }
 
 impl AutotuneShared {
@@ -182,6 +187,11 @@ impl AutotuneShared {
             rss_ewma_milli: AtomicU64::new(0),
             integral_rss_milli: AtomicI64::new(0),
             cooldown_ticks: AtomicU32::new(0),
+            net_pressure_ratio_milli: AtomicU64::new(0),
+            net_signal_age_ms: AtomicU64::new(0),
+            net_signal_stale_total: AtomicU64::new(0),
+            net_assisted_backoff_total: AtomicU64::new(0),
+            net_disabled_total: AtomicU64::new(0),
         }
     }
 
@@ -304,6 +314,13 @@ pub(crate) struct AutotuneTickOutput {
     pub(crate) pressure: f64,
 }
 
+fn effective_net_pressure_ratio(sample: NetPressureSample, max_age_ms: u64) -> Option<f64> {
+    if !sample.fresh || sample.age_ms > max_age_ms {
+        return None;
+    }
+    Some(sample.ratio.clamp(0.0, 1.0))
+}
+
 pub(crate) fn autotune_tick(
     state: &mut AutotuneController,
     current: AutotuneUpdate,
@@ -311,6 +328,7 @@ pub(crate) fn autotune_tick(
     wait_ratio: f64,
     rss_ratio: f64,
     inflight_ratio: f64,
+    net_pressure_ratio: f64,
     interval_secs: f64,
 ) -> AutotuneTickOutput {
     const ALPHA: f64 = 0.2;
@@ -340,17 +358,19 @@ pub(crate) fn autotune_tick(
     };
     state.prev_rss_ewma = state.rss_ewma;
 
-    let pressure = (KP * error + KI * state.integral_rss + KD * deriv).clamp(0.0, 1.0);
+    let memory_pressure = (KP * error + KI * state.integral_rss + KD * deriv).clamp(0.0, 1.0);
+    let net_pressure = net_pressure_ratio.clamp(0.0, 1.0);
+    let effective_pressure = memory_pressure.max(net_pressure);
 
     let mut next = current;
     let mut reason = "hold";
 
     let hard_cut = rss_ratio >= 0.97 || inflight_ratio >= 0.98;
-    let soft_cut = pressure >= 0.60;
+    let soft_cut = effective_pressure >= 0.60;
     let starvation = wait_ratio > 0.01 || state.wait_ewma > WAIT_TARGET;
     let can_increase = state.cooldown_ticks == 0
         && state.wait_ewma > WAIT_TARGET
-        && pressure <= 0.30
+        && effective_pressure <= 0.30
         && inflight_ratio <= 0.85
         && starvation;
 
@@ -377,7 +397,11 @@ pub(crate) fn autotune_tick(
     } else if soft_cut {
         next.prefetch_batches = next.prefetch_batches.saturating_sub(1);
         next.max_queue_batches = next.max_queue_batches.saturating_sub(2);
-        reason = "soft_cut";
+        reason = if net_pressure > memory_pressure {
+            "soft_cut_net"
+        } else {
+            "soft_cut"
+        };
         state.increase_ticks = 0;
     } else if state.probe.phase == ProbePhase::Sampling {
         state
@@ -540,29 +564,35 @@ pub(crate) fn autotune_tick(
             || next.want != current.want,
         next,
         reason,
-        pressure,
+        pressure: effective_pressure,
     }
 }
 
-pub(crate) async fn autotune_loop(
+async fn autotune_loop_with_interval(
     pipeline: Arc<Pipeline>,
     metrics: Arc<RuntimeMetrics>,
     shared: Arc<AutotuneShared>,
     max_inflight_bytes: u64,
     max_process_rss_bytes: Option<u64>,
     rails: AutotuneRails,
+    net_pressure_source: Arc<dyn NetPressureSource>,
+    interval: Duration,
 ) {
     if !shared.enabled {
         return;
     }
 
     let mut state = AutotuneController::new();
-    let interval = Duration::from_secs(2);
+    const NET_SIGNAL_MAX_AGE_MS: u64 = 5_000;
+    let source_name = net_pressure_source.name();
+    let net_source_enabled = source_name != "noop";
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;
+        let net_sample = net_pressure_source.poll();
+        let net_pressure_ratio = effective_net_pressure_ratio(net_sample, NET_SIGNAL_MAX_AGE_MS);
 
         let wait_ns = shared.wait_ns_interval.swap(0, Ordering::Relaxed);
         let wait_ratio = (wait_ns as f64 / interval.as_nanos() as f64).clamp(0.0, 1.0);
@@ -590,12 +620,28 @@ pub(crate) async fn autotune_loop(
             wait_ratio,
             rss_ratio,
             inflight_ratio,
+            net_pressure_ratio.unwrap_or(0.0),
             interval.as_secs_f64(),
         );
 
         shared
             .pressure_milli
             .store((tick.pressure * 1000.0).round() as u64, Ordering::Relaxed);
+        shared.net_signal_age_ms.store(net_sample.age_ms, Ordering::Relaxed);
+        shared.net_pressure_ratio_milli.store(
+            (net_pressure_ratio.unwrap_or(0.0) * 1000.0).round() as u64,
+            Ordering::Relaxed,
+        );
+        if net_source_enabled && net_pressure_ratio.is_none() {
+            shared
+                .net_signal_stale_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if tick.reason == "soft_cut_net" && tick.changed {
+            shared
+                .net_assisted_backoff_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         shared
             .wait_ewma_milli
             .store((state.wait_ewma * 1000.0).round() as u64, Ordering::Relaxed);
@@ -638,12 +684,39 @@ pub(crate) async fn autotune_loop(
     }
 }
 
+pub(crate) async fn autotune_loop(
+    pipeline: Arc<Pipeline>,
+    metrics: Arc<RuntimeMetrics>,
+    shared: Arc<AutotuneShared>,
+    max_inflight_bytes: u64,
+    max_process_rss_bytes: Option<u64>,
+    rails: AutotuneRails,
+    net_pressure_source: Arc<dyn NetPressureSource>,
+) {
+    autotune_loop_with_interval(
+        pipeline,
+        metrics,
+        shared,
+        max_inflight_bytes,
+        max_process_rss_bytes,
+        rails,
+        net_pressure_source,
+        Duration::from_secs(2),
+    )
+    .await;
+}
+
 #[cfg(test)]
 mod autotune_tests {
     use super::{
-        autotune_tick, AutotuneController, AutotuneRails, AutotuneTickOutput, AutotuneUpdate,
-        ProbePhase,
+        autotune_loop_with_interval, autotune_tick, effective_net_pressure_ratio,
+        AutotuneController, AutotuneRails, AutotuneShared, AutotuneTickOutput, AutotuneUpdate,
+        NetPressureSample, NetPressureSource, ProbePhase,
     };
+    use crate::{Pipeline, RuntimeCaps};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     fn controller_without_probe() -> AutotuneController {
         let mut state = AutotuneController::new();
@@ -658,6 +731,7 @@ mod autotune_tests {
         wait_ratio: f64,
         rss_ratio: f64,
         inflight_ratio: f64,
+        net_pressure_ratio: f64,
     ) -> AutotuneTickOutput {
         autotune_tick(
             state,
@@ -666,6 +740,7 @@ mod autotune_tests {
             wait_ratio,
             rss_ratio,
             inflight_ratio,
+            net_pressure_ratio,
             2.0,
         )
     }
@@ -686,7 +761,7 @@ mod autotune_tests {
             prefetch_batches: 8,
             max_queue_batches: 100,
         };
-        let out = tick(&mut state, current, rails, 0.0, 0.98, 0.2);
+        let out = tick(&mut state, current, rails, 0.0, 0.98, 0.2, 0.0);
         assert!(out.changed);
         assert_eq!(out.reason, "hard_cut");
         assert_eq!(out.next.prefetch_batches, 4);
@@ -710,7 +785,7 @@ mod autotune_tests {
             prefetch_batches: 4,
             max_queue_batches: 16,
         };
-        let out = tick(&mut state, current, rails, 0.30, 0.20, 0.10);
+        let out = tick(&mut state, current, rails, 0.30, 0.20, 0.10, 0.0);
         assert!(!out.changed);
         assert_eq!(out.reason, "aimd_increase");
         assert_eq!(out.next.prefetch_batches, 4);
@@ -738,7 +813,7 @@ mod autotune_tests {
             prefetch_batches: 4,
             max_queue_batches: 32,
         };
-        let out = tick(&mut state, current, rails, 0.0, 0.96, 0.5);
+        let out = tick(&mut state, current, rails, 0.0, 0.96, 0.5, 0.0);
         assert_eq!(out.reason, "soft_cut");
         assert!(out.changed);
         assert_eq!(out.next.prefetch_batches, 3);
@@ -762,7 +837,7 @@ mod autotune_tests {
             prefetch_batches: 6,
             max_queue_batches: 40,
         };
-        let out = tick(&mut state, current, rails, 0.05, 0.93, 0.50);
+        let out = tick(&mut state, current, rails, 0.05, 0.93, 0.50, 0.0);
         assert_eq!(out.reason, "probe_safety_cut");
         assert_eq!(out.next.prefetch_batches, rails.min_prefetch_batches);
         assert_eq!(out.next.max_queue_batches, rails.min_max_queue_batches);
@@ -787,7 +862,7 @@ mod autotune_tests {
         };
 
         for _ in 0..6 {
-            let out = tick(&mut state, cur, rails, 0.20, 0.40, 0.30);
+            let out = tick(&mut state, cur, rails, 0.20, 0.40, 0.30, 0.0);
             assert!(matches!(out.reason, "probe_sampling" | "probe_ready"));
             if out.reason == "probe_sampling" {
                 assert!(!out.changed);
@@ -795,7 +870,7 @@ mod autotune_tests {
             cur = out.next;
         }
 
-        let out = tick(&mut state, cur, rails, 0.22, 0.38, 0.28);
+        let out = tick(&mut state, cur, rails, 0.22, 0.38, 0.28, 0.0);
         assert!(matches!(out.reason, "probe_ready" | "probe_blend"));
         assert!(out.next.prefetch_batches.saturating_sub(cur.prefetch_batches) <= 1);
         assert!(out.next.max_queue_batches.saturating_sub(cur.max_queue_batches) <= 2);
@@ -804,7 +879,7 @@ mod autotune_tests {
 
         let mut saw_blend = false;
         for _ in 0..4 {
-            let out = tick(&mut state, cur, rails, 0.18, 0.42, 0.35);
+            let out = tick(&mut state, cur, rails, 0.18, 0.42, 0.35, 0.0);
             if out.reason == "probe_blend" {
                 saw_blend = true;
             }
@@ -844,7 +919,7 @@ mod autotune_tests {
             let mut cur = seed;
             let mut out = Vec::new();
             for (wait, rss, inflight) in signals {
-                let tick = tick(&mut state, cur, rails, wait, rss, inflight);
+                let tick = tick(&mut state, cur, rails, wait, rss, inflight, 0.0);
                 out.push((
                     tick.next.want,
                     tick.next.prefetch_batches,
@@ -860,5 +935,106 @@ mod autotune_tests {
         let first = run(controller_without_probe());
         let second = run(controller_without_probe());
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn autotune_net_pressure_can_trigger_soft_cut_without_memory_pressure() {
+        let mut state = controller_without_probe();
+        let rails = AutotuneRails {
+            min_prefetch_batches: 1,
+            max_prefetch_batches: 8,
+            min_max_queue_batches: 8,
+            max_max_queue_batches: 64,
+            min_want: 1,
+            max_want: 4,
+        };
+        let current = AutotuneUpdate {
+            want: 3,
+            prefetch_batches: 4,
+            max_queue_batches: 32,
+        };
+        let out = tick(&mut state, current, rails, 0.0, 0.40, 0.30, 0.80);
+        assert_eq!(out.reason, "soft_cut_net");
+        assert!(out.changed);
+        assert_eq!(out.next.prefetch_batches, 3);
+        assert_eq!(out.next.max_queue_batches, 30);
+    }
+
+    #[test]
+    fn net_pressure_sample_stale_or_not_fresh_is_ignored() {
+        let stale = NetPressureSample {
+            ratio: 0.9,
+            fresh: true,
+            age_ms: 5_001,
+        };
+        let not_fresh = NetPressureSample {
+            ratio: 0.9,
+            fresh: false,
+            age_ms: 100,
+        };
+        assert_eq!(effective_net_pressure_ratio(stale, 5_000), None);
+        assert_eq!(effective_net_pressure_ratio(not_fresh, 5_000), None);
+    }
+
+    #[test]
+    fn net_pressure_sample_fresh_is_clamped_and_used() {
+        let sample = NetPressureSample {
+            ratio: 1.7,
+            fresh: true,
+            age_ms: 100,
+        };
+        assert_eq!(effective_net_pressure_ratio(sample, 5_000), Some(1.0));
+    }
+
+    #[derive(Debug, Default)]
+    struct StaleNetPressureSource;
+
+    impl NetPressureSource for StaleNetPressureSource {
+        fn poll(&self) -> NetPressureSample {
+            NetPressureSample {
+                ratio: 0.9,
+                fresh: true,
+                age_ms: 10_000,
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "test_stale"
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autotune_loop_stale_signal_increments_counter_for_non_noop_source() {
+        let caps = RuntimeCaps {
+            max_inflight_bytes: 128 * 1024 * 1024,
+            max_queue_batches: 32,
+            batch_size_samples: 32,
+            prefetch_batches: 1,
+            target_batch_bytes: None,
+            max_batch_bytes: None,
+            max_process_rss_bytes: Some(128 * 1024 * 1024),
+        };
+        let pipeline = Arc::new(Pipeline::new(caps));
+        let metrics = pipeline.metrics();
+        let shared = Arc::new(AutotuneShared::new(true, 1, 1, 32));
+        let rails = AutotuneRails::for_profile(super::AutotuneProfile::Balanced);
+        let source: Arc<dyn NetPressureSource> = Arc::new(StaleNetPressureSource);
+
+        let task = tokio::spawn(autotune_loop_with_interval(
+            pipeline,
+            metrics,
+            shared.clone(),
+            caps.max_inflight_bytes,
+            caps.max_process_rss_bytes,
+            rails,
+            source,
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(shared.net_signal_stale_total.load(Ordering::Relaxed) > 0);
+        assert_eq!(shared.net_pressure_ratio_milli.load(Ordering::Relaxed), 0);
     }
 }

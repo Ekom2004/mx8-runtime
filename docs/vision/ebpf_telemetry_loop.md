@@ -1,66 +1,142 @@
-# Vision: eBPF Telemetry & Autotuning
+# RFC: eBPF Network Telemetry Signal for MX8 Autotune (v1)
 
-## The Concept
+Status: Draft  
+Owner: MX8 Runtime  
+Scope: Linux accelerator only, no user-facing API changes
 
-The MX8 Autotuner presently operates as an application-layer **Reactive** feedforward+PID controller. By limiting the `want` in-flight HTTP requests, MX8 gracefully avoids TCP slow-start and throttles buffer bloat. However, if the underlying network physically congests, the OS network stack still drops a packet, incurs a latency spike (100+ ms) while re-requesting the TCP fragment, and then the User-Space Rust app eventually corrects itself by turning the `want` dial down. 
+## 1. Summary
 
-With eBPF (Extended Berkeley Packet Filter), MX8 can transition from **Reactive Healing** to **Proactive Evasion**.
+Add an optional Linux eBPF telemetry path that produces a low-rate "network congestion pressure" signal for MX8 autotune.
 
-By injecting highly secure, JIT-compiled C/Rust programs into the absolute lowest levels of the Linux kernel network stack, MX8 can measure packet arrival variance at the nanosecond scale, communicating to the application-layer Autotuner *before* the application ever experiences congestion.
+The signal is used as an additional control input to the existing application-layer autotune loop. It does not replace the current RSS/inflight/wait controls and does not change Python API usage.
 
-## Core Capabilities
+If eBPF is unavailable, MX8 runs exactly as it does today.
 
-### 1. Telepathic Autotuning
-The eBPF module sits directly inside the host's Linux TCP stack, listening for incoming data. 
-- It tracks the exact timestamp each raw 1,500-byte packet arrives from Cloudflare or S3.
-- If the RTT (Round Trip Time) or inter-packet gap stretches by single milliseconds, it identifies that an upstream router is filling up.
-- The eBPF program writes a `CONGESTION_IMMINENT` signal into an eBPF Shared Memory Map.
-- **Result:** The `mx8-py/src/autotune.rs` PID controller polls this map 1,000 times a second and lowers the `want` throttle before a packet actually drops, maintaining an unbreakable, flawlessly flat, mathematically optimized throughput line.
+## 2. Goals
 
-### 2. The AF_XDP (Zero-Copy Receive) Paradigm
-While MX8 already employs Zero-Copy *Decoding* via `device_output=True` (shipping compressed bytes to the NVDEC unzipper), the Operating System still performs a massive memcpy when translating the network payload from the Network Interface Card (NIC) to the User-Space Rust memory map.
+- Reduce throughput variance on network-bound workloads.
+- Reduce avoidable hard-cut events caused by late congestion detection.
+- Improve time spent near steady-state throughput under fluctuating network conditions.
+- Keep current safety rails and fail-open behavior.
 
-Using AF_XDP:
-- MX8 allocates a large contiguous RAM buffer on boot.
-- The eBPF module hooks directly onto the network card driver.
-- When an HTTP byte-range frame arrives matching the MX8 socket, the NIC performs a Direct Memory Access (DMA) write, dropping the raw packet array straight into the Rust application buffer.
-- **Result:** The host CPU does effectively 0% of the network copy work, unlocking 100 Gbps to 400 Gbps network saturation for a single server processor.
+## 3. Non-Goals
 
-## Architecture
+- No AF_XDP transport rewrite in this RFC.
+- No changes to user-facing loader arguments or environment requirements.
+- No requirement for root-only operation in default deployments.
+- No cross-platform kernel instrumentation commitment (Linux only for v1).
 
-This is fully implementable in native Rust using libraries like `aya`.
+## 4. Why This Exists
 
-### The Sub-Kernel Probe (eBPF Rust)
-```rust
-#[tracepoint(name = "tcp_rcv_established")]
-pub fn measure_tcp_spacing(ctx: TracePointContext) -> u32 {
-    let packet_time = bpf_ktime_get_ns();
-    let old_time = read_from_map(socket_id);
-    let gap = packet_time - old_time;
-    
-    // Alert the user-space PID loop of micro-congestion
-    if gap > THRESHOLD {
-        write_alert_to_shared_memory(socket_id, CONGESTION_WARNING);
-    }
-    save_to_map(socket_id, packet_time);
-    return 0;
-}
-```
+Today, autotune reacts when application-level symptoms are already visible (wait ratio, inflight pressure, RSS pressure). For some network paths, congestion can be detected earlier at the kernel boundary. A lightweight eBPF signal can provide earlier warning and reduce overshoot.
 
-### The Tying (User-Space Link)
+This is an additive control signal, not a new control system.
 
-```rust
-// Inside `mx8-py/src/autotune.rs`
-let network_status = bpf_map.read(current_socket_id);
+## 5. Proposed Design (v1)
 
-if network_status == CONGESTION_WARNING {
-    // TCP queue expanding; back off request limit by 1
-    next.want = next.want.saturating_sub(1);
-} else {
-    // Network is clear, continue throttling up
-    next.want = next.want.saturating_add(1);
-}
-```
+### 5.1 Architecture
 
-## Graceful Degradation
-Because eBPF is a deeply privileged Linux-only technology, MX8 treats it purely as an **Accelerator**. If an ML engineer runs MX8 on macOS or Windows (or a Linux instance without `root`/`CAP_BPF` permissions), the eBPF hook quietly disables itself. The standard `autotune.rs` pipeline falls back to Application-Layer application-time sampling metrics seamlessly, guaranteeing the pipeline runs perfectly regardless of OS privilege.
+- Kernel side: eBPF program records per-flow latency/jitter indicators into BPF maps.
+- User side: a small Linux-only collector reads/aggregates map data at low frequency.
+- Autotune side: existing loop consumes one normalized scalar:
+  - `net_pressure_ratio` in `[0.0, 1.0]`.
+
+Final pressure used by autotune:
+
+`effective_pressure = max(memory_pressure, net_pressure_ratio)`
+
+This preserves existing memory safety behavior while allowing early network-aware backoff.
+
+### 5.2 Signal Contract
+
+Collector exports:
+
+- `net_pressure_ratio`: normalized pressure estimate in `[0, 1]`
+- `net_signal_fresh`: boolean freshness guard
+- `net_signal_age_ms`: age of last valid sample
+
+Rules:
+
+- If signal is stale, missing, or invalid, treat as unavailable and ignore it.
+- Never allow network signal to bypass hard memory rails.
+- Signal sampling is decoupled from packet rate and bounded in overhead.
+
+### 5.3 Sampling Cadence
+
+- eBPF event capture is kernel-native.
+- User-space aggregation runs at fixed low cadence (for example 2-4 Hz).
+- Autotune loop reads latest aggregated sample once per tick.
+
+No 1 kHz polling from autotune.
+
+### 5.4 Safety and Fallback
+
+- Feature is disabled by default until validated.
+- If eBPF attach/load fails, log once and continue with current autotune path.
+- If permissions are missing (`CAP_BPF`/`CAP_NET_ADMIN` as required by host/kernel policy), continue without eBPF.
+- If collector crashes or data becomes stale, continue without eBPF signal.
+
+## 6. Integration with Existing Autotune
+
+Autotune stays feedforward + PID + AIMD with current rails/clamps.
+
+Changes:
+
+1. Add optional `net_pressure_ratio` input to tick function.
+2. Compute `effective_pressure = max(existing_pressure, net_pressure_ratio)`.
+3. Use `effective_pressure` where soft-cut/backoff decisions are made.
+4. Keep hard-cut thresholds and cooldown semantics unchanged.
+
+No user-facing API or minimal API variable changes.
+
+## 7. Observability
+
+Add metrics (Linux only when enabled):
+
+- `autotune_net_pressure_ratio`
+- `autotune_net_signal_age_ms`
+- `autotune_net_signal_stale_total`
+- `autotune_net_assisted_backoff_total`
+- `autotune_net_disabled_total` (attach/init/fallback count)
+
+Add adjustment reason tags such as `soft_cut_net` when network pressure is the dominant driver.
+
+## 8. Rollout Plan
+
+Phase 1: internal feature flag, off by default
+- Implement collector + integration + tests.
+- Verify no regressions in existing autotune unit tests.
+
+Phase 2: controlled benchmarking
+- Compare baseline vs enabled on network-bound mixed-size datasets.
+- Record throughput mean/stddev, hard-cut counts, and stall ratios.
+
+Phase 3: optional production preview
+- Enable for selected Linux environments.
+- Monitor fallback rate, signal freshness, and control stability.
+
+Phase 4: default-on decision
+- Only if benchmarks show clear gain and no stability regressions.
+
+## 9. Acceptance Criteria
+
+- No API changes required by users.
+- Baseline behavior unchanged when eBPF unavailable.
+- On qualifying Linux hosts, reduced throughput variance and/or reduced hard-cut rate on representative network-bound runs.
+- No increase in memory safety incidents.
+
+## 10. Risks
+
+- Signal quality risk: noisy telemetry can create control chatter.
+- Portability risk: kernel/version/capability differences across Linux fleets.
+- Operational risk: privileged setup complexity in some environments.
+
+Mitigations:
+
+- Freshness/staleness guards.
+- Conservative blending (`max` with existing pressure) instead of replacement.
+- Fast fallback to current behavior.
+
+## 11. AF_XDP Note (Future Work, Separate RFC)
+
+AF_XDP is a transport-path architecture decision and should be treated as a separate research RFC. It is not part of this v1 telemetry-signal integration.

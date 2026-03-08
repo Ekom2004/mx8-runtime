@@ -314,6 +314,21 @@ pub(crate) fn render_human_stats(stats: &Bound<'_, PyDict>) -> String {
     if let Some(cooldown) = dict_u64(stats, "autotune_cooldown_ticks") {
         autotune_parts.push(format!("cooldown={cooldown}"));
     }
+    if let Some(net_pressure) = dict_f64(stats, "autotune_net_pressure_ratio") {
+        autotune_parts.push(format!("net={net_pressure:.2}"));
+    }
+    if let Some(net_age_ms) = dict_u64(stats, "autotune_net_signal_age_ms") {
+        autotune_parts.push(format!("net_age_ms={net_age_ms}"));
+    }
+    if let Some(stale) = dict_u64(stats, "autotune_net_signal_stale_total") {
+        autotune_parts.push(format!("net_stale={stale}"));
+    }
+    if let Some(assisted) = dict_u64(stats, "autotune_net_assisted_backoff_total") {
+        autotune_parts.push(format!("net_backoff={assisted}"));
+    }
+    if let Some(disabled) = dict_u64(stats, "autotune_net_disabled_total") {
+        autotune_parts.push(format!("net_disabled={disabled}"));
+    }
     let adjustments = dict_u64(stats, "mix_runtime_autotune_adjustments_total")
         .or_else(|| dict_u64(stats, "video_runtime_autotune_adjustments_total"));
     if let Some(adjustments) = adjustments {

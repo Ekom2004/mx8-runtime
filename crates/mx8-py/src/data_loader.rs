@@ -168,6 +168,10 @@ impl DataLoader {
             );
         }
         let autotune_task = if autotune_enabled {
+            let net_runtime = build_net_pressure_source();
+            autotune
+                .net_disabled_total
+                .fetch_add(net_runtime.disabled_total_seed, Ordering::Relaxed);
             Some(rt.spawn(autotune_loop(
                 Arc::new(pipeline.clone()),
                 metrics.clone(),
@@ -175,6 +179,7 @@ impl DataLoader {
                 max_inflight_bytes,
                 max_process_rss_bytes_cap,
                 rails.unwrap_or(AutotuneRails::for_profile(AutotuneProfile::Balanced)),
+                net_runtime.source,
             )))
         } else {
             None
@@ -430,6 +435,31 @@ impl DataLoader {
         out.set_item(
             "autotune_cooldown_ticks",
             self.autotune.cooldown_ticks.load(Ordering::Relaxed),
+        )?;
+        out.set_item(
+            "autotune_net_pressure_ratio",
+            self.autotune
+                .net_pressure_ratio_milli
+                .load(Ordering::Relaxed) as f64
+                / 1000.0,
+        )?;
+        out.set_item(
+            "autotune_net_signal_age_ms",
+            self.autotune.net_signal_age_ms.load(Ordering::Relaxed),
+        )?;
+        out.set_item(
+            "autotune_net_signal_stale_total",
+            self.autotune.net_signal_stale_total.load(Ordering::Relaxed),
+        )?;
+        out.set_item(
+            "autotune_net_assisted_backoff_total",
+            self.autotune
+                .net_assisted_backoff_total
+                .load(Ordering::Relaxed),
+        )?;
+        out.set_item(
+            "autotune_net_disabled_total",
+            self.autotune.net_disabled_total.load(Ordering::Relaxed),
         )?;
         Ok(out.into_any())
     }
