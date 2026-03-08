@@ -29,6 +29,7 @@ Scope: Internal scaffolding only, no user-facing API changes
   - `autotune_net_signal_stale_total`
   - `autotune_net_assisted_backoff_total`
   - `autotune_net_disabled_total`
+- Replaced eBPF skeleton source with Linux TCP collector implementation.
 
 ## Next (Step 5+)
 
@@ -36,4 +37,5 @@ Scope: Internal scaffolding only, no user-facing API changes
    - no-regression when source is noop
    - stale-signal counter behavior under enabled source
 2. Add rollout notes for Linux capability/permission fallback.
-3. Replace eBPF skeleton source with real collector implementation.
+   - validation runbook: `docs/vision/ebpf_linux_validation.md`
+3. Run Linux host validation using real workload traffic.
