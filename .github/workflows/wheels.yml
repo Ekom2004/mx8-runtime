@@ -80,16 +80,16 @@ jobs:
           python -m pip install dist/*.whl
           python -c "import mx8; print('mx8_import_ok')"
           python - <<'PY'
-import os
-import pathlib
-import mx8
+          import os
+          import pathlib
+          import mx8
 
-path = os.environ.get("MX8_COORDINATOR_BIN")
-print("coordinator_bin", path)
-assert path and pathlib.Path(path).is_file(), "bundled coordinator binary missing"
-with mx8.coordinator(timeout_secs=10, log=False) as coord:
-    print("coordinator_ok", coord.url)
-PY
+          path = os.environ.get("MX8_COORDINATOR_BIN")
+          print("coordinator_bin", path)
+          assert path and pathlib.Path(path).is_file(), "bundled coordinator binary missing"
+          with mx8.coordinator(timeout_secs=10, log=False) as coord:
+              print("coordinator_ok", coord.url)
+          PY
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
