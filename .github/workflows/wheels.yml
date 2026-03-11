@@ -67,7 +67,9 @@ jobs:
             fi
             mkdir -p crates/mx8-py/python/mx8
             cargo build -p mx8-coordinator --release
-            cp target/release/mx8-coordinator crates/mx8-py/python/mx8/mx8d-coordinator
+            COORD_BIN="$(find target -type f -name mx8-coordinator -path '*/release/*' | head -n1)"
+            test -n "${COORD_BIN}"
+            cp "${COORD_BIN}" crates/mx8-py/python/mx8/mx8d-coordinator
             chmod +x crates/mx8-py/python/mx8/mx8d-coordinator
       - name: Install test (import)
         if: matrix.target == 'x86_64' || matrix.target == 'universal2'
