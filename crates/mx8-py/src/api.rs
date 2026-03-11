@@ -2617,30 +2617,61 @@ impl CoordinatorHandle {
 }
 
 /// Find the `mx8d-coordinator` binary.
-/// Checks PATH directories, then the directory containing the current
-/// executable (useful when the binary is bundled alongside the wheel).
+/// Resolution order:
+/// 1) `MX8_COORDINATOR_BIN` explicit path
+/// 2) directory containing current executable (bundled/sibling installs)
+/// 3) PATH lookup
 pub(crate) fn find_coordinator_binary() -> Result<std::path::PathBuf, String> {
+    fn candidate_names() -> [&'static str; 2] {
+        ["mx8d-coordinator", "mx8-coordinator"]
+    }
+
+    if let Some(raw) = env_string("MX8_COORDINATOR_BIN") {
+        let candidate = std::path::PathBuf::from(raw);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        return Err(format!(
+            "MX8_COORDINATOR_BIN is set but file does not exist: {}",
+            candidate.display()
+        ));
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for name in candidate_names() {
+                let mut candidate = parent.join(name);
+                if cfg!(windows) {
+                    candidate.set_extension("exe");
+                }
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
     if let Ok(path_var) = std::env::var("PATH") {
         let sep = if cfg!(windows) { ';' } else { ':' };
         for dir in path_var.split(sep) {
-            let candidate = std::path::PathBuf::from(dir).join("mx8d-coordinator");
-            if candidate.is_file() {
-                return Ok(candidate);
+            for name in candidate_names() {
+                let mut candidate = std::path::PathBuf::from(dir).join(name);
+                if cfg!(windows) {
+                    candidate.set_extension("exe");
+                }
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
             }
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("mx8d-coordinator");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    Err("mx8d-coordinator not found in PATH. \
-         Build it with: cargo build -p mx8-coordinator \
-         then add the binary to your PATH."
-        .to_string())
+    Err(
+        "coordinator binary not found (tried mx8d-coordinator/mx8-coordinator). \
+         Reinstall mx8 wheel for your platform (bundled coordinator expected), \
+         or set MX8_COORDINATOR_BIN, or add mx8d-coordinator/mx8-coordinator to PATH. \
+         Advanced fallback: cargo build -p mx8-coordinator."
+            .to_string(),
+    )
 }
 
 /// Bind to port 0 to let the OS pick a free port, then release it.

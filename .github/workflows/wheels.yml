@@ -29,6 +29,18 @@ jobs:
       - name: Install Rust targets (macOS universal2)
         if: matrix.target == 'universal2'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Prepare bundled coordinator binary (macOS universal2)
+        if: matrix.target == 'universal2'
+        run: |
+          set -euxo pipefail
+          cargo build -p mx8-coordinator --release --target aarch64-apple-darwin
+          cargo build -p mx8-coordinator --release --target x86_64-apple-darwin
+          mkdir -p crates/mx8-py/python/mx8
+          lipo -create \
+            -output crates/mx8-py/python/mx8/mx8d-coordinator \
+            target/aarch64-apple-darwin/release/mx8-coordinator \
+            target/x86_64-apple-darwin/release/mx8-coordinator
+          chmod +x crates/mx8-py/python/mx8/mx8d-coordinator
       - uses: actions/setup-python@v5
         with:
           python-version: "3.9"
@@ -53,6 +65,10 @@ jobs:
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y libssl-dev pkg-config
             fi
+            mkdir -p crates/mx8-py/python/mx8
+            cargo build -p mx8-coordinator --release
+            cp target/release/mx8-coordinator crates/mx8-py/python/mx8/mx8d-coordinator
+            chmod +x crates/mx8-py/python/mx8/mx8d-coordinator
       - name: Install test (import)
         if: matrix.target == 'x86_64' || matrix.target == 'universal2'
         run: |
@@ -61,6 +77,17 @@ jobs:
           python -m pip install -U pip
           python -m pip install dist/*.whl
           python -c "import mx8; print('mx8_import_ok')"
+          python - <<'PY'
+import os
+import pathlib
+import mx8
+
+path = os.environ.get("MX8_COORDINATOR_BIN")
+print("coordinator_bin", path)
+assert path and pathlib.Path(path).is_file(), "bundled coordinator binary missing"
+with mx8.coordinator(timeout_secs=10, log=False) as coord:
+    print("coordinator_ok", coord.url)
+PY
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

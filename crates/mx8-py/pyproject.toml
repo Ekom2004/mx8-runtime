@@ -18,3 +18,8 @@ classifiers = [
 [tool.maturin]
 bindings = "pyo3"
 module-name = "mx8"
+python-source = "python"
+include = [
+  { path = "python/mx8/mx8d-coordinator", format = "wheel" },
+  { path = "python/mx8/mx8d-coordinator.exe", format = "wheel" },
+]
