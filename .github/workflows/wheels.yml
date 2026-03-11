@@ -77,7 +77,9 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install -U pip
-          python -m pip install dist/*.whl
+          WHEEL="$(ls dist/mx8-*-cp38-abi3-*.whl | head -n1)"
+          test -n "${WHEEL}"
+          python -m pip install "${WHEEL}"
           python -c "import mx8; print('mx8_import_ok')"
           python - <<'PY'
           import os
@@ -114,7 +116,9 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install -U pip
-          python -m pip install dist/*.whl
+          WHEEL="$(ls dist/mx8-*-cp38-abi3-*.whl | head -n1)"
+          test -n "${WHEEL}"
+          python -m pip install "${WHEEL}"
           python -c "import mx8; print('mx8_import_ok')"
           python - <<'PY'
           import os
