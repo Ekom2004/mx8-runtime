@@ -1,6 +1,6 @@
 # Python API
 
-This page documents the API that ships in `mx8==1.0.5`. Install with `pip install mx8`. For vision and training helpers, also install `pillow numpy torch`.
+This page documents the API that ships in `mx8==1.0.6`. Install with `pip install mx8`. For vision and training helpers, also install `pillow numpy torch`.
 
 
 ## Packing and snapshot resolution
@@ -370,7 +370,7 @@ Image loader arguments:
 
 `autopack` and `shard_mb` — same as the core loader.
 
-The default decode backend in `mx8==1.0.5` is Python/Pillow. To use the experimental Rust decode path, set `MX8_DECODE_BACKEND=rust`. The Rust path supports additional options: `MX8_DECODE_THREADS` for worker count, `MX8_RUST_JPEG_CODEC` for JPEG codec selection (`zune`, `image`, or `turbo`), and `MX8_RUST_RESIZE_BACKEND` for resize algorithm (`fast` or `image`).
+The default decode backend in `mx8==1.0.6` is Python/Pillow. To use the experimental Rust decode path, set `MX8_DECODE_BACKEND=rust`. The Rust path supports additional options: `MX8_DECODE_THREADS` for worker count, `MX8_RUST_JPEG_CODEC` for JPEG codec selection (`zune`, `image`, or `turbo`), and `MX8_RUST_RESIZE_BACKEND` for resize algorithm (`fast` or `image`).
 
 Augmentation order is fixed and deterministic: `decode -> resize -> crop -> flip -> jitter -> normalize`.
 
@@ -405,7 +405,7 @@ Audio loader arguments:
 
 `samples` — fixed output frame count per emitted row. Short clips are zero-padded; long clips are truncated.
 
-`channels` — output channels. `mx8==1.0.5` supports `channels=1` only (mono output).
+`channels` — output channels. `mx8==1.0.6` supports `channels=1` only (mono output).
 
 `rate_hz` — optional strict sample-rate check. When set, samples with mismatched decoded rates follow `on_decode_error`.
 
@@ -419,7 +419,7 @@ Audio loader arguments:
 
 `loader.checkpoint()` returns an opaque token compatible with `mx8.audio(..., resume=token)`.
 
-Supported formats in `mx8==1.0.5`: WAV and FLAC.
+Supported formats in `mx8==1.0.6`: WAV and FLAC.
 
 `loader.stats()` for the audio loader includes decode fields (`audio_sample_count`, `audio_channels`, `audio_expected_sample_rate_hz`, `audio_decode_samples_total`, `audio_decode_failures_total`, `audio_decoded_frames_total`) plus shared pipeline counters.
 
@@ -535,7 +535,7 @@ loader = mx8.load("s3://bucket/prefix/", batch=512, ram_gb=24)
 
 ### Starting the coordinator
 
-Use `mx8.coordinator()` to start a local coordinator subprocess without any manual setup. It finds the `mx8d-coordinator` binary in your PATH, starts it, waits for it to be ready, and tears it down when the context exits.
+Use `mx8.coordinator()` to start a local coordinator subprocess without any manual setup. In wheel installs, MX8 auto-resolves the bundled `mx8d-coordinator` binary and sets `MX8_COORDINATOR_BIN` for you. It then starts the coordinator, waits for readiness, and tears it down on context exit.
 
 In distributed mode, the coordinator owns snapshot resolution for the job. Start the coordinator with the same `data` intent you expect workers to consume.
 
@@ -551,13 +551,14 @@ rank       = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 
 with mx8.coordinator(rank=rank, world_size=world_size) as coord:
-    loader = mx8.DistributedDataLoader(
-        coord_url=coord.url,
-        job_id="train",
-        node_id=f"rank{rank}",
-        batch_size_samples=512,
-        max_ram_gb=24,
+    loader = mx8.load(
+        "s3://bucket/train@refresh",
+        batch=512,
+        ram_gb=24,
         profile="balanced",
+        job="train",
+        coord=coord.url,
+        node=f"rank{rank}",
     )
     for batch in loader:
         payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
@@ -577,7 +578,7 @@ with mx8.coordinator(
     master_addr="node0.cluster.local",
     port=50051,
 ) as coord:
-    loader = mx8.DistributedDataLoader(coord_url=coord.url, ...)
+    loader = mx8.load("s3://bucket/train@refresh", batch=512, ram_gb=24, job="train", coord=coord.url)
 ```
 
 **Single process (no torchrun)**
@@ -586,7 +587,7 @@ Omit `rank` and a free port is chosen automatically:
 
 ```python
 with mx8.coordinator(world_size=1) as coord:
-    loader = mx8.DistributedDataLoader(coord_url=coord.url, ...)
+    loader = mx8.load("s3://bucket/train@refresh", batch=512, ram_gb=24, job="train", coord=coord.url)
 ```
 
 `coordinator()` parameters:
@@ -609,53 +610,37 @@ with mx8.coordinator(world_size=1) as coord:
 
 `coord.stop()` terminates the subprocess immediately. Called automatically on context exit and garbage collection.
 
-### DistributedDataLoader
+### DistributedDataLoader (advanced compatibility)
+
+For user-facing distributed flows, prefer `mx8.load(..., job=..., coord=..., node=..., resume=...)`.
+
+`mx8.DistributedDataLoader` remains available for advanced/explicit control surfaces, but its argument names are legacy-style and intentionally not part of the minimal API contract.
+
+Distributed checkpoint example with minimal API:
 
 ```python
-loader = mx8.DistributedDataLoader(
-    coord_url="http://127.0.0.1:50051",
-    job_id="train",
-    node_id=f"rank{rank}",
-    batch_size_samples=512,
-    max_ram_gb=24,
-    profile="balanced",
+loader = mx8.load(
+    "s3://bucket/train@refresh",
+    batch=512,
+    ram_gb=24,
+    job="train",
+    coord=coord.url,
+    node=f"rank{rank}",
 )
-```
-
-`want` sets the max number of concurrent leases this node will request. `progress_interval_ms` controls how often progress is reported to the coordinator (default 500ms). `grpc_max_message_bytes` caps the gRPC message size for manifest and control-path traffic (default 64MB).
-
-`max_inflight_bytes`, `max_queue_batches`, and `prefetch_batches` are accepted for compatibility, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
-
-`resume_from` (default `None`) accepts an opaque distributed checkpoint token from `DistributedDataLoader.checkpoint()`. The token is validated and applied by the coordinator before lease issuance. Every rank should pass the same token on restart.
-
-Distributed resume rules:
-
-`resume_from` must be produced by `DistributedDataLoader.checkpoint()` from the same `manifest_hash` and `epoch`.
-
-All ranks must pass the same token content. Conflicting tokens are rejected.
-
-`resume_from` is a startup input only. If the run has already issued leases, the coordinator rejects late resume tokens.
-
-The token is intentionally opaque and versioned by MX8. Treat it as a byte blob and store it alongside the model checkpoint.
-
-Distributed autotune adjusts `want`, `prefetch_batches`, and `max_queue_batches` within the chosen profile rails. Pass `profile` and `autotune=True|False` on `DistributedDataLoader` to control it.
-
-Training note: `mx8==1.0.5` training supports epoch-boundary elasticity only. Mid-epoch rank loss is still non-elastic (the DDP process group fails and the job restarts). Add/remove nodes between epochs by launching the next epoch with a new world size.
-
-Distributed checkpoint example:
-
-```python
-loader = mx8.DistributedDataLoader(coord_url=coord.url, job_id="train", node_id=f"rank{rank}")
 token = loader.checkpoint()
-# save token with model checkpoint
 
-loader = mx8.DistributedDataLoader(
-    coord_url=coord.url,
-    job_id="train",
-    node_id=f"rank{rank}",
-    resume_from=token,
+loader = mx8.load(
+    "s3://bucket/train@refresh",
+    batch=512,
+    ram_gb=24,
+    job="train",
+    coord=coord.url,
+    node=f"rank{rank}",
+    resume=token,
 )
 ```
+
+Training note: `mx8==1.0.6` training supports epoch-boundary elasticity only. Mid-epoch rank loss is still non-elastic (the DDP process group fails and the job restarts). Add/remove nodes between epochs by launching the next epoch with a new world size.
 
 Gate commands:
 
@@ -675,7 +660,7 @@ loader_a = mx8.load("s3://bucket/a@refresh", batch=32, ram_gb=6)
 loader_b = mx8.load("s3://bucket/b@refresh", batch=32, ram_gb=6)
 
 mixed = mx8.mix(
-    [loader_a, loader_b],
+    sources=[loader_a, loader_b],
     weights=[0.7, 0.3],
     seed=17,
     epoch=3,

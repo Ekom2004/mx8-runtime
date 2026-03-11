@@ -149,7 +149,7 @@ a = mx8.load("s3://bucket/a/", batch=32, ram_gb=12)
 b = mx8.load("s3://bucket/b/", batch=32, ram_gb=12)
 
 mixed = mx8.mix(
-    [a, b],
+    sources=[a, b],
     weights=[0.7, 0.3],
     seed=17,
     epoch=0,

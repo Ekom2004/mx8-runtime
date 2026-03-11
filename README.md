@@ -82,7 +82,7 @@ loader = mx8.video("s3://bucket/videos/", clip=16, stride=8, fps=8, batch=32, ra
 # mix
 a = mx8.load("s3://bucket/a/", batch=32, ram_gb=12)
 b = mx8.load("s3://bucket/b/", batch=32, ram_gb=12)
-loader = mx8.mix([a, b], weights=[0.7, 0.3], seed=17, epoch=0, ram_gb=24)
+loader = mx8.mix(sources=[a, b], weights=[0.7, 0.3], seed=17, epoch=0, ram_gb=24)
 
 # distributed attach
 loader = mx8.load(
@@ -110,10 +110,7 @@ token = loader.checkpoint()
 ```
 
 Top-level minimal APIs (`load`, `run`, `image`, `video`, `text`, `audio`, `mix`, `resolve`) use short kwargs (`batch`, `ram_gb`, `coord`, `resume`, ...).
-Advanced classes keep explicit legacy names:
-- `mx8.Constraints(max_inflight_bytes=..., max_ram_bytes=...)`
-- `mx8.RuntimeConfig(prefetch_batches=..., max_queue_batches=..., want=...)`
-- `mx8.DistributedDataLoader(..., autotune=..., resume_from=...)`
+Use these as the default user-facing interface.
 
 ## Install
 
