@@ -156,6 +156,37 @@ M8.1 is complete only when all gates pass:
    - Record speedup and fallback rates.
    - Gate command: `./scripts/video_nvdec_throughput_gate.sh`
 
+Unified runner:
+
+- Full suite report:
+  - `MX8_NVDEC_VALIDATION_PROFILE=full ./scripts/video_nvdec_validation_report.sh`
+- GPU suite report (requires real NVDEC path):
+  - `MX8_NVDEC_VALIDATION_PROFILE=gpu MX8_VIDEO_NVDEC_THROUGHPUT_REQUIRE_HW=1 MX8_VIDEO_NVDEC_MIN_SPEEDUP=1.05 ./scripts/video_nvdec_validation_report.sh`
+- Fallback-only report:
+  - `MX8_NVDEC_VALIDATION_PROFILE=fallback ./scripts/video_nvdec_validation_report.sh`
+
+The report script emits one summary and per-gate logs under:
+
+- `MX8_NVDEC_REPORT_DIR` (default: `.artifacts/nvdec-validation/<timestamp>/`)
+- files:
+  - `summary.md`
+  - `summary.txt`
+  - `results.csv`
+  - `<gate>.log`
+
+## Promotion Criteria
+
+Promote NVDEC to broader usage only when all of the following are true:
+
+1. Fallback suite is green on non-GPU/unsupported nodes:
+   - `MX8_NVDEC_VALIDATION_PROFILE=fallback ./scripts/video_nvdec_validation_report.sh`
+2. GPU suite is green on a real NVIDIA runner with hardware-required throughput:
+   - `MX8_NVDEC_VALIDATION_PROFILE=gpu MX8_VIDEO_NVDEC_THROUGHPUT_REQUIRE_HW=1 MX8_VIDEO_NVDEC_MIN_SPEEDUP=1.05 ./scripts/video_nvdec_validation_report.sh`
+3. Throughput gate confirms active NVDEC path and speedup threshold (`>= 1.05x` by default, or stricter release threshold if configured).
+4. Pressure gate confirms clamp behavior with no crash/OOM regressions.
+5. All runs produce `summary.md` + per-gate logs and zero failed gates.
+6. CI manual workflow `nvdec-gpu-validation` stores artifacts for release review.
+
 ## Rollout
 
 1. Ship behind `auto` with kill-switch to force CPU backend.

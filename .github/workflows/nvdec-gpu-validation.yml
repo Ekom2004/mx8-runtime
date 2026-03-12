@@ -1,0 +1,62 @@
+name: nvdec-gpu-validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: JSON array of runner labels (must include self-hosted GPU labels)
+        required: false
+        type: string
+        default: '["self-hosted","linux","x64","gpu","runpod"]'
+      min_speedup:
+        description: Minimum nvdec throughput speedup vs cli when HW path is active
+        required: false
+        type: string
+        default: "1.05"
+      include_direct_decode_stress:
+        description: Include direct decode stress gate
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  validate:
+    name: nvdec validation (gpu)
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 240
+    env:
+      MX8_NVDEC_VALIDATION_PROFILE: gpu
+      MX8_VIDEO_NVDEC_THROUGHPUT_REQUIRE_HW: "1"
+      MX8_VIDEO_NVDEC_MIN_SPEEDUP: ${{ inputs.min_speedup }}
+      MX8_NVDEC_REPORT_DIR: ${{ github.workspace }}/.artifacts/nvdec-validation/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Run NVDEC validation suite
+        run: |
+          if [ "${{ inputs.include_direct_decode_stress }}" = "true" ]; then
+            export MX8_NVDEC_INCLUDE_DIRECT_DECODE_STRESS=1
+          else
+            export MX8_NVDEC_INCLUDE_DIRECT_DECODE_STRESS=0
+          fi
+          ./scripts/video_nvdec_validation_report.sh
+
+      - name: Attach report summary
+        if: always()
+        run: |
+          if [ -f "${MX8_NVDEC_REPORT_DIR}/summary.md" ]; then
+            cat "${MX8_NVDEC_REPORT_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload NVDEC report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvdec-validation-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.MX8_NVDEC_REPORT_DIR }}
+          if-no-files-found: error
+
