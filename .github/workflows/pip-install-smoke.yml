@@ -51,7 +51,16 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install -U pip
-          python -m pip install ${PACKAGE_SPEC}
+          for attempt in $(seq 1 10); do
+            if python -m pip install --no-cache-dir --index-url https://pypi.org/simple ${PACKAGE_SPEC}; then
+              break
+            fi
+            if [ "${attempt}" -eq 10 ]; then
+              echo "pip install failed after retries: ${PACKAGE_SPEC}" >&2
+              exit 1
+            fi
+            sleep 30
+          done
           python - <<'PY'
           import os
           import pathlib
