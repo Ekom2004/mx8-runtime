@@ -26,7 +26,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CLEAN_PATH="$(python -c 'import os; print(\":\".join([p for p in os.environ.get(\"PATH\", \"\").split(\":\") if p and \"/.cargo/bin\" not in p]))')"
+          CLEAN_PATH="$(printf '%s' "${PATH}" | tr ':' '\n' | grep -v '/.cargo/bin' | paste -sd ':' -)"
+          if [ -z "${CLEAN_PATH}" ]; then
+            echo "failed to build clean PATH" >&2
+            exit 1
+          fi
           echo "PATH=${CLEAN_PATH}" >> "${GITHUB_ENV}"
 
       - name: Assert rustc absent
