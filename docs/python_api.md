@@ -1,6 +1,6 @@
 # Python API
 
-This page documents the API that ships in `mx8==1.0.6`. Install with `pip install mx8`. For vision and training helpers, also install `pillow numpy torch`.
+This page documents the API that ships in `mx8==1.0.8rc1`. Install with `pip install mx8` (or `pip install --pre mx8==1.0.8rc1` for this release candidate). For vision and training helpers, also install `pillow numpy torch`.
 
 
 ## Packing and snapshot resolution
@@ -11,9 +11,7 @@ Before you can load from a dataset at production scale, you typically pack it on
 
 `mx8.pack_dir(in_dir, *, out, shard_mb=512, label_mode="auto", require_labels=False)` does the same for a local directory.
 
-`mx8.resolve_manifest_hash(data, *, store=None, manifest=None, recursive=True, node=None)` resolves a dataset link to its pinned manifest hash without starting a loader.
-
-`mx8.resolve(...)` is a short alias of `mx8.resolve_manifest_hash(...)` with the same signature and behavior.
+`mx8.resolve(data, *, store=None, manifest=None, recursive=True, node=None)` resolves a dataset link to its pinned manifest hash without starting a loader.
 
 `label_mode` accepts `auto`, `none`, or `imagefolder`.
 

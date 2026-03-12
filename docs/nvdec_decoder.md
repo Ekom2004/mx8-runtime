@@ -186,6 +186,7 @@ Promote NVDEC to broader usage only when all of the following are true:
 4. Pressure gate confirms clamp behavior with no crash/OOM regressions.
 5. All runs produce `summary.md` + per-gate logs and zero failed gates.
 6. CI manual workflow `nvdec-gpu-validation` stores artifacts for release review.
+7. Until a GPU runner exists, `nvdec-gpu-validation` stays manual and does not block wheel publish; fallback/no-GPU profile remains required.
 
 ## Rollout
 

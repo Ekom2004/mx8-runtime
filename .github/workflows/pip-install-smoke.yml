@@ -1,0 +1,62 @@
+name: pip-install-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_spec:
+        description: Package spec to install (e.g. mx8 or --pre mx8==1.0.8rc1)
+        required: false
+        type: string
+        default: mx8
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Remove Rust toolchain from PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLEAN_PATH="$(python -c 'import os; print(\":\".join([p for p in os.environ.get(\"PATH\", \"\").split(\":\") if p and \"/.cargo/bin\" not in p]))')"
+          echo "PATH=${CLEAN_PATH}" >> "${GITHUB_ENV}"
+
+      - name: Assert rustc absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v rustc >/dev/null 2>&1; then
+            echo "rustc is unexpectedly present on PATH" >&2
+            exit 1
+          fi
+
+      - name: pip install + coordinator smoke
+        shell: bash
+        env:
+          PACKAGE_SPEC: ${{ inputs.package_spec }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install -U pip
+          python -m pip install ${PACKAGE_SPEC}
+          python - <<'PY'
+          import os
+          import pathlib
+          import mx8
+
+          print("mx8_import_ok", mx8.__file__)
+          path = os.environ.get("MX8_COORDINATOR_BIN")
+          print("coordinator_bin", path)
+          assert path and pathlib.Path(path).is_file(), "bundled coordinator binary missing"
+          with mx8.coordinator(timeout_secs=10, log=False) as coord:
+              print("coordinator_ok", coord.url)
+          PY
