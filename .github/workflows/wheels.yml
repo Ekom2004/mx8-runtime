@@ -132,9 +132,20 @@ jobs:
               print("coordinator_ok", coord.url)
           PY
 
+  http_backend_gate:
+    name: gate (http backend throughput)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run HTTP backend gate
+        env:
+          RUST_LOG: warn
+        run: ./scripts/http_backend_gate.sh
+
   publish:
     name: publish (PyPI)
-    needs: [build, verify_aarch64]
+    needs: [build, verify_aarch64, http_backend_gate]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     env:
