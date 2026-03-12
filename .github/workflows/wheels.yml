@@ -149,6 +149,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg
       - name: Run NVDEC fallback validation profile
         env:
           MX8_NVDEC_VALIDATION_PROFILE: fallback
