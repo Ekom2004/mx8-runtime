@@ -119,6 +119,8 @@ Determinism note:
 
 Each batch exposes `sample_ids`, `offsets`, `payload`, and `label_ids`. Call `batch.to_torch()` to get `(payload_u8, offsets_i64, sample_ids_i64)` as tensors, or `batch.to_torch_with_labels()` to include labels.
 
+HTTP production throughput gate: `./scripts/http_backend_gate.sh`.
+
 
 ## Run helper (`mx8.run`)
 
