@@ -105,6 +105,25 @@ Arguments:
 
 `runtime` accepts an `mx8.RuntimeConfig` instance for explicit startup values when `tune=False`.
 
+`transform` accepts a function decorated with `@mx8.transform`. MX8 validates this at loader startup, compiles the transform artifact before first batch delivery, and applies transform bytes inline per sample.
+
+```python
+import mx8
+
+@mx8.transform
+def add_tag(sample: bytes) -> bytes:
+    return b"T" + sample
+
+loader = mx8.load("s3://bucket/prefix@refresh", batch=64, ram_gb=12, transform=add_tag)
+```
+
+Transform contract (v1):
+- Use `@mx8.transform` (undecorated callables are rejected).
+- Exactly one argument (`sample: bytes`) is required.
+- Body must be a single `return` statement.
+- Supported return forms are `sample`, `b\"...\" + sample`, `sample + b\"...\"`, `sample + sample`, and `None` (drop sample).
+- `transform=...` is supported in distributed mode for `mx8.load`/`mx8.run`.
+
 Compatibility note:
 - For `mx8.load`, prefer `constraints` and `runtime` for runtime shaping.
 - `constraints.max_inflight_bytes` and `constraints.max_ram_bytes` are the active hard-cap knobs.
@@ -139,6 +158,8 @@ loader = mx8.run(
 ```
 
 Use `mx8.load(...)` when you want the base primitive directly. Use `mx8.run(...)` when you want environment-driven local/distributed selection.
+
+`mx8.run(..., transform=...)` is supported in both single-process and distributed mode.
 
 
 ## Multi-epoch training
@@ -291,6 +312,8 @@ Text loader arguments:
 
 `on_decode_error` — UTF-8 decode handling (`"error"` default, `"skip"` optional).
 
+`transform` — same transform contract as `mx8.load`; applied before tokenization.
+
 `store`, `manifest`, `recursive`, `start`, `end`, `autopack`, and `shard_mb` — same semantics as `mx8.load`.
 
 `inflight`, `queue`, and `prefetch` are accepted in the signature, but effective values are currently derived from `profile`, `constraints`, and `runtime`.
@@ -358,6 +381,8 @@ Image loader arguments:
 
 `float_out` (default `True`) — normalize pixel values to `float32` in `[0, 1]`. Set `float_out=False` to get raw `uint8` tensors.
 
+`transform` — same transform contract as `mx8.load`; applied to raw sample bytes before image decode.
+
 `node` — same as the core loader. In distributed attach mode, default is `rank{RANK}` when unset.
 
 `store`, `manifest`, `recursive`, `start`, `end`, `autopack`, and `shard_mb` — same semantics as `mx8.load`.
@@ -410,6 +435,8 @@ Audio loader arguments:
 `rate_hz` — optional strict sample-rate check. When set, samples with mismatched decoded rates follow `on_decode_error`.
 
 `on_decode_error` — decode failure handling (`"error"` default, `"skip"` optional).
+
+`transform` — same transform contract as `mx8.load`; applied to raw sample bytes before audio decode.
 
 `store`, `manifest`, `recursive`, `start`, `end`, `autopack`, and `shard_mb` — same semantics as `mx8.load`.
 
@@ -641,13 +668,13 @@ loader = mx8.load(
 )
 ```
 
-Training note: `mx8==1.0.6` training supports epoch-boundary elasticity only. Mid-epoch rank loss is still non-elastic (the DDP process group fails and the job restarts). Add/remove nodes between epochs by launching the next epoch with a new world size.
+Training note: `mx8==1.0.6` training is non-elastic mid-epoch. If a rank dies, the DDP process group fails and the job restarts from checkpoint/resume token. Add/remove nodes only by launching the next epoch with a new world size.
 
 Gate commands:
 
 `./scripts/distributed_resume_gate.sh` (same-epoch restart from checkpoint token)
 
-`./scripts/training_epoch_boundary_gate.sh` (epoch-boundary add/remove membership)
+`./scripts/training_epoch_boundary_gate.sh` (epoch-boundary relaunch with membership changes)
 
 
 ## Mix API

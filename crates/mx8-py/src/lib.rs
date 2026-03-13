@@ -28,6 +28,8 @@ mod audio_loader;
 pub(crate) use audio_loader::*;
 mod mix_loader;
 pub(crate) use mix_loader::*;
+mod transform_runtime;
+pub(crate) use transform_runtime::*;
 mod api;
 pub(crate) use api::*;
 

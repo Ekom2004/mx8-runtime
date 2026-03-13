@@ -158,9 +158,20 @@ jobs:
           MX8_NVDEC_VALIDATION_PROFILE: fallback
         run: ./scripts/video_nvdec_validation_report.sh
 
+  transform_gate:
+    name: gate (transform runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run transform gate
+        env:
+          RUST_LOG: warn
+        run: ./scripts/transform_gate.sh
+
   publish:
     name: publish (PyPI)
-    needs: [build, verify_aarch64, http_backend_gate, nvdec_fallback_gate]
+    needs: [build, verify_aarch64, http_backend_gate, nvdec_fallback_gate, transform_gate]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     env:

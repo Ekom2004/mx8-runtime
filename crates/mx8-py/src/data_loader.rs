@@ -22,6 +22,12 @@ pub(crate) struct DataLoader {
     pub(crate) checkpoint_next_sample_id: u64,
     pub(crate) checkpoint_end_id: Option<u64>,
     pub(crate) started_at: Instant,
+    pub(crate) transform: Option<CompiledTransform>,
+    pub(crate) transform_samples_total: u64,
+    pub(crate) transform_failures_total: u64,
+    pub(crate) transform_timeout_total: u64,
+    pub(crate) transform_output_ratio_ewma_milli: u64,
+    pub(crate) transform_heavy_mode_active: bool,
 }
 
 #[pymethods]
@@ -46,6 +52,7 @@ impl DataLoader {
         node_id=None,
         profile=None,
         autotune=None,
+        transform=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -66,6 +73,7 @@ impl DataLoader {
         node_id: Option<String>,
         profile: Option<String>,
         autotune: Option<bool>,
+        transform: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let parsed = mx8_core::dataset_link::DatasetLink::parse(&dataset_link)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
@@ -185,6 +193,19 @@ impl DataLoader {
             None
         };
 
+        let compiled_transform = transform
+            .as_ref()
+            .map(|transform_fn| {
+                Python::with_gil(|py| {
+                    CompiledTransform::compile_from_py(
+                        py,
+                        &transform_fn.bind(py),
+                        max_inflight_bytes,
+                    )
+                })
+            })
+            .transpose()?;
+
         if should_use_zero_manifest_scan(&parsed, &dataset_base) {
             if resume_token.is_some() {
                 return Err(PyValueError::new_err(
@@ -247,6 +268,12 @@ impl DataLoader {
                         checkpoint_next_sample_id: 0,
                         checkpoint_end_id: None,
                         started_at: Instant::now(),
+                        transform: compiled_transform,
+                        transform_samples_total: 0,
+                        transform_failures_total: 0,
+                        transform_timeout_total: 0,
+                        transform_output_ratio_ewma_milli: 1000,
+                        transform_heavy_mode_active: false,
                     });
                 }
                 Err(err) => {
@@ -391,6 +418,12 @@ impl DataLoader {
             checkpoint_next_sample_id: effective_start,
             checkpoint_end_id: Some(requested_end),
             started_at: Instant::now(),
+            transform: compiled_transform,
+            transform_samples_total: 0,
+            transform_failures_total: 0,
+            transform_timeout_total: 0,
+            transform_output_ratio_ewma_milli: 1000,
+            transform_heavy_mode_active: false,
         })
     }
 
@@ -461,6 +494,18 @@ impl DataLoader {
             "autotune_net_disabled_total",
             self.autotune.net_disabled_total.load(Ordering::Relaxed),
         )?;
+        out.set_item("transform_enabled", self.transform.is_some())?;
+        out.set_item("transform_samples_total", self.transform_samples_total)?;
+        out.set_item("transform_failures_total", self.transform_failures_total)?;
+        out.set_item("transform_timeout_total", self.transform_timeout_total)?;
+        out.set_item(
+            "transform_output_ratio_ewma",
+            self.transform_output_ratio_ewma_milli as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "transform_heavy_mode_active",
+            self.transform_heavy_mode_active,
+        )?;
         Ok(out.into_any())
     }
 
@@ -503,9 +548,16 @@ impl DataLoader {
         let wait_started = Instant::now();
         let lease = py.allow_threads(|| self.rt.block_on(async { self.rx.recv().await }));
         let out = match lease {
-            Some(lease) => {
+            Some(mut lease) => {
+                let extra_inflight_lease = self.apply_transform_if_enabled(&mut lease)?;
                 self.on_batch_delivered(&lease);
-                let out = Py::new(py, PyBatch { lease })?;
+                let out = Py::new(
+                    py,
+                    PyBatch {
+                        lease,
+                        _extra_inflight_lease: extra_inflight_lease,
+                    },
+                )?;
                 Ok(out.into_bound(py).into_any())
             }
             None => {
@@ -588,11 +640,70 @@ impl DataLoader {
             self.pipeline.set_max_queue_batches(clamped);
         }
     }
+
+    fn apply_transform_if_enabled(
+        &mut self,
+        lease: &mut BatchLease,
+    ) -> PyResult<Option<ExtraInFlightLease>> {
+        let transform = match self.transform.as_ref() {
+            Some(t) => t,
+            _ => return Ok(None),
+        };
+
+        let out = transform.apply(&lease.batch).map_err(|e| {
+            self.transform_failures_total = self.transform_failures_total.saturating_add(1);
+            if e.timeout {
+                self.transform_timeout_total = self.transform_timeout_total.saturating_add(1);
+            }
+            PyRuntimeError::new_err(format!("transform `{}` failed: {}", transform.name, e))
+        })?;
+
+        self.transform_samples_total = self
+            .transform_samples_total
+            .saturating_add(out.stats.transformed_samples);
+        if self.transform_output_ratio_ewma_milli == 0 {
+            self.transform_output_ratio_ewma_milli = out.stats.output_ratio_milli;
+        } else {
+            self.transform_output_ratio_ewma_milli =
+                ((self.transform_output_ratio_ewma_milli.saturating_mul(80))
+                    .saturating_add(out.stats.output_ratio_milli.saturating_mul(20)))
+                    / 100;
+        }
+        self.transform_heavy_mode_active = out.stats.heavy_mode_active;
+        if self.transform_heavy_mode_active && self.pipeline.effective_prefetch_batches() > 1 {
+            self.pipeline.set_prefetch_batches(1);
+        }
+
+        let output_bytes = out.batch.payload.len() as u64;
+        let extra_inflight_lease = if output_bytes > lease.bytes {
+            let extra = output_bytes - lease.bytes;
+            Some(
+                self.rt
+                    .block_on(self.pipeline.reserve_extra_inflight(extra))
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "transform inflight reservation failed for +{} bytes: {e}",
+                            extra
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err("transform inflight reservation unexpectedly empty")
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        lease.batch = out.batch;
+
+        Ok(extra_inflight_lease)
+    }
 }
 
 #[pyclass]
 pub(crate) struct PyBatch {
     pub(crate) lease: BatchLease,
+    pub(crate) _extra_inflight_lease: Option<ExtraInFlightLease>,
 }
 
 #[pymethods]

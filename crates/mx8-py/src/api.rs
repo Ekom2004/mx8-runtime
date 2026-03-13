@@ -384,6 +384,7 @@ pub(crate) fn maybe_autopack(py: Python<'_>, s3_url: &str, shard_mb: u64) -> PyR
     tune=None,
     constraints=None,
     runtime=None,
+    transform=None,
     autopack=false,
     shard_mb=512,
 ))]
@@ -411,6 +412,7 @@ pub(crate) fn load<'py>(
     tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    transform: Option<Py<PyAny>>,
     autopack: bool,
     shard_mb: u64,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -431,6 +433,7 @@ pub(crate) fn load<'py>(
     let node_id = node;
     let max_ram_gb = ram_gb;
     let autotune = tune;
+    let transform_fn = transform;
     let autopack_shard_mb = shard_mb;
     let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
     let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
@@ -580,6 +583,7 @@ pub(crate) fn load<'py>(
             500,
             DEFAULT_GRPC_MAX_MESSAGE_BYTES,
             resume_from,
+            transform_fn,
         )?;
         let out = Py::new(py, out)?;
         return Ok(out.into_bound(py).into_any());
@@ -607,6 +611,7 @@ pub(crate) fn load<'py>(
         node_id,
         profile.clone(),
         autotune,
+        transform_fn,
     )?;
     let out = Py::new(py, loader)?;
     Ok(out.into_bound(py).into_any())
@@ -629,6 +634,7 @@ pub(crate) fn load<'py>(
     tune=None,
     constraints=None,
     runtime=None,
+    transform=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 /// `mx8.run(...)` is the default job entry point.
@@ -652,6 +658,7 @@ pub(crate) fn run<'py>(
     tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    transform: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let dataset = data;
     let batch_size = batch;
@@ -663,6 +670,7 @@ pub(crate) fn run<'py>(
     let manifest_store = store;
     let manifest_path = manifest;
     let autotune = tune;
+    let transform_fn = transform;
     let world_size = std::env::var("WORLD_SIZE")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
@@ -710,6 +718,7 @@ pub(crate) fn run<'py>(
             500,
             DEFAULT_GRPC_MAX_MESSAGE_BYTES,
             resume_from,
+            transform_fn,
         )?;
         let out = Py::new(py, loader)?;
         return Ok(out.into_bound(py).into_any());
@@ -738,6 +747,7 @@ pub(crate) fn run<'py>(
         autotune,
         constraints,
         runtime,
+        transform_fn,
         false,
         512,
     )?;
@@ -769,6 +779,7 @@ pub(crate) fn run<'py>(
     tune=None,
     constraints=None,
     runtime=None,
+    transform=None,
     tokenizer="gpt2".to_string(),
     seq_len=2048,
     stride=2048,
@@ -804,6 +815,7 @@ pub(crate) fn py_text(
     tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    transform: Option<Py<PyAny>>,
     tokenizer: String,
     seq_len: usize,
     stride: usize,
@@ -832,6 +844,7 @@ pub(crate) fn py_text(
     let node_id = node;
     let max_ram_gb = ram_gb;
     let autotune = tune;
+    let transform_fn = transform;
     let sequence_length = seq_len;
     let return_attention_mask = return_mask;
     let decode_error_policy = on_decode_error;
@@ -995,6 +1008,7 @@ pub(crate) fn py_text(
             500,
             DEFAULT_GRPC_MAX_MESSAGE_BYTES,
             resume_from,
+            transform_fn.clone(),
         )?;
         let out = TextLoader {
             loader: TextLoaderInner::Distributed(distributed_loader),
@@ -1031,6 +1045,7 @@ pub(crate) fn py_text(
         node_id,
         profile,
         autotune,
+        transform_fn,
     )?;
     let out = TextLoader {
         loader: TextLoaderInner::Local(loader),
@@ -1074,6 +1089,7 @@ pub(crate) fn py_text(
     tune=None,
     constraints=None,
     runtime=None,
+    transform=None,
     samples=16000,
     channels=1,
     rate_hz=None,
@@ -1105,6 +1121,7 @@ pub(crate) fn py_audio(
     tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    transform: Option<Py<PyAny>>,
     samples: usize,
     channels: usize,
     rate_hz: Option<u32>,
@@ -1129,6 +1146,7 @@ pub(crate) fn py_audio(
     let node_id = node;
     let max_ram_gb = ram_gb;
     let autotune = tune;
+    let transform_fn = transform;
     let sample_count = samples;
     let sample_rate_hz = rate_hz;
     let decode_error_policy = on_decode_error;
@@ -1273,6 +1291,7 @@ pub(crate) fn py_audio(
             500,
             DEFAULT_GRPC_MAX_MESSAGE_BYTES,
             resume_from,
+            transform_fn.clone(),
         )?;
         let out = AudioLoader {
             loader: AudioLoaderInner::Distributed(distributed_loader),
@@ -1305,6 +1324,7 @@ pub(crate) fn py_audio(
         node_id,
         profile,
         autotune,
+        transform_fn,
     )?;
     let out = AudioLoader {
         loader: AudioLoaderInner::Local(loader),
@@ -1344,6 +1364,7 @@ pub(crate) fn py_audio(
     tune=None,
     constraints=None,
     runtime=None,
+    transform=None,
     augment=None,
     resize=None,
     crop=None,
@@ -1384,6 +1405,7 @@ pub(crate) fn py_image(
     tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    transform: Option<Py<PyAny>>,
     augment: Option<String>,
     resize: Option<(u32, u32)>,
     crop: Option<(u32, u32)>,
@@ -1417,6 +1439,7 @@ pub(crate) fn py_image(
     let node_id = node;
     let max_ram_gb = ram_gb;
     let autotune = tune;
+    let transform_fn = transform;
     let resize_hw = resize;
     let crop_hw = crop;
     let horizontal_flip_p = flip_p;
@@ -1663,6 +1686,7 @@ pub(crate) fn py_image(
             500,
             DEFAULT_GRPC_MAX_MESSAGE_BYTES,
             resume_from,
+            transform_fn.clone(),
         )?;
         let decode_backend = decode_backend_from_env()?;
         let rust_jpeg_codec = rust_jpeg_codec_from_env()?;
@@ -1726,6 +1750,7 @@ pub(crate) fn py_image(
         node_id,
         profile,
         autotune,
+        transform_fn,
         resolved_resize_hw,
         resolved_crop_hw,
         resolved_horizontal_flip_p,

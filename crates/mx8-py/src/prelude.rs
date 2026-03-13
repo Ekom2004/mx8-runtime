@@ -5,13 +5,13 @@ pub(crate) use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize,
 pub(crate) use std::sync::{Arc, Mutex};
 pub(crate) use std::time::{Duration, Instant};
 
-pub(crate) use ::image::imageops::FilterType as ImageFilterType;
 pub(crate) use anyhow::Result;
 pub(crate) use fast_image_resize::images::Image as FirImage;
 pub(crate) use fast_image_resize::{
     FilterType as FirFilterType, PixelType as FirPixelType, ResizeAlg as FirResizeAlg,
     ResizeOptions as FirResizeOptions, Resizer as FirResizer,
 };
+pub(crate) use image::imageops::FilterType as ImageFilterType;
 pub(crate) use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 pub(crate) use pyo3::prelude::*;
 pub(crate) use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString, PyTuple};
@@ -35,7 +35,10 @@ pub(crate) use mx8_proto::v0::RegisterNodeResponse;
 pub(crate) use mx8_proto::v0::ReportProgressRequest;
 pub(crate) use mx8_proto::v0::RequestLeaseRequest;
 pub(crate) use mx8_proto::v0::RequestLeaseResponse;
-pub(crate) use mx8_runtime::pipeline::{BatchLease, Pipeline, RuntimeCaps, RuntimeMetrics};
+pub(crate) use mx8_runtime::pipeline::{
+    BatchLease, ExtraInFlightLease, Pipeline, RuntimeCaps, RuntimeMetrics,
+};
+pub(crate) use mx8_runtime::types::Batch;
 pub(crate) use mx8_snapshot::labels::load_labels_for_base;
 pub(crate) use mx8_snapshot::pack_dir::{
     pack_dir as pack_dir_impl, LabelMode as PackDirLabelMode, PackDirConfig,

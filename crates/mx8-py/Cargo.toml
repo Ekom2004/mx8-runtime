@@ -38,6 +38,8 @@ tokio.workspace = true
 tonic.workspace = true
 turbojpeg = { version = "1.4", default-features = false, features = ["cmake", "pkg-config"] }
 tracing.workspace = true
+wasmi = "0.40"
+wat = "1"
 zune-jpeg = "0.5"
 
 [target.'cfg(mx8_video_ffi)'.dependencies]

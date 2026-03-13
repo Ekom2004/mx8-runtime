@@ -775,6 +775,7 @@ impl ImageLoader {
         node_id=None,
         profile=None,
         autotune=None,
+        transform=None,
         resize_hw=None,
         crop_hw=None,
         horizontal_flip_p=0.0,
@@ -807,6 +808,7 @@ impl ImageLoader {
         node_id: Option<String>,
         profile: Option<String>,
         autotune: Option<bool>,
+        transform: Option<Py<PyAny>>,
         resize_hw: Option<(u32, u32)>,
         crop_hw: Option<(u32, u32)>,
         horizontal_flip_p: f32,
@@ -838,6 +840,7 @@ impl ImageLoader {
             node_id,
             profile,
             autotune,
+            transform,
         )?;
         let base = loader.dataset_base.clone();
         let classes = loader

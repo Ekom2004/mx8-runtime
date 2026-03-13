@@ -293,6 +293,12 @@ pub(crate) struct DistributedDataLoader {
     pub(crate) autotune_task: Option<tokio::task::JoinHandle<()>>,
     pub(crate) rt: tokio::runtime::Runtime,
     pub(crate) started_at: Instant,
+    pub(crate) transform: Option<CompiledTransform>,
+    pub(crate) transform_samples_total: u64,
+    pub(crate) transform_failures_total: u64,
+    pub(crate) transform_timeout_total: u64,
+    pub(crate) transform_output_ratio_ewma_milli: u64,
+    pub(crate) transform_heavy_mode_active: bool,
 }
 
 #[derive(Debug)]
@@ -404,6 +410,7 @@ impl DistributedDataLoader {
         progress_interval_ms=500,
         grpc_max_message_bytes=DEFAULT_GRPC_MAX_MESSAGE_BYTES,
         resume_from=None,
+        transform=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -426,6 +433,7 @@ impl DistributedDataLoader {
         progress_interval_ms: u64,
         grpc_max_message_bytes: usize,
         resume_from: Option<Vec<u8>>,
+        transform: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let _ = (max_inflight_bytes, max_queue_batches, prefetch_batches);
         let constraints_cfg = constraints.as_ref().map(|c| c.bind(py).borrow().clone());
@@ -492,6 +500,16 @@ impl DistributedDataLoader {
                 effective_max_inflight_bytes = max_process;
             }
         }
+        let compiled_transform = transform
+            .as_ref()
+            .map(|transform_fn| {
+                CompiledTransform::compile_from_py(
+                    py,
+                    &transform_fn.bind(py),
+                    effective_max_inflight_bytes,
+                )
+            })
+            .transpose()?;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -793,6 +811,12 @@ impl DistributedDataLoader {
             autotune_task,
             rt,
             started_at: Instant::now(),
+            transform: compiled_transform,
+            transform_samples_total: 0,
+            transform_failures_total: 0,
+            transform_timeout_total: 0,
+            transform_output_ratio_ewma_milli: 1000,
+            transform_heavy_mode_active: false,
         })
     }
 
@@ -900,6 +924,18 @@ impl DistributedDataLoader {
             "autotune_net_disabled_total",
             self.autotune.net_disabled_total.load(Ordering::Relaxed),
         )?;
+        out.set_item("transform_enabled", self.transform.is_some())?;
+        out.set_item("transform_samples_total", self.transform_samples_total)?;
+        out.set_item("transform_failures_total", self.transform_failures_total)?;
+        out.set_item("transform_timeout_total", self.transform_timeout_total)?;
+        out.set_item(
+            "transform_output_ratio_ewma",
+            self.transform_output_ratio_ewma_milli as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "transform_heavy_mode_active",
+            self.transform_heavy_mode_active,
+        )?;
         Ok(out.into_any())
     }
 
@@ -932,21 +968,26 @@ impl DistributedDataLoader {
 
     pub(crate) fn __next__(&mut self) -> PyResult<PyBatch> {
         let wait_started = Instant::now();
-        let out = self.rt.block_on(async {
-            match self.rx.recv().await {
-                Some(lease) => Ok(PyBatch { lease }),
-                None => match self.task.take() {
-                    Some(handle) => match handle.await {
-                        Ok(Ok(())) => Err(PyStopIteration::new_err(())),
-                        Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
-                        Err(err) => Err(PyRuntimeError::new_err(format!(
-                            "producer task failed: {err}"
-                        ))),
-                    },
-                    None => Err(PyStopIteration::new_err(())),
-                },
+        let lease = self.rt.block_on(self.rx.recv());
+        let out = match lease {
+            Some(mut lease) => {
+                let extra_inflight_lease = self.apply_transform_if_enabled(&mut lease)?;
+                Ok(PyBatch {
+                    lease,
+                    _extra_inflight_lease: extra_inflight_lease,
+                })
             }
-        });
+            None => match self.task.take() {
+                Some(handle) => match self.rt.block_on(handle) {
+                    Ok(Ok(())) => Err(PyStopIteration::new_err(())),
+                    Ok(Err(err)) => Err(PyRuntimeError::new_err(format!("{err}"))),
+                    Err(err) => Err(PyRuntimeError::new_err(format!(
+                        "producer task failed: {err}"
+                    ))),
+                },
+                None => Err(PyStopIteration::new_err(())),
+            },
+        };
         self.autotune.on_wait(wait_started.elapsed());
         out
     }
@@ -965,5 +1006,64 @@ impl DistributedDataLoader {
 
     fn __del__(&mut self) {
         self.close();
+    }
+}
+
+impl DistributedDataLoader {
+    fn apply_transform_if_enabled(
+        &mut self,
+        lease: &mut BatchLease,
+    ) -> PyResult<Option<ExtraInFlightLease>> {
+        let transform = match self.transform.as_ref() {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let out = transform.apply(&lease.batch).map_err(|e| {
+            self.transform_failures_total = self.transform_failures_total.saturating_add(1);
+            if e.timeout {
+                self.transform_timeout_total = self.transform_timeout_total.saturating_add(1);
+            }
+            PyRuntimeError::new_err(format!("transform `{}` failed: {}", transform.name, e))
+        })?;
+
+        self.transform_samples_total = self
+            .transform_samples_total
+            .saturating_add(out.stats.transformed_samples);
+        if self.transform_output_ratio_ewma_milli == 0 {
+            self.transform_output_ratio_ewma_milli = out.stats.output_ratio_milli;
+        } else {
+            self.transform_output_ratio_ewma_milli =
+                ((self.transform_output_ratio_ewma_milli.saturating_mul(80))
+                    .saturating_add(out.stats.output_ratio_milli.saturating_mul(20)))
+                    / 100;
+        }
+        self.transform_heavy_mode_active = out.stats.heavy_mode_active;
+        if self.transform_heavy_mode_active && self.pipeline.effective_prefetch_batches() > 1 {
+            self.pipeline.set_prefetch_batches(1);
+        }
+
+        let output_bytes = out.batch.payload.len() as u64;
+        let extra_inflight_lease = if output_bytes > lease.bytes {
+            let extra = output_bytes - lease.bytes;
+            Some(
+                self.rt
+                    .block_on(self.pipeline.reserve_extra_inflight(extra))
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "transform inflight reservation failed for +{} bytes: {e}",
+                            extra
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err("transform inflight reservation unexpectedly empty")
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        lease.batch = out.batch;
+        Ok(extra_inflight_lease)
     }
 }
