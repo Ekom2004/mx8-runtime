@@ -5,6 +5,15 @@ from pathlib import Path
 
 import mx8
 
+@mx8.transform
+def _video_identity(sample: bytes) -> bytes:
+    return sample
+
+
+@mx8.transform
+def _video_expand(sample: bytes) -> bytes:
+    return sample + sample
+
 
 def _write_bytes(path: Path, fill: bytes, n: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,6 +238,7 @@ def main() -> None:
         seed=seed,
         epoch=epoch,
         constraints=constraints,
+        transform=_video_identity,
     )
     seq1 = _collect_sequence(loader1, max_batches=max_batches)
     stats1 = loader1.stats()
@@ -270,6 +280,30 @@ def main() -> None:
         raise RuntimeError(f"missing decode succeeded clips stat: {stats1}")
     if int(stats1.get("video_decode_ms_total", 0)) <= 0:
         raise RuntimeError(f"missing decode timing stat: {stats1}")
+    if stats1.get("video_transform_enabled") is not True:
+        raise RuntimeError(f"expected video_transform_enabled=True in stats: {stats1}")
+    if int(stats1.get("video_transform_samples_total", 0)) <= 0:
+        raise RuntimeError(f"missing video transform sample stats: {stats1}")
+
+    loader_transform_fail = mx8.video(
+        str(ds_root),
+        store=str(store_root),
+        recursive=True,
+        clip=clip_len,
+        stride=stride,
+        fps=fps,
+        batch=batch_size,
+        seed=seed,
+        epoch=epoch,
+        constraints=constraints,
+        transform=_video_expand,
+    )
+    try:
+        next(loader_transform_fail)
+        raise RuntimeError("expected video transform clip-size guard failure")
+    except RuntimeError as e:
+        if "video transform changed clip byte size" not in str(e):
+            raise RuntimeError(f"unexpected video transform failure: {e}")
 
     try:
         mx8.video(
@@ -289,7 +323,7 @@ def main() -> None:
         )
         raise RuntimeError("expected max_inflight_bytes guard to reject config")
     except ValueError as e:
-        if "exceeds max_inflight_bytes" not in str(e):
+        if "exceeds inflight" not in str(e) and "exceeds max_inflight_bytes" not in str(e):
             raise RuntimeError(f"unexpected config error: {e}")
 
     runtime_failure_class = _check_runtime_io_failure(

@@ -1855,6 +1855,7 @@ fn detect_video_experimental_device_direct_write(
     tune=None,
     constraints=None,
     runtime=None,
+    transform=None,
     node=None
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1878,6 +1879,7 @@ pub(crate) fn video(
     tune: Option<bool>,
     constraints: Option<Py<Constraints>>,
     runtime: Option<Py<RuntimeConfig>>,
+    transform: Option<Py<PyAny>>,
     node: Option<String>,
 ) -> PyResult<Py<VideoDataLoader>> {
     let dataset_link = data;
@@ -1890,6 +1892,7 @@ pub(crate) fn video(
     let cluster_url = coord;
     let max_ram_gb = ram_gb;
     let autotune = tune;
+    let transform_fn = transform;
     let node_id = node;
     if fps == 0 {
         return Err(PyValueError::new_err("video fps must be > 0"));
@@ -2027,6 +2030,12 @@ pub(crate) fn video(
         }
     }
     let max_inflight_bytes = effective_max_inflight_bytes.max(1);
+    let compiled_transform = transform_fn
+        .as_ref()
+        .map(|transform_fn| {
+            CompiledTransform::compile_from_py(py, &transform_fn.bind(py), max_inflight_bytes)
+        })
+        .transpose()?;
     let decode_backend = video_decode_backend_from_env()?;
     let video_experimental_device_output_requested =
         env_bool("MX8_VIDEO_EXPERIMENTAL_DEVICE_OUTPUT", false);
@@ -2187,6 +2196,7 @@ pub(crate) fn video(
         epoch = epoch,
         assigned_rank = assigned_rank,
         world_size = world_size,
+        transform_enabled = compiled_transform.is_some(),
         "initialized stage2b video loader"
     );
 
@@ -2256,6 +2266,12 @@ pub(crate) fn video(
             job_id,
             cluster_url,
             started_at: Instant::now(),
+            transform: compiled_transform,
+            transform_samples_total: 0,
+            transform_failures_total: 0,
+            transform_timeout_total: 0,
+            transform_output_ratio_ewma_milli: 1000,
+            transform_heavy_mode_active: false,
         },
     )
 }

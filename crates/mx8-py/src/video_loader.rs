@@ -88,6 +88,12 @@ pub(crate) struct VideoDataLoader {
     pub(crate) job_id: Option<String>,
     pub(crate) cluster_url: Option<String>,
     pub(crate) started_at: Instant,
+    pub(crate) transform: Option<CompiledTransform>,
+    pub(crate) transform_samples_total: u64,
+    pub(crate) transform_failures_total: u64,
+    pub(crate) transform_timeout_total: u64,
+    pub(crate) transform_output_ratio_ewma_milli: u64,
+    pub(crate) transform_heavy_mode_active: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -702,6 +708,86 @@ impl VideoBatch {
 }
 
 impl VideoDataLoader {
+    fn apply_transform_if_enabled(
+        &mut self,
+        sample_ids: &mut Vec<u64>,
+        offsets: &mut Vec<u64>,
+        payload: &mut Vec<u8>,
+    ) -> PyResult<()> {
+        let transform = match self.transform.as_ref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let input_batch = Batch {
+            sample_ids: Arc::from(sample_ids.as_slice()),
+            label_ids: None,
+            offsets: Arc::from(offsets.as_slice()),
+            payload: Arc::from(payload.as_slice()),
+        };
+
+        let out = transform.apply(&input_batch).map_err(|e| {
+            self.transform_failures_total = self.transform_failures_total.saturating_add(1);
+            if e.timeout {
+                self.transform_timeout_total = self.transform_timeout_total.saturating_add(1);
+            }
+            PyRuntimeError::new_err(format!(
+                "video transform `{}` failed: {}",
+                transform.name, e
+            ))
+        })?;
+
+        self.transform_samples_total = self
+            .transform_samples_total
+            .saturating_add(out.stats.transformed_samples);
+        if self.transform_output_ratio_ewma_milli == 0 {
+            self.transform_output_ratio_ewma_milli = out.stats.output_ratio_milli;
+        } else {
+            self.transform_output_ratio_ewma_milli =
+                ((self.transform_output_ratio_ewma_milli.saturating_mul(80))
+                    .saturating_add(out.stats.output_ratio_milli.saturating_mul(20)))
+                    / 100;
+        }
+        self.transform_heavy_mode_active = out.stats.heavy_mode_active;
+
+        let out_ids = out.batch.sample_ids.as_ref();
+        let out_offsets = out.batch.offsets.as_ref();
+        if out_ids.len() != sample_ids.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "video transform must preserve sample count (got {} expected {})",
+                out_ids.len(),
+                sample_ids.len()
+            )));
+        }
+        if out_offsets.len() != out_ids.len().saturating_add(1) {
+            return Err(PyRuntimeError::new_err(
+                "video transform output offsets/sample_ids mismatch",
+            ));
+        }
+
+        let expected_clip_bytes = self.decode_contract.clip_bytes;
+        for idx in 0..out_ids.len() {
+            if out_ids[idx] != sample_ids[idx] {
+                return Err(PyRuntimeError::new_err(format!(
+                    "video transform must preserve sample ordering (sample_ids changed at idx {})",
+                    idx
+                )));
+            }
+            let clip_bytes = out_offsets[idx + 1].saturating_sub(out_offsets[idx]);
+            if clip_bytes != expected_clip_bytes {
+                return Err(PyRuntimeError::new_err(format!(
+                    "video transform changed clip byte size for sample {}: got {} expected {}",
+                    out_ids[idx], clip_bytes, expected_clip_bytes
+                )));
+            }
+        }
+
+        *sample_ids = out_ids.to_vec();
+        *offsets = out_offsets.to_vec();
+        *payload = out.batch.payload.as_ref().to_vec();
+        Ok(())
+    }
+
     const VIDEO_GPU_PRESSURE_MIN_SAMPLE_INTERVAL: std::time::Duration =
         std::time::Duration::from_secs(2);
 
@@ -2077,6 +2163,8 @@ impl VideoDataLoader {
             clip_starts.push(clip_start_for_log);
         }
 
+        self.apply_transform_if_enabled(&mut sample_ids, &mut offsets, &mut payload)?;
+
         let payload_bytes = payload.len() as u64;
         if payload_bytes > self.max_inflight_bytes {
             return Err(PyRuntimeError::new_err(format!(
@@ -2215,6 +2303,27 @@ impl VideoDataLoader {
         out.set_item(
             "video_runtime_autotune_pressure",
             self.video_runtime_autotune_pressure_milli as f64 / 1000.0,
+        )?;
+        out.set_item("video_transform_enabled", self.transform.is_some())?;
+        out.set_item(
+            "video_transform_samples_total",
+            self.transform_samples_total,
+        )?;
+        out.set_item(
+            "video_transform_failures_total",
+            self.transform_failures_total,
+        )?;
+        out.set_item(
+            "video_transform_timeout_total",
+            self.transform_timeout_total,
+        )?;
+        out.set_item(
+            "video_transform_output_ratio_ewma",
+            self.transform_output_ratio_ewma_milli as f64 / 1000.0,
+        )?;
+        out.set_item(
+            "video_transform_heavy_mode_active",
+            self.transform_heavy_mode_active,
         )?;
         out.set_item(
             "video_experimental_device_output_requested",
