@@ -171,6 +171,18 @@ impl Drop for BatchLease {
     }
 }
 
+pub struct ExtraInFlightLease {
+    pub bytes: u64,
+    metrics: Arc<RuntimeMetrics>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ExtraInFlightLease {
+    fn drop(&mut self) {
+        self.metrics.on_inflight_sub(self.bytes);
+    }
+}
+
 #[derive(Clone)]
 pub struct Pipeline {
     caps: RuntimeCaps,
@@ -224,6 +236,39 @@ impl Pipeline {
     pub fn set_max_queue_batches(&self, max_queue_batches: usize) {
         self.max_queue_batches
             .store(max_queue_batches.max(1), Ordering::Relaxed);
+    }
+
+    pub async fn reserve_extra_inflight(
+        &self,
+        extra_bytes: u64,
+    ) -> Result<Option<ExtraInFlightLease>> {
+        if extra_bytes == 0 {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            extra_bytes <= self.caps.max_inflight_bytes,
+            "extra inflight bytes {} exceeds max_inflight_bytes {}",
+            extra_bytes,
+            self.caps.max_inflight_bytes
+        );
+
+        let permit_units = extra_bytes.div_ceil(PERMIT_UNIT_BYTES).max(1);
+        anyhow::ensure!(
+            permit_units <= u32::MAX as u64,
+            "extra inflight reservation too large for permit accounting ({} units)",
+            permit_units
+        );
+        let permit = self
+            .inflight_sem
+            .clone()
+            .acquire_many_owned(permit_units as u32)
+            .await?;
+        self.metrics.on_inflight_add(extra_bytes);
+        Ok(Some(ExtraInFlightLease {
+            bytes: extra_bytes,
+            metrics: self.metrics.clone(),
+            _permit: permit,
+        }))
     }
 
     fn current_batch_band_pcts(&self) -> (u64, u64) {
